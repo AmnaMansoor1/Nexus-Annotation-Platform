@@ -17,6 +17,7 @@ export default function AnnotationWorkbench() {
   const userEmail = (session.email || "").toLowerCase().trim();
   const { assignedArticles, loading: assignmentLoading } = useArticleAssignment(userEmail);
 
+  const [completedArticles, setCompletedArticles] = useState<string[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [completedCount, setCompletedCount] = useState(0);
   const [currentArticle, setCurrentArticle] = useState<Article | null>(null);
@@ -24,6 +25,11 @@ export default function AnnotationWorkbench() {
   const [submitting, setSubmitting] = useState(false);
   const [timerExpired, setTimerExpired] = useState(false);
   const [startTime, setStartTime] = useState<number>(0);
+
+  // Form State
+  const [label, setLabel] = useState<BiasLabel | null>(null);
+  const [biasType, setBiasType] = useState<BiasType | null>(null);
+  const [confidence, setConfidence] = useState<ConfidenceLevel | null>(null);
 
   // Update lastActive timestamp on every action
   useEffect(() => {
@@ -34,11 +40,6 @@ export default function AnnotationWorkbench() {
       localStorage.setItem("nexus_user_session", JSON.stringify(session));
     }
   }, [currentIndex, completedCount]);
-  
-  // Form State
-  const [label, setLabel] = useState<BiasLabel | null>(null);
-  const [biasType, setBiasType] = useState<BiasType | null>(null);
-  const [confidence, setConfidence] = useState<ConfidenceLevel | null>(null);
 
   // Auto-set bias type to 'other' if neutral is selected for convenience
   useEffect(() => {
@@ -47,28 +48,41 @@ export default function AnnotationWorkbench() {
     }
   }, [label]);
 
-  // Load current article
+  // Initial load of annotator state
+  useEffect(() => {
+    async function initAnnotator() {
+      if (!userEmail) return;
+      try {
+        const annotatorDoc = await getDoc(doc(db, "annotators", userEmail));
+        if (annotatorDoc.exists()) {
+          const data = annotatorDoc.data() as Annotator;
+          const completed = data.completed_articles || [];
+          setCompletedArticles(completed);
+          setCompletedCount(completed.length);
+        }
+      } catch (err) {
+        console.error("Error loading annotator:", err);
+      }
+    }
+    initAnnotator();
+  }, [userEmail]);
+
+  // Load current article based on assigned pool and local completed state
   useEffect(() => {
     async function loadArticle() {
       if (assignedArticles.length === 0) {
-        if (!assignmentLoading) setLoading(false); // Stop loading if assignment came back empty
+        if (!assignmentLoading) setLoading(false);
         return;
       }
       
-      try {
-        // Find the first uncompleted article
-        const annotatorDoc = await getDoc(doc(db, "annotators", userEmail));
-        const annotatorData = annotatorDoc.data() as Annotator;
-        const completed = annotatorData.completed_articles || [];
-        setCompletedCount(completed.length);
-        
-        const firstPendingIndex = assignedArticles.findIndex(id => !completed.includes(id));
-        
-        if (firstPendingIndex === -1) {
-          navigate("/done");
-          return;
-        }
+      const firstPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id));
+      
+      if (firstPendingIndex === -1) {
+        if (!assignmentLoading) navigate("/done");
+        return;
+      }
 
+      try {
         setCurrentIndex(firstPendingIndex);
         const articleId = assignedArticles[firstPendingIndex];
         const articleDoc = await getDoc(doc(db, "articles", articleId));
@@ -91,7 +105,7 @@ export default function AnnotationWorkbench() {
     if (!assignmentLoading) {
       loadArticle();
     }
-  }, [assignedArticles, assignmentLoading, currentIndex, userEmail, navigate]);
+  }, [assignedArticles, assignmentLoading, completedArticles, navigate]);
 
   const handleSubmit = async () => {
     const requiresBiasType = label !== "neutral";
@@ -228,7 +242,8 @@ export default function AnnotationWorkbench() {
       })();
 
       // 3. UI PROGRESSION
-      // We can derive the new count from current state + 1
+      // Update local state to trigger the load of the next article
+      setCompletedArticles(prev => [...prev, articleId]);
       const totalCompleted = (completedCount || 0) + 1;
       setCompletedCount(totalCompleted);
 
@@ -239,17 +254,13 @@ export default function AnnotationWorkbench() {
         navigate("/done");
       } else if (currentIndex + 1 >= assignedArticles.length) {
         // If we ran out of assigned articles but haven't reached 20
-        // Redirect to /done which will show the "Batch Completed" message (blue clock)
-        // instead of "Mission Accomplished" (green check)
         navigate("/done");
       } else {
-        setCurrentIndex(prev => prev + 1);
-        // Reset form for next article
+        // Reset form immediately for visual feedback
         setLabel(null);
         setBiasType(null);
         setConfidence(null);
         setTimerExpired(false);
-        setStartTime(Date.now());
       }
 
     } catch (err: any) {

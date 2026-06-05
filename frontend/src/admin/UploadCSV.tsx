@@ -43,43 +43,46 @@ export default function UploadCSV() {
       const chunk = data.slice(i, i + batchSize);
       let chunkImported = 0;
 
-      for (const row of chunk) {
+      // 1. Pre-check which articles already exist in this chunk (Parallelized)
+      const existenceChecks = await Promise.all(chunk.map(async (row) => {
         const articleId = row.article_id;
-        if (!articleId) {
+        if (!articleId) return { row, exists: true }; // Skip empty IDs
+        const docSnap = await getDoc(doc(db, "articles", articleId));
+        return { row, exists: docSnap.exists() };
+      }));
+
+      for (const { row, exists } of existenceChecks) {
+        if (exists) {
           skipped++;
           continue;
         }
 
+        const articleId = row.article_id;
         const docRef = doc(db, "articles", articleId);
-        const docSnap = await getDoc(docRef);
 
-        if (!docSnap.exists()) {
-          const article: Article = {
-            article_id: articleId,
-            headline: row.headline || "",
-            display_text: row.display_text || "",
-            source: row.source || "",
-            author: row.author || "",
-            date_published: row.date_published || "",
-            url: row.url || "",
-            category: row.category || "",
-            article_type: (row.article_type as any) || "News Article",
-            word_count: parseInt(row.word_count) || 0,
-            status: "pending",
-            annotation_count: 0,
-            annotated_by: [],
-            assigned_to: [],
-            assigned_count: 0,
-            bias_score: null,
-            fleiss_kappa: null,
-            is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1",
-            gold_expected_label: row.gold_expected_label || undefined
-          };
-          batch.set(docRef, article);
-          chunkImported++;
-        } else {
-          skipped++;
-        }
+        const article: Article = {
+          article_id: articleId,
+          headline: row.headline || "",
+          display_text: row.display_text || "",
+          source: row.source || "",
+          author: row.author || "",
+          date_published: row.date_published || "",
+          url: row.url || "",
+          category: row.category || "",
+          article_type: (row.article_type as any) || "News Article",
+          word_count: parseInt(row.word_count) || 0,
+          status: "pending",
+          annotation_count: 0,
+          annotated_by: [],
+          assigned_to: [],
+          assigned_count: 0,
+          bias_score: null,
+          fleiss_kappa: null,
+          is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1",
+          gold_expected_label: row.gold_expected_label || undefined
+        };
+        batch.set(docRef, article);
+        chunkImported++;
       }
 
       await batch.commit();

@@ -66,25 +66,26 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
     return [];
   }
 
-  // 5. Atomic Update: Increment assigned_count and add to assigned_to
-  // Only for non-gold articles as they don't follow the same assignment rules
-  for (const articleId of selectedIds) {
+  // 5. Atomic Update: Increment assigned_count and add to assigned_to in a SINGLE transaction
+  if (selectedIds.length > 0) {
     try {
       await runTransaction(db, async (transaction) => {
-        const articleRef = doc(db, "articles", articleId);
-        const snap = await transaction.get(articleRef);
-        if (!snap.exists()) return;
-        
-        const data = snap.data() as Article;
-        if (!data.assigned_to.includes(email)) {
-          transaction.update(articleRef, {
-            assigned_count: increment(1),
-            assigned_to: arrayUnion(email)
-          });
+        for (const articleId of selectedIds) {
+          const articleRef = doc(db, "articles", articleId);
+          const snap = await transaction.get(articleRef);
+          if (!snap.exists()) continue;
+          
+          const data = snap.data() as Article;
+          if (!data.assigned_to.includes(email)) {
+            transaction.update(articleRef, {
+              assigned_count: increment(1),
+              assigned_to: arrayUnion(email)
+            });
+          }
         }
       });
     } catch (e) {
-      console.error("Failed to update article assignment:", articleId, e);
+      console.error("Failed to update article assignments in transaction:", e);
     }
   }
 

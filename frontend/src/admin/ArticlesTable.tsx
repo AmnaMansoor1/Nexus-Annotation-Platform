@@ -14,9 +14,8 @@ export default function ArticlesTable() {
   const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
   
   // Pagination State
-  const [lastVisible, setLastVisible] = useState<any>(null);
-  const [firstVisible, setFirstVisible] = useState<any>(null);
   const [page, setPage] = useState(1);
+  const [cursors, setCursors] = useState<any[]>([null]); // Index 0 is null (first page)
   const [totalCount, setTotalCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
@@ -27,7 +26,6 @@ export default function ArticlesTable() {
       try {
         const summaryRef = doc(db, "stats", "platform_summary");
         const summarySnap = await getDoc(summaryRef);
-
         
         if (summarySnap.exists()) {
           const data = summarySnap.data();
@@ -58,15 +56,16 @@ export default function ArticlesTable() {
         baseConstraints.push(where("category", "==", selectedCategory) as any);
       }
 
-      if (direction === 'next' && lastVisible) {
-        q = query(collection(db, "articles"), ...baseConstraints, startAfter(lastVisible), limit(PAGE_SIZE));
-      } else if (direction === 'prev' && firstVisible) {
-        // Firebase doesn't have limitToLast in the same way for simple paging
-        // So we'll fetch based on page state or use the simplest approach for MVP
-        // Note: Real cursor-based backward paging is complex in Firestore.
-        // We'll use a simpler version for this implementation.
-        const skipCount = (page - 2) * PAGE_SIZE;
-        q = query(collection(db, "articles"), ...baseConstraints, limit(skipCount + PAGE_SIZE));
+      if (direction === 'next' && cursors[page]) {
+        q = query(collection(db, "articles"), ...baseConstraints, startAfter(cursors[page]), limit(PAGE_SIZE));
+      } else if (direction === 'prev' && page > 1) {
+        // Use the cursor from the page BEFORE the one we want to go to
+        const prevCursor = cursors[page - 2];
+        if (prevCursor) {
+          q = query(collection(db, "articles"), ...baseConstraints, startAfter(prevCursor), limit(PAGE_SIZE));
+        } else {
+          q = query(collection(db, "articles"), ...baseConstraints, limit(PAGE_SIZE));
+        }
       } else {
         q = query(collection(db, "articles"), ...baseConstraints, limit(PAGE_SIZE));
       }
@@ -74,29 +73,39 @@ export default function ArticlesTable() {
       const snap = await getDocs(q);
       const docs = snap.docs;
       
-      if (direction === 'prev') {
-        const pageDocs = docs.slice(-PAGE_SIZE);
-        setArticles(pageDocs.map(d => d.data() as Article));
-        setFirstVisible(pageDocs[0]);
-        setLastVisible(pageDocs[pageDocs.length - 1]);
-        setHasMore(true);
-      } else {
-        setArticles(docs.map(d => d.data() as Article));
-        setFirstVisible(docs[0]);
-        setLastVisible(docs[docs.length - 1]);
+      setArticles(docs.map(d => d.data() as Article));
+      
+      if (direction === 'next') {
+        // If we went next, we might need to add a new cursor for the next page
+        if (docs.length === PAGE_SIZE) {
+          const nextCursor = docs[docs.length - 1];
+          setCursors(prev => {
+            const updated = [...prev];
+            updated[page] = nextCursor;
+            return updated;
+          });
+          setHasMore(true);
+        } else {
+          setHasMore(false);
+        }
+      } else if (direction === 'initial') {
+        const nextCursor = docs[docs.length - 1];
+        setCursors([null, nextCursor]);
         setHasMore(docs.length === PAGE_SIZE);
+      } else {
+        // For 'prev', we already have the cursors in the array
+        setHasMore(true);
       }
     } catch (err) {
       console.error("Error fetching articles:", err);
     } finally {
       setLoading(false);
     }
-  }, [selectedCategory, lastVisible, firstVisible, page]);
+  }, [selectedCategory, cursors, page]);
 
   useEffect(() => {
     setPage(1);
-    setLastVisible(null);
-    setFirstVisible(null);
+    setCursors([null]);
     fetchArticles('initial');
   }, [selectedCategory]);
 
