@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc } from "firebase/firestore";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article, PlatformSummary } from "../types";
+import { Article, PlatformSummary, Annotator } from "../types";
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend
@@ -13,7 +13,8 @@ import {
   Users, 
   TrendingUp,
   Activity,
-  Loader2
+  Loader2,
+  RefreshCw
 } from "lucide-react";
 
 export default function Dashboard() {
@@ -35,50 +36,109 @@ export default function Dashboard() {
     { name: "Pending", value: 0, color: "#94a3b8" }
   ]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    async function loadDashboardData() {
-      setLoading(true);
-      setError(null);
-      try {
-        console.log("Loading dashboard data from summary...");
-        
-        // Scalable approach: Read from the single summary document
-        const summaryRef = doc(db, "stats", "platform_summary");
-        const summarySnap = await getDoc(summaryRef);
-        
-        if (!summarySnap.exists()) {
-          throw new Error("Stats summary not found. Please upload articles first.");
-        }
-
-        const data = summarySnap.data() as PlatformSummary;
-        setStats(data);
-        
-        setStatusData([
-          { name: "Completed", value: data.completedArticles || 0, color: "#16a34a" },
-          { name: "In Progress", value: data.inProgressArticles || 0, color: "#eab308" },
-          { name: "Pending", value: data.pendingArticles || 0, color: "#94a3b8" }
-        ]);
-        
-        // 2. Extract categories from summary distribution
-        if (data.categoryDistribution) {
-          setCategoryData(Object.entries(data.categoryDistribution)
-            .map(([name, value]) => ({ name, value }))
-            .sort((a, b) => b.value - a.value)
-          );
-        }
-        
-      } catch (err) {
-        console.error("Dashboard data load error:", err);
-        setError("Failed to load dashboard data. Please check your Firestore connection and refresh.");
-      } finally {
-        setLoading(false);
+  const loadDashboardData = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      console.log("Loading dashboard data from summary...");
+      
+      const summaryRef = doc(db, "stats", "platform_summary");
+      const summarySnap = await getDoc(summaryRef);
+      
+      if (!summarySnap.exists()) {
+        throw new Error("Stats summary not found. Please click 'Sync Statistics' below to initialize.");
       }
-    }
 
+      const data = summarySnap.data() as PlatformSummary;
+      setStats(data);
+      
+      setStatusData([
+        { name: "Completed", value: data.completedArticles || 0, color: "#16a34a" },
+        { name: "In Progress", value: data.inProgressArticles || 0, color: "#eab308" },
+        { name: "Pending", value: data.pendingArticles || 0, color: "#94a3b8" }
+      ]);
+      
+      if (data.categoryDistribution) {
+        setCategoryData(Object.entries(data.categoryDistribution)
+          .map(([name, value]) => ({ name, value }))
+          .sort((a, b) => b.value - a.value)
+        );
+      }
+      
+    } catch (err: any) {
+      console.error("Dashboard data load error:", err);
+      setError(err.message || "Failed to load dashboard data.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
     loadDashboardData();
   }, []);
+
+  const handleSyncStats = async () => {
+    if (!window.confirm("This will perform a full scan of your database to recalculate all statistics. Continue?")) return;
+    
+    setSyncing(true);
+    try {
+      console.log("Starting full statistics sync...");
+      
+      // 1. Fetch ALL articles and annotators (Note: Use pagination for > 10,000)
+      const [articlesSnap, annotatorsSnap] = await Promise.all([
+        getDocs(collection(db, "articles")),
+        getDocs(collection(db, "annotators"))
+      ]);
+
+      const articles = articlesSnap.docs.map(d => d.data() as Article);
+      const annotators = annotatorsSnap.docs.map(d => d.data() as Annotator);
+
+      // 2. Calculate category distribution
+      const categories = articles.reduce((acc: Record<string, number>, article) => {
+        const cat = article.category || "Uncategorized";
+        acc[cat] = (acc[cat] || 0) + 1;
+        return acc;
+      }, {});
+
+      // 3. Build new summary
+      const newSummary: PlatformSummary = {
+        totalArticles: articles.length,
+        completedArticles: articles.filter(a => a.status === "complete").length,
+        inProgressArticles: articles.filter(a => a.status === "partial").length,
+        pendingArticles: articles.filter(a => a.status === "pending").length,
+        totalAnnotators: annotators.length,
+        completedAnnotators: annotators.filter(a => a.completed).length,
+        avgBiasScore: stats.avgBiasScore, // Keep current avg bias score
+        needsReview: articles.filter(a => a.status === "partial" && a.annotation_count >= 10).length,
+        categoryDistribution: categories
+      };
+
+      // 4. Update Firestore
+      await setDoc(doc(db, "stats", "platform_summary"), newSummary);
+      
+      // 5. Update local state
+      setStats(newSummary);
+      setStatusData([
+        { name: "Completed", value: newSummary.completedArticles, color: "#16a34a" },
+        { name: "In Progress", value: newSummary.inProgressArticles, color: "#eab308" },
+        { name: "Pending", value: newSummary.pendingArticles, color: "#94a3b8" }
+      ]);
+      setCategoryData(Object.entries(categories)
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value)
+      );
+
+      alert("Statistics synchronized successfully!");
+    } catch (err) {
+      console.error("Sync error:", err);
+      alert("Failed to sync statistics: " + err);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
 
   const statCards = [
@@ -115,9 +175,19 @@ export default function Dashboard() {
           <h2 className="text-3xl font-bold text-slate-900 tracking-tight">Dashboard</h2>
           <p className="text-slate-500 font-medium text-sm">Platform Metrics & Analytics</p>
         </div>
-        <div className="flex items-center gap-3 bg-white px-5 py-2.5 rounded-xl border border-slate-100 shadow-sm">
-          <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-          <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">System Live</span>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={handleSyncStats}
+            disabled={syncing}
+            className="flex items-center gap-2 bg-white px-4 py-2 rounded-xl border border-slate-200 text-slate-600 font-bold text-xs hover:bg-slate-50 transition-all shadow-sm disabled:opacity-50"
+          >
+            <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
+            {syncing ? "Syncing..." : "Sync Statistics"}
+          </button>
+          <div className="flex items-center gap-3 bg-white px-5 py-2.5 rounded-xl border border-slate-100 shadow-sm">
+            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+            <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">System Live</span>
+          </div>
         </div>
       </div>
 
