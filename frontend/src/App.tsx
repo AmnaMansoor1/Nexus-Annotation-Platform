@@ -27,18 +27,23 @@ const PageLoader = () => (
 );
 
 // Simple Error Boundary
-class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean, error: Error | null}> {
-  state = { hasError: false, error: null as Error | null };
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<{children: ReactNode}, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, error: null };
   static getDerivedStateFromError(error: Error) { return { hasError: true, error }; }
   componentDidCatch(error: Error, info: any) { console.error("App Crash:", error, info); }
   render() {
-    if (this.state.hasError) {
+    if (this.state.hasError && this.state.error) {
       return (
         <div className="min-h-screen flex items-center justify-center bg-red-50 p-6">
           <div className="text-center max-w-md">
             <h1 className="text-2xl font-bold text-red-600">Something went wrong.</h1>
             <p className="text-red-500 mt-2 text-sm font-mono bg-white p-4 rounded-xl border border-red-100 break-words">
-              {this.state.error?.message || "Unknown error"}
+              {this.state.error.message}
             </p>
             <button onClick={() => { localStorage.removeItem("nexus_user_session"); window.location.href = "/"; }} className="mt-6 px-6 py-3 bg-red-600 text-white rounded-xl font-bold shadow-lg shadow-red-200 active:scale-95 transition-all">
               Reset Session & Try Again
