@@ -14,7 +14,8 @@ import {
   TrendingUp,
   Activity,
   Loader2,
-  RefreshCw
+  RefreshCw,
+  ShieldAlert
 } from "lucide-react";
 
 export default function Dashboard() {
