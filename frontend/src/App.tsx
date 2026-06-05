@@ -27,10 +27,10 @@ const PageLoader = () => (
 );
 
 // Simple Error Boundary
-class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean, error: any}> {
-  state = { hasError: false, error: null };
-  static getDerivedStateFromError(error: any) { return { hasError: true, error }; }
-  componentDidCatch(error: any, info: any) { console.error("App Crash:", error, info); }
+class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean, error: Error | null}> {
+  state = { hasError: false, error: null as Error | null };
+  static getDerivedStateFromError(error: Error) { return { hasError: true, error }; }
+  componentDidCatch(error: Error, info: any) { console.error("App Crash:", error, info); }
   render() {
     if (this.state.hasError) {
       return (
