@@ -1,0 +1,12 @@
+{
+  "name": "nexus-annotation-platform-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "node src/index.js",
+    "build": "node -e \"console.log('No backend build configured yet.')\"",
+    "lint": "node -e \"console.log('No backend lint configured yet.')\""
+  }
+}

@@ -1,0 +1,62 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.email.lower() == "admin@gmail.com";
+    }
+    
+    function isOwner(email) {
+      return isAuthenticated() && request.auth.token.email.lower() == email.lower();
+    }
+
+    // 1. Articles Collection
+    match /articles/{articleId} {
+      // Admins have full access
+      allow read, write: if isAdmin();
+      
+      // Students can read articles but cannot delete or create them
+      allow read: if isAuthenticated();
+      
+      // Students can only update specific fields via the workbench transaction
+      allow update: if isAuthenticated() && 
+                    (request.resource.data.diff(resource.data).affectedKeys()
+                    .hasAny(['annotation_count', 'annotated_by', 'status', 'bias_score', 'fleiss_kappa']));
+    }
+
+    // 2. Annotators Collection
+    match /annotators/{email} {
+      allow read, write: if isAdmin();
+      allow read, update: if isOwner(email);
+      allow create: if isAuthenticated(); // Allow new student signups
+    }
+
+    // 3. Annotations Collection
+    match /annotations/{articleId} {
+      allow read: if isAdmin();
+      
+      match /responses/{email} {
+        allow read: if isAdmin() || isOwner(email);
+        allow create: if isAuthenticated() && isOwner(email);
+        allow update: if false; // Once submitted, annotations cannot be changed
+      }
+    }
+
+    // 4. Admin Config & Stats
+    match /admin_config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    match /stats/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated(); // Allow status increments
+    }
+  }
+}
