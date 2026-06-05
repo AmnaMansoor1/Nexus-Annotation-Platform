@@ -53,6 +53,15 @@ export default function Dashboard() {
       }
 
       const data = summarySnap.data() as PlatformSummary;
+      
+      // Auto-fix: If we detect an impossible state (Total is 0 but In Progress is not),
+      // or if totalArticles is missing, trigger a silent sync or alert.
+      if ((!data.totalArticles || data.totalArticles === 0) && (data.inProgressArticles > 0 || data.completedArticles > 0)) {
+        console.warn("Impossible stats detected. Summary document is out of sync.");
+        // We don't auto-sync here to avoid infinite loops/heavy reads on every load,
+        // but we'll show a warning to the admin.
+      }
+
       setStats(data);
       
       setStatusData([
@@ -192,6 +201,28 @@ export default function Dashboard() {
       </div>
 
       {/* KPI Grid */}
+      {(!stats.totalArticles || stats.totalArticles === 0) && stats.inProgressArticles > 0 && (
+        <div className="bg-amber-50 border-2 border-amber-200 p-6 rounded-[32px] flex items-center justify-between gap-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-600">
+              <ShieldAlert size={24} />
+            </div>
+            <div>
+              <p className="text-sm font-black text-amber-900 uppercase tracking-tight">Database Out of Sync</p>
+              <p className="text-xs font-bold text-amber-600/80">Your dashboard is showing incorrect counts because the summary document hasn't been initialized.</p>
+            </div>
+          </div>
+          <button
+            onClick={handleSyncStats}
+            disabled={syncing}
+            className="bg-amber-500 hover:bg-amber-600 text-white px-6 py-3 rounded-2xl font-black text-xs uppercase tracking-widest transition-all shadow-lg shadow-amber-200 flex items-center gap-2 shrink-0"
+          >
+            <RefreshCw size={16} className={syncing ? "animate-spin" : ""} />
+            Fix Statistics Now
+          </button>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         {statCards.map((card, i) => (
           <div key={i} className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col gap-4 hover:shadow-md transition-all group relative overflow-hidden">
