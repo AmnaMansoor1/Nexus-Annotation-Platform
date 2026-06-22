@@ -25,13 +25,9 @@ export interface Article {
 }
 
 export type BiasLabel = "neutral" | "slightly_manipulative" | "highly_manipulative";
-export type BiasType = "political" | "emotional" | "factual" | "other";
-export type ConfidenceLevel = "low" | "medium" | "high";
 
 export interface AnnotationResponse {
   label: BiasLabel;
-  bias_type: BiasType | null;
-  confidence: ConfidenceLevel;
   timestamp: Timestamp;
   time_spent_sec: number;
   is_gold_check: boolean;

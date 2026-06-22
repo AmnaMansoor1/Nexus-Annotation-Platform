@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article, Annotator, BiasLabel, BiasType, ConfidenceLevel } from "../types";
+import { Article, Annotator, BiasLabel } from "../types";
 import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
 import TimerRing from "../components/TimerRing";
@@ -28,8 +28,6 @@ export default function AnnotationWorkbench() {
 
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
-  const [biasType, setBiasType] = useState<BiasType | null>(null);
-  const [confidence, setConfidence] = useState<ConfidenceLevel | null>(null);
 
   // Update lastActive timestamp on every action
   useEffect(() => {
@@ -40,13 +38,6 @@ export default function AnnotationWorkbench() {
       localStorage.setItem("nexus_user_session", JSON.stringify(session));
     }
   }, [currentIndex, completedCount]);
-
-  // Auto-set bias type to 'other' if neutral is selected for convenience
-  useEffect(() => {
-    if (label === "neutral") {
-      setBiasType(null);
-    }
-  }, [label]);
 
   // Initial load of annotator state
   useEffect(() => {
@@ -92,8 +83,6 @@ export default function AnnotationWorkbench() {
           setStartTime(Date.now());
           setTimerExpired(false);
           setLabel(null);
-          setBiasType(null);
-          setConfidence(null);
         }
       } catch (err) {
         console.error("Error loading article:", err);
@@ -108,8 +97,7 @@ export default function AnnotationWorkbench() {
   }, [assignedArticles, assignmentLoading, completedArticles, navigate]);
 
   const handleSubmit = async () => {
-    const requiresBiasType = label !== "neutral";
-    if (!currentArticle || !label || !confidence || !timerExpired || (requiresBiasType && !biasType)) return;
+    if (!currentArticle || !label || !timerExpired) return;
 
     if (!userEmail) {
       alert("Session expired. Please login again.");
@@ -126,8 +114,6 @@ export default function AnnotationWorkbench() {
       const responseData = {
         annotator_email: userEmail,
         label,
-        bias_type: label === "neutral" ? null : biasType,
-        confidence,
         timestamp: serverTimestamp(),
         time_spent_sec: timeSpent,
         is_gold_check: !!currentArticle.is_gold_standard
@@ -258,8 +244,6 @@ export default function AnnotationWorkbench() {
       } else {
         // Reset form immediately for visual feedback
         setLabel(null);
-        setBiasType(null);
-        setConfidence(null);
         setTimerExpired(false);
       }
 
@@ -384,10 +368,10 @@ export default function AnnotationWorkbench() {
 
         {/* Right Panel: Form */}
         <div className="md:col-span-4 space-y-10">
-          {/* Section A: Manipulation Level */}
+          {/* Section: Manipulation Level */}
           <section className="space-y-5">
             <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
-              Step 1. What is the tone of this excerpt?
+              What is the tone of this excerpt?
             </h3>
             <div className="flex flex-col gap-3">
               {(["neutral", "slightly_manipulative", "highly_manipulative"] as const).map((opt) => (
@@ -411,69 +395,13 @@ export default function AnnotationWorkbench() {
             </div>
           </section>
 
-          {/* Section B: Bias Type */}
-          <section className={`space-y-5 transition-all duration-300 ${label === "neutral" ? "opacity-40 pointer-events-none" : "opacity-100"}`}>
-            <div className="flex justify-between items-center">
-              <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
-                Step 2. If biased, what type of bias?
-              </h3>
-              {label === "neutral" && (
-                <span className="text-[10px] bg-slate-100 text-slate-400 px-3 py-1 rounded-full font-black uppercase tracking-widest">Not needed</span>
-              )}
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              {(["political", "emotional", "factual", "other"] as const).map((opt) => (
-                <button
-                  key={opt}
-                  onClick={() => setBiasType(opt)}
-                  className={`p-4 rounded-xl border-2 text-xs font-black transition-all capitalize tracking-wider ${
-                    biasType === opt 
-                      ? "border-primary bg-primary text-white shadow-md shadow-primary/20" 
-                      : "border-slate-100 bg-white text-slate-400 hover:border-slate-200"
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          {/* Section C: Confidence */}
-          <section className="space-y-5">
-            <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
-              Step 3. How confident are you?
-            </h3>
-            <div className="flex gap-3">
-              {(["low", "medium", "high"] as const).map((opt) => (
-                <button
-                  key={opt}
-                  onClick={() => setConfidence(opt)}
-                  className={`flex-1 py-4 rounded-xl border-2 text-xs font-black transition-all capitalize tracking-wider ${
-                    confidence === opt 
-                      ? "border-primary bg-primary text-white shadow-md shadow-primary/20" 
-                      : "border-slate-100 bg-white text-slate-400 hover:border-slate-200"
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
-            </div>
-            {label === "neutral" && (
-              <p className="text-xs text-slate-400 font-medium">
-                {timerExpired
-                  ? "Neutral selected. No bias type is required. Select confidence to enable Submit & Next."
-                  : "Neutral selected. No bias type is required. Select confidence after the timer ends."}
-              </p>
-            )}
-          </section>
-
-          {/* Section D: Submit */}
+          {/* Section: Submit */}
           <div className="pt-4">
             <button
               onClick={handleSubmit}
-              disabled={!label || !confidence || !timerExpired || (label !== "neutral" && !biasType) || submitting}
+              disabled={!label || !timerExpired || submitting}
               className={`w-full py-4 rounded-xl font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-2 ${
-                label && confidence && timerExpired && (label === "neutral" || biasType) && !submitting
+                label && timerExpired && !submitting
                   ? "bg-primary text-white shadow-primary/25 hover:bg-primary/90"
                   : "bg-slate-100 text-slate-400 cursor-not-allowed shadow-none"
               }`}
@@ -482,12 +410,8 @@ export default function AnnotationWorkbench() {
                 <Loader2 className="animate-spin" size={24} />
               ) : !timerExpired ? (
                 <span>Wait for timer...</span>
-              ) : label === "neutral" && !confidence ? (
-                <span>Select confidence to continue</span>
-              ) : label !== "neutral" && !biasType ? (
-                <span>Select bias type to continue</span>
-              ) : !label || !confidence ? (
-                <span>Complete all fields</span>
+              ) : !label ? (
+                <span>Select a tone to continue</span>
               ) : (
                 <>Submit & Next <Check size={20} /></>
               )}

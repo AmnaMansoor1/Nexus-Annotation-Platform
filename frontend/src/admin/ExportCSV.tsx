@@ -43,8 +43,6 @@ export default function ExportCSV() {
         for (let i = 1; i <= 10; i++) {
           row[`ann_${i}_student_id`] = "";
           row[`ann_${i}_label`] = "";
-          row[`ann_${i}_bias_type`] = "";
-          row[`ann_${i}_confidence`] = "";
         }
 
         // 3. Fill in actual response data
@@ -53,8 +51,6 @@ export default function ExportCSV() {
             const slot = i + 1;
             row[`ann_${slot}_student_id`] = res.annotator_email || "unknown";
             row[`ann_${slot}_label`] = res.label || "";
-            row[`ann_${slot}_bias_type`] = res.bias_type || "";
-            row[`ann_${slot}_confidence`] = res.confidence || "";
           }
         });
 
