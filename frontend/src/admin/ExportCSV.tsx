@@ -35,7 +35,6 @@ export default function ExportCSV() {
           status: article.status || "",
           bias_score: article.bias_score || "",
           fleiss_kappa: article.fleiss_kappa || "",
-          is_gold_standard: article.is_gold_standard || false,
           total_annotations: article.annotation_count || responses.length
         };
 
