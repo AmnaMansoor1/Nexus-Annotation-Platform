@@ -124,6 +124,7 @@ export default function AnnotationWorkbench() {
       const annotatorRef = doc(db, "annotators", userEmail);
 
       let statusChangedTo: string | null = null;
+      let updatedCompletedCount = (completedCount || 0) + 1;
 
       // 1. ATOMIC TRANSACTION (Critical Data)
       await runTransaction(db, async (transaction) => {
@@ -191,8 +192,24 @@ export default function AnnotationWorkbench() {
         transaction.update(annotatorRef, annotatorUpdates);
       });
 
-      // 2. NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring)
-      // These run in the background and won't fail the submission if they error out
+      // 2. OPTIMISTIC UI UPDATE - DO THIS FIRST for perceived speed
+      setCompletedArticles(prev => [...prev, articleId]);
+      setCompletedCount(updatedCompletedCount);
+      setLabel(null);
+      setTimerExpired(false);
+      setSubmitting(false); // Unblock UI immediately
+
+      // Check for completion based on total target (20)
+      const isSessionDone = updatedCompletedCount >= 20;
+
+      if (isSessionDone) {
+        navigate("/done");
+      } else if (currentIndex + 1 >= assignedArticles.length) {
+        // If we ran out of assigned articles but haven't reached 20
+        navigate("/done");
+      }
+
+      // 3. NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring) - BACKGROUND ONLY
       (async () => {
         try {
           if (statusChangedTo === "complete") {
@@ -227,26 +244,6 @@ export default function AnnotationWorkbench() {
         }
       })();
 
-      // 3. UI PROGRESSION
-      // Update local state to trigger the load of the next article
-      setCompletedArticles(prev => [...prev, articleId]);
-      const totalCompleted = (completedCount || 0) + 1;
-      setCompletedCount(totalCompleted);
-
-      // Check for completion based on total target (20)
-      const isSessionDone = totalCompleted >= 20;
-
-      if (isSessionDone) {
-        navigate("/done");
-      } else if (currentIndex + 1 >= assignedArticles.length) {
-        // If we ran out of assigned articles but haven't reached 20
-        navigate("/done");
-      } else {
-        // Reset form immediately for visual feedback
-        setLabel(null);
-        setTimerExpired(false);
-      }
-
     } catch (err: any) {
       console.error("Submit error details:", err);
       let errorMsg = "An unexpected error occurred.";
@@ -254,6 +251,7 @@ export default function AnnotationWorkbench() {
       if (err.message === "ALREADY_SUBMITTED") {
         alert("You have already submitted an annotation for this article.");
         setCurrentIndex(prev => prev + 1);
+        setSubmitting(false);
         return;
       } else if (err.message === "ARTICLE_NOT_FOUND") {
         errorMsg = "Article data not found. Please refresh the page.";
@@ -266,8 +264,7 @@ export default function AnnotationWorkbench() {
       }
 
       alert(`Failed to save annotation: ${errorMsg}`);
-    } finally {
-      setSubmitting(false);
+      setSubmitting(false); // Ensure UI is unblocked if there's an error
     }
   };
 
