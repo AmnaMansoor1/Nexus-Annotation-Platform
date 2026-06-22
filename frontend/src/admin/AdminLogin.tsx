@@ -60,71 +60,79 @@ export default function AdminLogin() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-900 px-4 relative overflow-hidden">
-      {/* Abstract background shapes */}
-      <div className="absolute top-0 right-0 w-1/2 h-full bg-primary/5 -skew-x-12 translate-x-1/4" />
-      <div className="absolute bottom-0 left-0 w-1/3 h-1/2 bg-primary/10 rounded-full blur-[120px]" />
-
-      <div className="max-w-md w-full bg-white p-12 rounded-[40px] border border-slate-200 shadow-2xl relative animate-in fade-in zoom-in-95 duration-500">
-        <div className="text-center mb-10">
-          <div className="inline-flex items-center justify-center w-20 h-20 rounded-3xl bg-slate-900 text-white mb-6 rotate-3 hover:rotate-0 transition-transform duration-500 shadow-xl shadow-slate-900/20">
-            <Lock size={36} />
-          </div>
-          <h1 className="text-4xl font-black text-slate-900 tracking-tighter italic">ADMIN PORTAL</h1>
-          <p className="text-slate-400 mt-3 text-[10px] uppercase tracking-[0.3em] font-black">
-            Nexus Security Layer
-          </p>
-        </div>
-
-        <form onSubmit={handleLogin} className="space-y-6">
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Secure Email</label>
-            <input
-              type="email"
-              required
-              className="w-full px-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:bg-white focus:border-slate-900/10 focus:ring-4 focus:ring-slate-900/5 outline-none transition-all font-bold text-slate-700 placeholder:text-slate-300"
-              placeholder="admin@gmail.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-            />
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Access Key</label>
-            <input
-              type="password"
-              required
-              className="w-full px-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:bg-white focus:border-slate-900/10 focus:ring-4 focus:ring-slate-900/5 outline-none transition-all font-bold text-slate-700 placeholder:text-slate-300"
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </div>
-
-          {error && (
-            <div className="p-5 rounded-2xl bg-red-50 text-red-600 text-sm font-bold border-2 border-red-100 animate-in shake duration-300">
-              {error}
+    <div className="min-h-screen flex items-center justify-center bg-white px-4 relative overflow-hidden">
+      <div className="max-w-md w-full relative">
+        <div className="bg-white rounded-3xl shadow-lg border border-gray-200 overflow-hidden animate-in fade-in zoom-in-95 duration-500">
+          {/* Header */}
+          <div className="bg-white pt-12 px-10 text-center">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gray-100 text-gray-700 mb-4">
+              <Lock size={32} />
             </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-slate-900 text-white py-5 rounded-2xl font-black uppercase tracking-[0.2em] text-xs hover:bg-black transition-all shadow-xl shadow-slate-900/20 active:scale-[0.98] mt-4 flex items-center justify-center gap-2"
-          >
-            {loading ? <Loader2 className="animate-spin" size={18} /> : "Authenticate & Access"}
-          </button>
-          
-          <div className="pt-8 text-center">
-            <button
-              type="button"
-              onClick={() => navigate("/")}
-              className="text-[10px] text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center gap-3 mx-auto font-black uppercase tracking-[0.2em] group"
-            >
-              <span className="group-hover:-translate-x-1 transition-transform">←</span> Return to Student View
-            </button>
+            <h1 className="text-4xl font-black tracking-tighter text-gray-800 italic">ADMIN PORTAL</h1>
+            <p className="text-gray-500 mt-2 text-base">
+              Sign in to continue
+            </p>
           </div>
-        </form>
+
+          <div className="px-10 pt-8 pb-12">
+            <form onSubmit={handleLogin} className="space-y-6">
+              <div className="space-y-2">
+                <div className="relative group">
+                  <input
+                    type="email"
+                    required
+                    id="email"
+                    className="w-full px-4 py-4 rounded-xl bg-white border-2 border-gray-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-base text-gray-800 placeholder:text-gray-400"
+                    placeholder="Email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <div className="relative group">
+                  <input
+                    type="password"
+                    required
+                    id="password"
+                    className="w-full px-4 py-4 rounded-xl bg-white border-2 border-gray-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-base text-gray-800 placeholder:text-gray-400"
+                    placeholder="Password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {error && (
+                <div className="p-4 rounded-xl bg-red-50 text-red-600 text-sm border border-red-100 animate-in shake duration-300">
+                  {error}
+                </div>
+              )}
+
+              <div className="flex justify-between items-center mt-4">
+                <button
+                  type="button"
+                  onClick={() => navigate("/")}
+                  className="text-blue-600 text-sm font-medium hover:underline focus:outline-none"
+                >
+                  Go to Student View
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="px-8 py-3 bg-blue-600 text-white rounded-full font-medium text-sm shadow-md hover:bg-blue-700 hover:shadow-lg hover:-translate-y-0.5 active:translate-y-0 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {loading ? (
+                    <Loader2 className="animate-spin" size={18} />
+                  ) : (
+                    <span>Next</span>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       </div>
     </div>
   );
