@@ -44,6 +44,7 @@ export default function AnnotatorsTable() {
           <table className="w-full text-left">
             <thead className="bg-slate-50 border-b border-slate-100">
               <tr>
+                <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Student</th>
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Reg. Code</th>
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider text-center">Progress</th>
                 <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">Status</th>
@@ -53,7 +54,7 @@ export default function AnnotatorsTable() {
             <tbody className="divide-y divide-slate-100">
               {loading ? (
                 <tr>
-                  <td colSpan={4} className="px-6 py-12 text-center">
+                  <td colSpan={5} className="px-6 py-12 text-center">
                     <Loader2 className="animate-spin inline mr-2 text-primary" />
                     <span className="text-slate-500 font-medium">Loading annotators...</span>
                   </td>
@@ -66,6 +67,19 @@ export default function AnnotatorsTable() {
 
                   return (
                     <tr key={ann.email} className={`hover:bg-slate-50/50 transition-colors group ${ann.deactivated ? "opacity-50" : ""}`}>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
+                            <User size={20} />
+                          </div>
+                          <div>
+                            <div className="font-bold text-slate-700">{ann.full_name || ann.email?.split('@')[0] || "Unknown"}</div>
+                            <div className="text-xs text-slate-400 flex items-center gap-1">
+                              <Mail size={12} /> {ann.email || "No email"}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
                       <td className="px-6 py-4 font-mono text-sm text-slate-600">
                         {ann.registration_code || "—"}
                       </td>
