@@ -104,53 +104,30 @@ export default function Login() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg-student px-4 relative overflow-hidden">
-      {/* Decorative background elements */}
-      <div className="absolute -top-24 -left-24 w-96 h-96 bg-primary/5 rounded-full blur-3xl" />
-      <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-primary/10 rounded-full blur-3xl" />
-      
+    <div className="min-h-screen flex items-center justify-center bg-white px-4 relative overflow-hidden">
       <div className="max-w-md w-full relative">
-        <div className="bg-white rounded-[40px] shadow-2xl shadow-slate-200/50 border border-slate-100 overflow-hidden animate-in fade-in zoom-in-95 duration-500">
+        <div className="bg-white rounded-3xl shadow-lg border border-gray-200 overflow-hidden animate-in fade-in zoom-in-95 duration-500">
           {/* Header */}
-          <div className="bg-white p-10 text-center border-b border-slate-50 relative overflow-hidden">
-            <div className="absolute top-0 left-0 w-full h-1 bg-primary" />
-            <h1 className="text-5xl font-black tracking-tighter text-primary italic">NEXUS</h1>
-            <p className="text-slate-400 mt-3 text-xs uppercase tracking-[0.2em] font-black">
-              Annotation Platform
+          <div className="bg-white pt-12 px-10 text-center">
+            <h1 className="text-5xl font-black tracking-tighter text-gray-800 italic">NEXUS</h1>
+            <p className="text-gray-500 mt-2 text-base">
+              {mode === "login" ? "Sign in" : "Create your account"}
+            </p>
+            <p className="text-gray-400 mt-1 text-sm">
+              {mode === "login" ? "to continue to the annotation platform" : "to get started with annotations"}
             </p>
           </div>
 
-          {/* Tab Switcher */}
-          <div className="flex bg-slate-50/80 p-1.5 mx-8 my-6 rounded-2xl border border-slate-100">
-            <button
-              onClick={() => setMode("login")}
-              className={`flex-1 py-3 text-sm font-black uppercase tracking-wider flex items-center justify-center gap-2 rounded-xl transition-all ${
-                mode === "login" ? "text-primary bg-white shadow-md shadow-slate-200" : "text-slate-400 hover:text-slate-600"
-              }`}
-            >
-              <LogIn size={18} /> Login
-            </button>
-            <button
-              onClick={() => setMode("signup")}
-              className={`flex-1 py-3 text-sm font-black uppercase tracking-wider flex items-center justify-center gap-2 rounded-xl transition-all ${
-                mode === "signup" ? "text-primary bg-white shadow-md shadow-slate-200" : "text-slate-400 hover:text-slate-600"
-              }`}
-            >
-              <UserPlus size={18} /> Sign Up
-            </button>
-          </div>
-
-          <div className="px-10 pb-10">
-            <form onSubmit={handleAuth} className="space-y-4">
+          <div className="px-10 pt-8 pb-12">
+            <form onSubmit={handleAuth} className="space-y-6">
               <div className="space-y-2">
-                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">Institutional Email</label>
                 <div className="relative group">
-                  <Mail className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-300 group-focus-within:text-primary transition-colors" size={20} />
                   <input
                     type="email"
                     required
-                    className="w-full pl-12 pr-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:bg-white focus:border-primary/20 focus:ring-4 focus:ring-primary/5 outline-none transition-all font-bold text-slate-700 placeholder:text-slate-300 placeholder:font-medium"
-                    placeholder="student@university.edu"
+                    id="email"
+                    className="w-full px-4 py-4 rounded-xl bg-white border-2 border-gray-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-base text-gray-800 placeholder:text-gray-400"
+                    placeholder="Email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                   />
@@ -158,33 +135,31 @@ export default function Login() {
               </div>
 
               {mode === "signup" && (
-                <div className="space-y-4 animate-in slide-in-from-top-4 duration-300">
+                <div className="space-y-6 animate-in slide-in-from-top-4 duration-300">
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">Registration Code / Password</label>
                     <div className="relative group">
-                      <Lock className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-300 group-focus-within:text-primary transition-colors" size={20} />
-                      <input
-                        type="password"
-                        required
-                        className="w-full pl-12 pr-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:bg-white focus:border-primary/20 focus:ring-4 focus:ring-primary/5 outline-none transition-all font-bold text-slate-700 placeholder:text-slate-300 placeholder:font-medium"
-                        placeholder="••••••••"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 block">Full Name</label>
-                    <div className="relative group">
-                      <User className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-300 group-focus-within:text-primary transition-colors" size={20} />
                       <input
                         type="text"
                         required
-                        className="w-full pl-12 pr-6 py-4 rounded-2xl bg-slate-50 border-2 border-transparent focus:bg-white focus:border-primary/20 focus:ring-4 focus:ring-primary/5 outline-none transition-all font-bold text-slate-700 placeholder:text-slate-300 placeholder:font-medium"
-                        placeholder="John Doe"
+                        id="fullName"
+                        className="w-full px-4 py-4 rounded-xl bg-white border-2 border-gray-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-base text-gray-800 placeholder:text-gray-400"
+                        placeholder="Full Name"
                         value={fullName}
                         onChange={(e) => setFullName(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <div className="relative group">
+                      <input
+                        type="password"
+                        required
+                        id="password"
+                        className="w-full px-4 py-4 rounded-xl bg-white border-2 border-gray-200 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 outline-none transition-all text-base text-gray-800 placeholder:text-gray-400"
+                        placeholder="Password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
                       />
                     </div>
                   </div>
@@ -192,40 +167,43 @@ export default function Login() {
               )}
 
               {error && (
-                <div className="p-5 rounded-2xl bg-red-50 text-red-600 text-sm font-bold border-2 border-red-100 flex items-start gap-3 animate-in shake duration-300">
-                  <div className="w-5 h-5 rounded-full bg-red-600 text-white flex items-center justify-center shrink-0 mt-0.5">!</div>
+                <div className="p-4 rounded-xl bg-red-50 text-red-600 text-sm border border-red-100 flex items-start gap-3 animate-in shake duration-300">
+                  <div className="w-5 h-5 rounded-full bg-red-600 text-white flex items-center justify-center shrink-0 mt-0.5 text-xs font-bold">!</div>
                   <span>{error}</span>
                 </div>
               )}
 
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full py-4 bg-primary text-white rounded-2xl font-black uppercase tracking-[0.2em] shadow-lg shadow-primary/20 hover:shadow-primary/40 hover:-translate-y-0.5 active:translate-y-0 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3 mt-4"
-              >
-                {loading ? (
-                  <Loader2 className="animate-spin" size={20} />
-                ) : (
-                  <>
-                    {mode === "login" ? "Enter Portal" : "Create Account"}
-                    <LogIn size={20} className={mode === "signup" ? "hidden" : ""} />
-                  </>
-                )}
-              </button>
+              <div className="flex justify-between items-center mt-4">
+                <button
+                  type="button"
+                  onClick={() => setMode(mode === "login" ? "signup" : "login")}
+                  className="text-blue-600 text-sm font-medium hover:underline focus:outline-none"
+                >
+                  {mode === "login" ? "Create account" : "Sign in instead"}
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="px-8 py-3 bg-blue-600 text-white rounded-full font-medium text-sm shadow-md hover:bg-blue-700 hover:shadow-lg hover:-translate-y-0.5 active:translate-y-0 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {loading ? (
+                    <Loader2 className="animate-spin" size={18} />
+                  ) : (
+                    <span>{mode === "login" ? "Next" : "Create"}</span>
+                  )}
+                </button>
+              </div>
             </form>
-            
-            <div className="pt-8 text-center space-y-4">
-              <p className="text-[10px] font-black text-slate-300 uppercase tracking-widest">
-                Research Project • University Level
-              </p>
-              <Link 
-                to="/admin" 
-                className="inline-block text-[10px] font-black text-slate-400 hover:text-primary uppercase tracking-[0.2em] transition-colors border-t border-slate-50 pt-4 w-full"
-              >
-                Access Admin Portal →
-              </Link>
-            </div>
           </div>
+        </div>
+        
+        <div className="pt-8 text-center">
+          <Link 
+            to="/admin" 
+            className="inline-block text-sm text-gray-500 hover:text-gray-700 transition-colors"
+          >
+            Go to Admin Portal
+          </Link>
         </div>
       </div>
     </div>
