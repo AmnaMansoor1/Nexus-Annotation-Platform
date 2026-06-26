@@ -28,15 +28,13 @@ export default function AnnotatorsTable() {
   const recalculateProgress = async (annotator: Annotator) => {
     if (!confirm("Recalculate annotator's progress based on actual saved annotations?")) return;
     try {
-      // Optimized: First check all articles in annotator's assigned list
-      const articlesToCheck = new Set<string>((annotator.assigned_articles || []));
-      
-      // Also check any existing entries in completed_articles to make sure they exist
-      (annotator.completed_articles || []).forEach(id => articlesToCheck.add(id));
+      // 1. Check ALL articles (not just assigned and previously completed)
+      const allArticlesSnap = await getDocs(collection(db, "articles"));
+      const allArticleIds = allArticlesSnap.docs.map(doc => doc.id);
       
       const actualCompleted = [];
 
-      for (const articleId of articlesToCheck) {
+      for (const articleId of allArticleIds) {
         const responseDoc = await getDoc(
           doc(db, "annotations", articleId, "responses", annotator.email)
         );

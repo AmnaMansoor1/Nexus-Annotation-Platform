@@ -268,7 +268,22 @@ export default function AnnotationWorkbench() {
         })();
       }, 3, 500);
 
-      // --- 4. Now check for next articles / proceed with UI navigation ---
+      // --- 4. VERIFY SAVE: Check that the annotation response actually exists ---
+      const verifyAnnotationDoc = await getDoc(doc(db, "annotations", articleId, "responses", userEmail));
+      if (!verifyAnnotationDoc.exists()) {
+        throw new Error("Annotation failed verification after save");
+      }
+
+      // --- 5. Refresh annotator's completed_articles from DB to be 100% sure ---
+      const annotatorRefAfter = doc(db, "annotators", userEmail);
+      const annotatorDocAfter = await getDoc(annotatorRefAfter);
+      if (annotatorDocAfter.exists()) {
+        const data = annotatorDocAfter.data() as Annotator;
+        setCompletedArticles(data.completed_articles || []);
+        setCompletedCount(data.completed_articles?.length || 0);
+      }
+
+      // --- 6. Now check for next articles / proceed with UI navigation ---
       let nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
       if (nextPendingIndex === -1 && newCompletedCount < 20) {
         setAssignmentRefresh(prev => prev + 1);
