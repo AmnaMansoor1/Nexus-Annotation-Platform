@@ -8,9 +8,11 @@ export default function Settings() {
   const [config, setConfig] = useState<AdminConfig>({
     total_target: 100,
     gold_article_ids: [],
-    annotators_per_article: 10
+    annotators_per_article: 10,
+    admin_emails: ["admin@gmail.com"]
   });
   const [goldInput, setGoldInput] = useState("");
+  const [adminEmailsInput, setAdminEmailsInput] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
@@ -22,6 +24,7 @@ export default function Settings() {
         const data = docSnap.data() as AdminConfig;
         setConfig(data);
         setGoldInput(data.gold_article_ids.join(", "));
+        setAdminEmailsInput((data.admin_emails || ["admin@gmail.com"]).join(", "));
       }
       setLoading(false);
     }
@@ -34,7 +37,8 @@ export default function Settings() {
     setSuccess(false);
 
     const goldIds = goldInput.split(",").map(id => id.trim()).filter(id => id !== "");
-    const newConfig = { ...config, gold_article_ids: goldIds };
+    const adminEmails = adminEmailsInput.split(",").map(email => email.trim().toLowerCase()).filter(email => email !== "");
+    const newConfig = { ...config, gold_article_ids: goldIds, admin_emails: adminEmails };
 
     try {
       await setDoc(doc(db, "admin_config", "settings"), newConfig);
@@ -80,6 +84,20 @@ export default function Settings() {
             />
             <p className="text-xs text-slate-400 font-medium italic">Number of annotations required for a 'complete' status.</p>
           </div>
+        </div>
+
+        <div className="space-y-3">
+          <label className="block text-sm font-bold text-slate-700 uppercase tracking-wider">Admin Emails (Comma-Separated)</label>
+          <input
+            type="text"
+            className="w-full px-5 py-4 rounded-xl bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-primary/20 focus:bg-white outline-none font-mono text-sm leading-relaxed transition-all text-slate-700"
+            placeholder="admin@gmail.com, amna@cuilahore.edu.pk"
+            value={adminEmailsInput}
+            onChange={(e) => setAdminEmailsInput(e.target.value)}
+          />
+          <p className="text-xs text-slate-400 font-medium italic leading-relaxed">
+            List of emails that have admin privileges (access to admin panel and recalculate functions).
+          </p>
         </div>
 
         <div className="space-y-3">

@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Lock, Loader2 } from "lucide-react";
 import { signInWithEmailAndPassword } from "firebase/auth";
-import { auth } from "../firebase";
+import { auth, db } from "../firebase";
+import { getDoc, doc } from "firebase/firestore";
 
 export default function AdminLogin() {
   const [email, setEmail] = useState("");
@@ -30,8 +31,19 @@ export default function AdminLogin() {
       // 1. Authenticate with Firebase (Server-side check)
       await signInWithEmailAndPassword(auth, email, password);
 
-      // 2. Authorization check (Only the master admin email allowed)
-      if (email.toLowerCase() === "admin@gmail.com") {
+      // 2. Load admin config to check allowed emails
+      let allowedAdminEmails = ["admin@gmail.com"];
+      try {
+        const configDoc = await getDoc(doc(db, "admin_config", "settings"));
+        if (configDoc.exists()) {
+          allowedAdminEmails = configDoc.data().admin_emails || ["admin@gmail.com"];
+        }
+      } catch (configErr) {
+        console.warn("Could not load admin config, using default admin email", configErr);
+      }
+      
+      // 3. Authorization check
+      if (allowedAdminEmails.includes(email.toLowerCase())) {
         const session = {
           email: email.toLowerCase(),
           role: "admin",

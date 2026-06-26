@@ -52,6 +52,7 @@ export interface AdminConfig {
   total_target: number;
   gold_article_ids: string[];
   annotators_per_article: number;
+  admin_emails: string[];
 }
 
 export interface PlatformSummary {

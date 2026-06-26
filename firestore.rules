@@ -9,7 +9,15 @@ service cloud.firestore {
     }
     
     function isAdmin() {
-      return isAuthenticated() && request.auth.token.email.lower() == "admin@gmail.com";
+      if (!isAuthenticated()) return false;
+      
+      // Try to get admin config
+      let adminConfig = get(/databases/$(database)/documents/admin_config/settings).data;
+      
+      // Fallback: if no admin config exists, use default admin@gmail.com
+      let allowedEmails = adminConfig.admin_emails != null ? adminConfig.admin_emails : ["admin@gmail.com"];
+      
+      return request.auth.token.email.lower() in allowedEmails;
     }
     
     function isOwner(email) {
