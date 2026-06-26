@@ -28,21 +28,37 @@ export default function AnnotatorsTable() {
   const recalculateProgress = async (annotator: Annotator) => {
     if (!confirm("Recalculate annotator's progress based on actual saved annotations?")) return;
     try {
+      console.log(`[Recalculate] Starting for ${annotator.email}`);
+      
       // 1. Check ALL articles (not just assigned and previously completed)
       const allArticlesSnap = await getDocs(collection(db, "articles"));
       const allArticleIds = allArticlesSnap.docs.map(doc => doc.id);
+      console.log(`[Recalculate] Found ${allArticleIds.length} total articles`);
       
       const actualCompleted = [];
+      const emailsToCheck = [
+        annotator.email,
+        annotator.email.toLowerCase(),
+        annotator.email.toUpperCase()
+      ];
 
       for (const articleId of allArticleIds) {
-        const responseDoc = await getDoc(
-          doc(db, "annotations", articleId, "responses", annotator.email)
-        );
-        if (responseDoc.exists()) {
-          actualCompleted.push(articleId);
+        for (const email of emailsToCheck) {
+          const responseDoc = await getDoc(
+            doc(db, "annotations", articleId, "responses", email)
+          );
+          if (responseDoc.exists()) {
+            console.log(`[Recalculate] Found annotation for article: ${articleId} (using email: ${email}`);
+            if (!actualCompleted.includes(articleId)) {
+              actualCompleted.push(articleId);
+            }
+            break; // no need to check other emails for same article
+          }
         }
       }
 
+      console.log(`[Recalculate] Total completed articles found: ${actualCompleted.length}`);
+      
       // Now update annotator document in Firestore
       const annotatorRef = doc(db, "annotators", annotator.email);
       await updateDoc(annotatorRef, {
@@ -52,7 +68,7 @@ export default function AnnotatorsTable() {
       
       alert(`Progress recalculated! Completed articles: ${actualCompleted.length}/20`);
     } catch (err) {
-      console.error(err);
+      console.error("[Recalculate] Error:", err);
       alert("Error recalculating progress: " + err);
     }
   };
