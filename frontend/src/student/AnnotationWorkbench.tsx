@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { db } from "../firebase";
@@ -11,12 +11,12 @@ import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
 
-// Helper to retry async operations with exponential backoff
-const retryWithBackoff = async <T>(
-  fn: () => Promise<T>,
+// Helper to retry async operations with exponential backoff (no generics to avoid errors)
+const retryWithBackoff = async (
+  fn: () => Promise<any>,
   retries = 3,
   delay = 500
-): Promise<T> => {
+): Promise<any> => {
   try {
     return await fn();
   } catch (error) {
@@ -46,7 +46,38 @@ export default function AnnotationWorkbench() {
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
 
-  // Update lastActive timestamp
+  // Load article from cache or Firestore
+  const loadArticleFromCacheOrDB = useCallback(async (articleId: string): Promise<Article | null> => {
+    // Check cache first
+    if (articlesCache.has(articleId)) {
+      return articlesCache.get(articleId) as Article;
+    }
+    // If not in cache, fetch from DB and add to cache
+    const articleDoc = await getDoc(doc(db, "articles", articleId));
+    if (articleDoc.exists()) {
+      const article = articleDoc.data() as Article;
+      setArticlesCache(prev => {
+        const newCache = new Map(prev);
+        newCache.set(articleId, article);
+        return newCache;
+      });
+      return article;
+    }
+    return null;
+  }, [articlesCache]);
+
+  // Preload next article
+  const preloadNextArticle = useCallback(async (nextIndex: number): Promise<void> => {
+    if (nextIndex < assignedArticles.length) {
+      const nextArticleId = assignedArticles[nextIndex];
+      if (!completedArticles.includes(nextArticleId)) {
+        const article = await loadArticleFromCacheOrDB(nextArticleId);
+        if (article) setNextArticle(article);
+      }
+    }
+  }, [assignedArticles, completedArticles, loadArticleFromCacheOrDB]);
+
+  // Update lastActive timestamp on every action
   useEffect(() => {
     const sessionStr = localStorage.getItem("nexus_user_session");
     if (sessionStr) {
@@ -75,34 +106,7 @@ export default function AnnotationWorkbench() {
     initAnnotator();
   }, [userEmail]);
 
-  // Load article from cache or Firestore
-  const loadArticleFromCacheOrDB = useCallback(async (articleId: string) => {
-    // Check cache first
-    if (articlesCache.has(articleId)) {
-      return articlesCache.get(articleId)!;
-    }
-    // If not in cache, fetch from DB and add to cache
-    const articleDoc = await getDoc(doc(db, "articles", articleId));
-    if (articleDoc.exists()) {
-      const article = articleDoc.data() as Article;
-      setArticlesCache(prev => new Map(prev).set(articleId, article));
-      return article;
-    }
-    return null;
-  }, [articlesCache]);
-
-  // Preload next article
-  const preloadNextArticle = useCallback(async (nextIndex: number) => {
-    if (nextIndex < assignedArticles.length) {
-      const nextArticleId = assignedArticles[nextIndex];
-      if (!completedArticles.includes(nextArticleId)) {
-        const article = await loadArticleFromCacheOrDB(nextArticleId);
-        if (article) setNextArticle(article);
-      }
-    }
-  }, [assignedArticles, completedArticles, loadArticleFromCacheOrDB]);
-
-  // Load current article and preload next
+  // Load current article based on assigned pool and local completed state
   useEffect(() => {
     async function loadArticle() {
       if (assignedArticles.length === 0) {
@@ -128,7 +132,7 @@ export default function AnnotationWorkbench() {
           setTimerExpired(false);
           setLabel(null);
           
-          // Preload next article
+          // Preload the next article right away!
           await preloadNextArticle(firstPendingIndex + 1);
         }
       } catch (err) {
@@ -152,15 +156,15 @@ export default function AnnotationWorkbench() {
       return;
     }
 
-    const articleId = currentArticle.article_id;
     const timeSpent = Math.round((Date.now() - startTime) / 1000);
-    const newCompletedCount = completedCount + 1;
+    const articleId = currentArticle.article_id;
+    const newCompletedCount = (completedCount || 0) + 1;
 
-    // 1. OPTIMISTIC UI UPDATE - DO THIS FIRST BEFORE ANYTHING ELSE!
+    // 1. INSTANT UI UPDATE - DO THIS FIRST BEFORE ANY DATABASE CALLS!
     setCompletedArticles(prev => [...prev, articleId]);
     setCompletedCount(newCompletedCount);
-
-    // 2. SWITCH TO NEXT ARTICLE IMMEDIATELY
+    
+    // 2. SWITCH TO NEXT ARTICLE RIGHT AWAY!
     const nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
     if (nextPendingIndex !== -1 && nextArticle) {
       setCurrentIndex(nextPendingIndex);
@@ -169,14 +173,14 @@ export default function AnnotationWorkbench() {
       setTimerExpired(false);
       setLabel(null);
       setSubmitting(false);
-      // Start preloading the article after next
+      // Start preloading the article after next!
       preloadNextArticle(nextPendingIndex + 1);
     } else if (newCompletedCount >= 20 || nextPendingIndex === -1) {
       navigate("/done");
       return;
     }
 
-    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND WITH RETRIES
+    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND WITH RETRIES!
     setSubmitting(true);
     try {
       await retryWithBackoff(async () => {
@@ -200,7 +204,7 @@ export default function AnnotationWorkbench() {
           // Check for duplicate submission
           const responseSnap = await transaction.get(responseRef);
           if (responseSnap.exists()) {
-            return; // Already submitted, no problem
+            return; // Already submitted, no problem!
           }
 
           // Get current article state
@@ -249,6 +253,8 @@ export default function AnnotationWorkbench() {
             annotatorUpdates.gold_correct_count = newCorrect;
             annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
             annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
+          } else if (currentArticle.is_gold_standard && !currentArticle.gold_expected_label) {
+            console.warn("Skipping gold check update: Article is marked as gold standard but missing gold_expected_label", articleId);
           }
 
           const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
@@ -259,7 +265,7 @@ export default function AnnotationWorkbench() {
           transaction.update(annotatorRef, annotatorUpdates);
         });
 
-        // NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring)
+        // NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring) - BACKGROUND
         (async () => {
           try {
             if (statusChangedTo === "complete") {
@@ -293,7 +299,7 @@ export default function AnnotationWorkbench() {
             console.warn("Background stats update failed:", e);
           }
         })();
-      }, 3, 500); // 3 retries with exponential backoff (500ms, 1000ms, 2000ms)
+      }, 3, 500); // 3 retries!
     } catch (err: any) {
       console.error("Submit failed after retries:", err);
       alert("Failed to save annotation. Please check your internet connection and refresh the page.");
