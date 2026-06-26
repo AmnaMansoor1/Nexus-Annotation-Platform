@@ -40,8 +40,9 @@ export default function AnnotationWorkbench() {
   const [nextArticle, setNextArticle] = useState<Article | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [verifyingFinalAnnotations, setVerifyingFinalAnnotations] = useState(false);
   const [timerExpired, setTimerExpired] = useState(false);
-  const [startTime, setStartTime] = useState<number>(0);
+  const [startTime, setStartTime] = useState(0);
   const [articlesCache, setArticlesCache] = useState<Map<string, Article>>(new Map());
 
   // Form State
@@ -157,11 +158,10 @@ export default function AnnotationWorkbench() {
 
     const timeSpent = Math.round((Date.now() - startTime) / 1000);
     const articleId = currentArticle.article_id;
-    const newCompletedCount = (completedCount || 0) + 1;
 
     // --- 1. INSTANT OPTIMISTIC UI UPDATE ---
     setCompletedArticles(prev => [...prev, articleId]);
-    setCompletedCount(newCompletedCount);
+    setCompletedCount(prev => prev + 1);
 
     // --- 2. CAPTURE ALL VARS WE NEED TO SAVE FIRST ---
     const savedLabel = label;
@@ -274,22 +274,28 @@ export default function AnnotationWorkbench() {
         throw new Error("Annotation failed verification after save");
       }
 
-      // --- 5. IF this is 20th annotation: POLL Firestore until annotator has 20 completed articles and completed flag is true ---
-      const is20thAnnotation = newCompletedCount >= 20;
-      if (is20thAnnotation) {
+      // --- 5. Check from Firestore if this annotation brought us to >= 20 ---
+      let initialAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
+      let actualCompletedCountFromFirestore = initialAnnotatorCheck.exists() ? initialAnnotatorCheck.data().completed_articles?.length : 0;
+      
+      if (actualCompletedCountFromFirestore >= 20) {
+        // --- NOW POLL ---
+        setVerifyingFinalAnnotations(true);
         let pollAttempts = 0;
         const maxPollAttempts = 30;
+        let success = false;
+        
         while (pollAttempts < maxPollAttempts) {
           const annotatorRefAfter = doc(db, "annotators", userEmail);
           const annotatorDocAfter = await getDoc(annotatorRefAfter);
           
           if (annotatorDocAfter.exists()) {
             const data = annotatorDocAfter.data() as Annotator;
-            // Update local state
             setCompletedArticles(data.completed_articles || []);
             setCompletedCount(data.completed_articles?.length || 0);
             
             if (data.completed_articles?.length >= 20 && data.completed === true) {
+              success = true;
               break;
             }
           }
@@ -299,22 +305,29 @@ export default function AnnotationWorkbench() {
         }
         
         // Final double check before navigating
-        const finalAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
-        if (!finalAnnotatorCheck.exists() || finalAnnotatorCheck.data().completed_articles?.length < 20 || finalAnnotatorCheck.data().completed !== true) {
-          throw new Error("Failed to confirm 20 completed annotations in Firestore");
+        if (!success) {
+          const finalAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
+          if (!finalAnnotatorCheck.exists() || finalAnnotatorCheck.data().completed_articles?.length < 20 || finalAnnotatorCheck.data().completed !== true) {
+            throw new Error("Failed to confirm 20 completed annotations in Firestore");
+          }
         }
+        
+        setVerifyingFinalAnnotations(false);
+        setSubmitting(false);
+        navigate("/done");
+        return;
       }
 
-      // --- 6. Now check for next articles / proceed with UI navigation ---
+      // --- 6. If NOT 20, proceed with next article ---
+      setSubmitting(false);
+      
       let nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
-      if (nextPendingIndex === -1 && newCompletedCount < 20) {
+      if (nextPendingIndex === -1 && actualCompletedCountFromFirestore < 20) {
         setAssignmentRefresh(prev => prev + 1);
         await loadAssignment();
         nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
       }
-
-      setSubmitting(false);
-
+      
       if (nextPendingIndex !== -1 && nextArticle) {
         setCurrentIndex(nextPendingIndex);
         setCurrentArticle(nextArticle);
@@ -322,18 +335,17 @@ export default function AnnotationWorkbench() {
         setTimerExpired(false);
         setLabel(null);
         preloadNextArticle(nextPendingIndex + 1);
-      } else if (newCompletedCount >= 20) {
-        navigate("/done");
       } else {
         navigate("/done");
       }
+
     } catch (err: any) {
       console.error("Annotation failed to save after retries!", err);
       alert("Annotation failed to save properly. Please refresh and try again!");
       setSubmitting(false);
-      // Revert optimistic updates on failure
+      setVerifyingFinalAnnotations(false);
       setCompletedArticles(prev => prev.filter(id => id !== articleId));
-      setCompletedCount(newCompletedCount - 1);
+      setCompletedCount(prev => prev - 1);
     }
   };
 
@@ -462,15 +474,20 @@ export default function AnnotationWorkbench() {
           <div className="pt-4">
             <button
               onClick={handleSubmit}
-              disabled={!label || !timerExpired || submitting}
+              disabled={!label || !timerExpired || submitting || verifyingFinalAnnotations}
               className={`w-full py-4 rounded-xl font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-2 ${
-                label && timerExpired && !submitting
+                label && timerExpired && !submitting && !verifyingFinalAnnotations
                   ? "bg-primary text-white shadow-primary/25 hover:bg-primary/90"
                   : "bg-slate-100 text-slate-400 cursor-not-allowed shadow-none"
               }`}
             >
-              {submitting ? (
+              {submitting && !verifyingFinalAnnotations ? (
                 <Loader2 className="animate-spin" size={24} />
+              ) : verifyingFinalAnnotations ? (
+                <>
+                  <Loader2 className="animate-spin" size={24} />
+                  <span>Saving & Verifying Final Annotations...</span>
+                </>
               ) : !timerExpired ? (
                 <span>Wait for timer...</span>
               ) : !label ? (
