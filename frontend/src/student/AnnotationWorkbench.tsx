@@ -30,7 +30,8 @@ export default function AnnotationWorkbench() {
   const navigate = useNavigate();
   const session = JSON.parse(localStorage.getItem("nexus_user_session") || "{}");
   const userEmail = (session.email || "").toLowerCase().trim();
-  const { assignedArticles, loading: assignmentLoading } = useArticleAssignment(userEmail);
+  const [assignmentRefresh, setAssignmentRefresh] = useState(0);
+  const { assignedArticles, loading: assignmentLoading, loadAssignment } = useArticleAssignment(userEmail, assignmentRefresh);
 
   const [completedArticles, setCompletedArticles] = useState<string[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -164,8 +165,17 @@ export default function AnnotationWorkbench() {
     setCompletedArticles(prev => [...prev, articleId]);
     setCompletedCount(newCompletedCount);
     
-    // 2. SWITCH TO NEXT ARTICLE RIGHT AWAY!
-    const nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
+    // 2. CHECK IF WE NEED MORE ARTICLES FIRST!
+    let nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
+    if (nextPendingIndex === -1 && newCompletedCount < 20) {
+      // TRY TO REFILL ASSIGNMENT POOL!
+      setAssignmentRefresh(prev => prev + 1);
+      await loadAssignment();
+      // Re-check next pending index after refresh
+      nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
+    }
+
+    // 3. SWITCH TO NEXT ARTICLE OR NAVIGATE TO DONE
     if (nextPendingIndex !== -1 && nextArticle) {
       setCurrentIndex(nextPendingIndex);
       setCurrentArticle(nextArticle);
@@ -174,12 +184,16 @@ export default function AnnotationWorkbench() {
       setLabel(null);
       // Start preloading the article after next!
       preloadNextArticle(nextPendingIndex + 1);
-    } else if (newCompletedCount >= 20 || nextPendingIndex === -1) {
+    } else if (newCompletedCount >= 20) {
+      navigate("/done");
+      return;
+    } else {
+      // STILL NO ARTICLES AFTER REFRESH - MAYBE NO MORE IN DATABASE
       navigate("/done");
       return;
     }
 
-    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND - DON'T SHOW SUBMITTING SPINNER TO USER!
+    // 4. NOW SAVE TO DATABASE IN THE BACKGROUND - DON'T SHOW SUBMITTING SPINNER TO USER!
     try {
       await retryWithBackoff(async () => {
         // Prepare response data
