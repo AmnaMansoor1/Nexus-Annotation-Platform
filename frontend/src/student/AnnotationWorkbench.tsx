@@ -274,13 +274,35 @@ export default function AnnotationWorkbench() {
         throw new Error("Annotation failed verification after save");
       }
 
-      // --- 5. Refresh annotator's completed_articles from DB to be 100% sure ---
-      const annotatorRefAfter = doc(db, "annotators", userEmail);
-      const annotatorDocAfter = await getDoc(annotatorRefAfter);
-      if (annotatorDocAfter.exists()) {
-        const data = annotatorDocAfter.data() as Annotator;
-        setCompletedArticles(data.completed_articles || []);
-        setCompletedCount(data.completed_articles?.length || 0);
+      // --- 5. IF this is 20th annotation: POLL Firestore until annotator has 20 completed articles and completed flag is true ---
+      const is20thAnnotation = newCompletedCount >= 20;
+      if (is20thAnnotation) {
+        let pollAttempts = 0;
+        const maxPollAttempts = 30;
+        while (pollAttempts < maxPollAttempts) {
+          const annotatorRefAfter = doc(db, "annotators", userEmail);
+          const annotatorDocAfter = await getDoc(annotatorRefAfter);
+          
+          if (annotatorDocAfter.exists()) {
+            const data = annotatorDocAfter.data() as Annotator;
+            // Update local state
+            setCompletedArticles(data.completed_articles || []);
+            setCompletedCount(data.completed_articles?.length || 0);
+            
+            if (data.completed_articles?.length >= 20 && data.completed === true) {
+              break;
+            }
+          }
+          
+          pollAttempts++;
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        // Final double check before navigating
+        const finalAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
+        if (!finalAnnotatorCheck.exists() || finalAnnotatorCheck.data().completed_articles?.length < 20 || finalAnnotatorCheck.data().completed !== true) {
+          throw new Error("Failed to confirm 20 completed annotations in Firestore");
+        }
       }
 
       // --- 6. Now check for next articles / proceed with UI navigation ---
@@ -307,7 +329,7 @@ export default function AnnotationWorkbench() {
       }
     } catch (err: any) {
       console.error("Annotation failed to save after retries!", err);
-      alert("Annotation failed to save. Please refresh the page and try again!");
+      alert("Annotation failed to save properly. Please refresh and try again!");
       setSubmitting(false);
       // Revert optimistic updates on failure
       setCompletedArticles(prev => prev.filter(id => id !== articleId));
