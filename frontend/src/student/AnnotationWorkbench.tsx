@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { db } from "../firebase";
@@ -11,6 +11,21 @@ import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
 
+// Helper to retry async operations with exponential backoff
+const retryWithBackoff = async <T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  delay = 500
+): Promise<T> => {
+  try {
+    return await fn();
+  } catch (error) {
+    if (retries <= 0) throw error;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return retryWithBackoff(fn, retries - 1, delay * 2);
+  }
+};
+
 export default function AnnotationWorkbench() {
   const navigate = useNavigate();
   const session = JSON.parse(localStorage.getItem("nexus_user_session") || "{}");
@@ -21,15 +36,17 @@ export default function AnnotationWorkbench() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [completedCount, setCompletedCount] = useState(0);
   const [currentArticle, setCurrentArticle] = useState<Article | null>(null);
+  const [nextArticle, setNextArticle] = useState<Article | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [timerExpired, setTimerExpired] = useState(false);
   const [startTime, setStartTime] = useState<number>(0);
+  const [articlesCache, setArticlesCache] = useState<Map<string, Article>>(new Map());
 
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
 
-  // Update lastActive timestamp on every action
+  // Update lastActive timestamp
   useEffect(() => {
     const sessionStr = localStorage.getItem("nexus_user_session");
     if (sessionStr) {
@@ -58,7 +75,34 @@ export default function AnnotationWorkbench() {
     initAnnotator();
   }, [userEmail]);
 
-  // Load current article based on assigned pool and local completed state
+  // Load article from cache or Firestore
+  const loadArticleFromCacheOrDB = useCallback(async (articleId: string) => {
+    // Check cache first
+    if (articlesCache.has(articleId)) {
+      return articlesCache.get(articleId)!;
+    }
+    // If not in cache, fetch from DB and add to cache
+    const articleDoc = await getDoc(doc(db, "articles", articleId));
+    if (articleDoc.exists()) {
+      const article = articleDoc.data() as Article;
+      setArticlesCache(prev => new Map(prev).set(articleId, article));
+      return article;
+    }
+    return null;
+  }, [articlesCache]);
+
+  // Preload next article
+  const preloadNextArticle = useCallback(async (nextIndex: number) => {
+    if (nextIndex < assignedArticles.length) {
+      const nextArticleId = assignedArticles[nextIndex];
+      if (!completedArticles.includes(nextArticleId)) {
+        const article = await loadArticleFromCacheOrDB(nextArticleId);
+        if (article) setNextArticle(article);
+      }
+    }
+  }, [assignedArticles, completedArticles, loadArticleFromCacheOrDB]);
+
+  // Load current article and preload next
   useEffect(() => {
     async function loadArticle() {
       if (assignedArticles.length === 0) {
@@ -76,13 +120,16 @@ export default function AnnotationWorkbench() {
       try {
         setCurrentIndex(firstPendingIndex);
         const articleId = assignedArticles[firstPendingIndex];
-        const articleDoc = await getDoc(doc(db, "articles", articleId));
+        const article = await loadArticleFromCacheOrDB(articleId);
         
-        if (articleDoc.exists()) {
-          setCurrentArticle(articleDoc.data() as Article);
+        if (article) {
+          setCurrentArticle(article);
           setStartTime(Date.now());
           setTimerExpired(false);
           setLabel(null);
+          
+          // Preload next article
+          await preloadNextArticle(firstPendingIndex + 1);
         }
       } catch (err) {
         console.error("Error loading article:", err);
@@ -94,7 +141,7 @@ export default function AnnotationWorkbench() {
     if (!assignmentLoading) {
       loadArticle();
     }
-  }, [assignedArticles, assignmentLoading, completedArticles, navigate]);
+  }, [assignedArticles, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle]);
 
   const handleSubmit = async () => {
     if (!currentArticle || !label || !timerExpired) return;
@@ -105,166 +152,153 @@ export default function AnnotationWorkbench() {
       return;
     }
 
-    setSubmitting(true);
-    const timeSpent = Math.round((Date.now() - startTime) / 1000);
     const articleId = currentArticle.article_id;
+    const timeSpent = Math.round((Date.now() - startTime) / 1000);
+    const newCompletedCount = completedCount + 1;
 
+    // 1. OPTIMISTIC UI UPDATE - DO THIS FIRST BEFORE ANYTHING ELSE!
+    setCompletedArticles(prev => [...prev, articleId]);
+    setCompletedCount(newCompletedCount);
+
+    // 2. SWITCH TO NEXT ARTICLE IMMEDIATELY
+    const nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
+    if (nextPendingIndex !== -1 && nextArticle) {
+      setCurrentIndex(nextPendingIndex);
+      setCurrentArticle(nextArticle);
+      setStartTime(Date.now());
+      setTimerExpired(false);
+      setLabel(null);
+      setSubmitting(false);
+      // Start preloading the article after next
+      preloadNextArticle(nextPendingIndex + 1);
+    } else if (newCompletedCount >= 20 || nextPendingIndex === -1) {
+      navigate("/done");
+      return;
+    }
+
+    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND WITH RETRIES
+    setSubmitting(true);
     try {
-      // Prepare response data
-      const responseData = {
-        annotator_email: userEmail,
-        label,
-        timestamp: serverTimestamp(),
-        time_spent_sec: timeSpent,
-        is_gold_check: !!currentArticle.is_gold_standard
-      };
-
-      const responseRef = doc(db, "annotations", articleId, "responses", userEmail);
-      const articleRef = doc(db, "articles", articleId);
-      const annotatorRef = doc(db, "annotators", userEmail);
-
-      let statusChangedTo: string | null = null;
-      let updatedCompletedCount = (completedCount || 0) + 1;
-
-      // 1. ATOMIC TRANSACTION (Critical Data)
-      await runTransaction(db, async (transaction) => {
-        // Check for duplicate submission
-        const responseSnap = await transaction.get(responseRef);
-        if (responseSnap.exists()) {
-          throw new Error("ALREADY_SUBMITTED");
-        }
-
-        // Get current article state
-        const articleSnap = await transaction.get(articleRef);
-        if (!articleSnap.exists()) throw new Error("ARTICLE_NOT_FOUND");
-        
-        const articleData = articleSnap.data() as Article;
-        const oldStatus = articleData.status;
-        const newCount = (articleData.annotation_count || 0) + 1;
-        
-        let newStatus = oldStatus;
-        if (newCount >= 10) {
-          newStatus = "complete";
-        } else if (newCount > 0) {
-          newStatus = "partial";
-        }
-
-        // Get annotator state
-        const annotatorSnap = await transaction.get(annotatorRef);
-        if (!annotatorSnap.exists()) throw new Error("ANNOTATOR_NOT_FOUND");
-        const annotatorData = annotatorSnap.data() as Annotator;
-
-        // Perform updates
-        transaction.update(articleRef, {
-          annotation_count: increment(1),
-          annotated_by: arrayUnion(userEmail),
-          status: newStatus
-        });
-
-        transaction.set(responseRef, responseData);
-
-        if (newStatus !== oldStatus) {
-          statusChangedTo = newStatus;
-        }
-
-        const annotatorUpdates: any = {
-          completed_articles: arrayUnion(articleId)
+      await retryWithBackoff(async () => {
+        // Prepare response data
+        const responseData = {
+          annotator_email: userEmail,
+          label,
+          timestamp: serverTimestamp(),
+          time_spent_sec: timeSpent,
+          is_gold_check: !!currentArticle.is_gold_standard
         };
 
-        if (currentArticle.is_gold_standard && currentArticle.gold_expected_label) {
-          const wasCorrect = label === currentArticle.gold_expected_label;
-          const newTotal = (annotatorData.gold_total_count || 0) + 1;
-          const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
+        const responseRef = doc(db, "annotations", articleId, "responses", userEmail);
+        const articleRef = doc(db, "articles", articleId);
+        const annotatorRef = doc(db, "annotators", userEmail);
+
+        let statusChangedTo: string | null = null;
+
+        // ATOMIC TRANSACTION (Critical Data)
+        await runTransaction(db, async (transaction) => {
+          // Check for duplicate submission
+          const responseSnap = await transaction.get(responseRef);
+          if (responseSnap.exists()) {
+            return; // Already submitted, no problem
+          }
+
+          // Get current article state
+          const articleSnap = await transaction.get(articleRef);
+          if (!articleSnap.exists()) return;
           
-          annotatorUpdates.gold_total_count = newTotal;
-          annotatorUpdates.gold_correct_count = newCorrect;
-          annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
-          annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
-        } else if (currentArticle.is_gold_standard && !currentArticle.gold_expected_label) {
-          console.warn("Skipping gold check update: Article is marked as gold standard but missing gold_expected_label", articleId);
-        }
-
-        const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
-        if (totalCompleted >= 20) {
-          annotatorUpdates.completed = true;
-        }
-
-        transaction.update(annotatorRef, annotatorUpdates);
-      });
-
-      // 2. OPTIMISTIC UI UPDATE - DO THIS FIRST for perceived speed
-      setCompletedArticles(prev => [...prev, articleId]);
-      setCompletedCount(updatedCompletedCount);
-      setLabel(null);
-      setTimerExpired(false);
-      setSubmitting(false); // Unblock UI immediately
-
-      // Check for completion based on total target (20)
-      const isSessionDone = updatedCompletedCount >= 20;
-
-      if (isSessionDone) {
-        navigate("/done");
-      } else if (currentIndex + 1 >= assignedArticles.length) {
-        // If we ran out of assigned articles but haven't reached 20
-        navigate("/done");
-      }
-
-      // 3. NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring) - BACKGROUND ONLY
-      (async () => {
-        try {
-          if (statusChangedTo === "complete") {
-            const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
-            const responses = responsesSnap.docs.map(d => d.data());
-            const counts = {
-              neutral: responses.filter(r => r.label === "neutral").length,
-              slightly: responses.filter(r => r.label === "slightly_manipulative").length,
-              highly: responses.filter(r => r.label === "highly_manipulative").length
-            };
-            const bias_score = calculateBiasScore(counts);
-            const fleiss_kappa = calculateFleissKappa(counts);
-            
-            await updateDoc(articleRef, { bias_score, fleiss_kappa });
-            
-            const q = query(collection(db, "articles"), where("status", "==", "complete"));
-            const snap = await getDocs(q);
-            await syncAverageBiasScore(bias_score, snap.size);
+          const articleData = articleSnap.data() as Article;
+          const oldStatus = articleData.status;
+          const newCount = (articleData.annotation_count || 0) + 1;
+          
+          let newStatus = oldStatus;
+          if (newCount >= 10) {
+            newStatus = "complete";
+          } else if (newCount > 0) {
+            newStatus = "partial";
           }
 
-          if (statusChangedTo) {
-            const statsUpdate: any = {};
-            const oldStatus = currentArticle.status;
-            if (oldStatus === "pending") statsUpdate.pendingArticles = -1;
-            if (oldStatus === "partial") statsUpdate.inProgressArticles = -1;
-            if (statusChangedTo === "partial") statsUpdate.inProgressArticles = 1;
-            if (statusChangedTo === "complete") statsUpdate.completedArticles = 1;
-            await updatePlatformStats(statsUpdate);
-          }
-        } catch (e) {
-          console.warn("Background stats update failed:", e);
-        }
-      })();
+          // Get annotator state
+          const annotatorSnap = await transaction.get(annotatorRef);
+          if (!annotatorSnap.exists()) return;
+          const annotatorData = annotatorSnap.data() as Annotator;
 
+          // Perform updates
+          transaction.update(articleRef, {
+            annotation_count: increment(1),
+            annotated_by: arrayUnion(userEmail),
+            status: newStatus
+          });
+
+          transaction.set(responseRef, responseData);
+
+          if (newStatus !== oldStatus) {
+            statusChangedTo = newStatus;
+          }
+
+          const annotatorUpdates: any = {
+            completed_articles: arrayUnion(articleId)
+          };
+
+          if (currentArticle.is_gold_standard && currentArticle.gold_expected_label) {
+            const wasCorrect = label === currentArticle.gold_expected_label;
+            const newTotal = (annotatorData.gold_total_count || 0) + 1;
+            const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
+            
+            annotatorUpdates.gold_total_count = newTotal;
+            annotatorUpdates.gold_correct_count = newCorrect;
+            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
+            annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
+          }
+
+          const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
+          if (totalCompleted >= 20) {
+            annotatorUpdates.completed = true;
+          }
+
+          transaction.update(annotatorRef, annotatorUpdates);
+        });
+
+        // NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring)
+        (async () => {
+          try {
+            if (statusChangedTo === "complete") {
+              const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
+              const responses = responsesSnap.docs.map(d => d.data());
+              const counts = {
+                neutral: responses.filter(r => r.label === "neutral").length,
+                slightly: responses.filter(r => r.label === "slightly_manipulative").length,
+                highly: responses.filter(r => r.label === "highly_manipulative").length
+              };
+              const bias_score = calculateBiasScore(counts);
+              const fleiss_kappa = calculateFleissKappa(counts);
+              
+              await updateDoc(articleRef, { bias_score, fleiss_kappa });
+              
+              const q = query(collection(db, "articles"), where("status", "==", "complete"));
+              const snap = await getDocs(q);
+              await syncAverageBiasScore(bias_score, snap.size);
+            }
+
+            if (statusChangedTo) {
+              const statsUpdate: any = {};
+              const oldStatus = currentArticle.status;
+              if (oldStatus === "pending") statsUpdate.pendingArticles = -1;
+              if (oldStatus === "partial") statsUpdate.inProgressArticles = -1;
+              if (statusChangedTo === "partial") statsUpdate.inProgressArticles = 1;
+              if (statusChangedTo === "complete") statsUpdate.completedArticles = 1;
+              await updatePlatformStats(statsUpdate);
+            }
+          } catch (e) {
+            console.warn("Background stats update failed:", e);
+          }
+        })();
+      }, 3, 500); // 3 retries with exponential backoff (500ms, 1000ms, 2000ms)
     } catch (err: any) {
-      console.error("Submit error details:", err);
-      let errorMsg = "An unexpected error occurred.";
-      
-      if (err.message === "ALREADY_SUBMITTED") {
-        alert("You have already submitted an annotation for this article.");
-        setCurrentIndex(prev => prev + 1);
-        setSubmitting(false);
-        return;
-      } else if (err.message === "ARTICLE_NOT_FOUND") {
-        errorMsg = "Article data not found. Please refresh the page.";
-      } else if (err.message === "ANNOTATOR_NOT_FOUND") {
-        errorMsg = "Your student profile was not found. Please logout and login again.";
-      } else if (err.code === "permission-denied") {
-        errorMsg = "Permission denied. Please ensure you are logged in with your institutional email.";
-      } else {
-        errorMsg = err.message || "Unknown error";
-      }
-
-      alert(`Failed to save annotation: ${errorMsg}`);
-      setSubmitting(false); // Ensure UI is unblocked if there's an error
+      console.error("Submit failed after retries:", err);
+      alert("Failed to save annotation. Please check your internet connection and refresh the page.");
+    } finally {
+      setSubmitting(false);
     }
   };
 
