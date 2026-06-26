@@ -61,9 +61,8 @@ export default function AnnotatorsTable() {
                 </tr>
               ) : (
                 annotators.map((ann) => {
-                  const assignedCount = ann.assigned_articles?.length || 0;
                   const completedCount = ann.completed_articles?.length || 0;
-                  const progress = assignedCount > 0 ? (completedCount / assignedCount) * 100 : 0;
+                  const progress = (completedCount / 20) * 100;
 
                   return (
                     <tr key={ann.email} className={`hover:bg-slate-50/50 transition-colors group ${ann.deactivated ? "opacity-50" : ""}`}>
@@ -85,7 +84,7 @@ export default function AnnotatorsTable() {
                       </td>
                       <td className="px-6 py-4">
                         <div className="flex flex-col items-center gap-1">
-                          <span className="text-sm font-bold text-slate-700">{ann.completed_articles?.length || 0}/20</span>
+                          <span className="text-sm font-bold text-slate-700">{completedCount}/20</span>
                           <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                             <div 
                               className={`h-full transition-all duration-500 ${ann.completed ? "bg-green-500" : "bg-primary"}`}

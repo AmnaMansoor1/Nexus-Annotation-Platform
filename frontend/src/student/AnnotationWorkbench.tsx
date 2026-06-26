@@ -172,7 +172,6 @@ export default function AnnotationWorkbench() {
       setStartTime(Date.now());
       setTimerExpired(false);
       setLabel(null);
-      setSubmitting(false);
       // Start preloading the article after next!
       preloadNextArticle(nextPendingIndex + 1);
     } else if (newCompletedCount >= 20 || nextPendingIndex === -1) {
@@ -180,8 +179,7 @@ export default function AnnotationWorkbench() {
       return;
     }
 
-    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND WITH RETRIES!
-    setSubmitting(true);
+    // 3. NOW SAVE TO DATABASE IN THE BACKGROUND - DON'T SHOW SUBMITTING SPINNER TO USER!
     try {
       await retryWithBackoff(async () => {
         // Prepare response data
@@ -303,8 +301,6 @@ export default function AnnotationWorkbench() {
     } catch (err: any) {
       console.error("Submit failed after retries:", err);
       alert("Failed to save annotation. Please check your internet connection and refresh the page.");
-    } finally {
-      setSubmitting(false);
     }
   };
 
