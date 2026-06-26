@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, updateDoc } from "firebase/firestore";
+import { collection, onSnapshot, doc, updateDoc, getDoc, getDocs } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator } from "../types";
-import { User, Mail, Hash, CheckCircle, Clock, ShieldAlert, Ban, Loader2 } from "lucide-react";
+import { User, Mail, Hash, CheckCircle, Clock, ShieldAlert, Ban, Loader2, RefreshCw } from "lucide-react";
 
 export default function AnnotatorsTable() {
   const [annotators, setAnnotators] = useState<Annotator[]>([]);
@@ -22,6 +22,40 @@ export default function AnnotatorsTable() {
       await updateDoc(ref, { deactivated: !annotator.deactivated });
     } catch (err) {
       alert("Error updating annotator: " + err);
+    }
+  };
+
+  const recalculateProgress = async (annotator: Annotator) => {
+    if (!confirm("Recalculate annotator's progress based on actual saved annotations?")) return;
+    try {
+      // Optimized: First check all articles in annotator's assigned list
+      const articlesToCheck = new Set<string>((annotator.assigned_articles || []));
+      
+      // Also check any existing entries in completed_articles to make sure they exist
+      (annotator.completed_articles || []).forEach(id => articlesToCheck.add(id));
+      
+      const actualCompleted = [];
+
+      for (const articleId of articlesToCheck) {
+        const responseDoc = await getDoc(
+          doc(db, "annotations", articleId, "responses", annotator.email)
+        );
+        if (responseDoc.exists()) {
+          actualCompleted.push(articleId);
+        }
+      }
+
+      // Now update annotator document in Firestore
+      const annotatorRef = doc(db, "annotators", annotator.email);
+      await updateDoc(annotatorRef, {
+        completed_articles: actualCompleted,
+        completed: actualCompleted.length >= 20
+      });
+      
+      alert(`Progress recalculated! Completed articles: ${actualCompleted.length}/20`);
+    } catch (err) {
+      console.error(err);
+      alert("Error recalculating progress: " + err);
     }
   };
 
@@ -109,17 +143,26 @@ export default function AnnotatorsTable() {
                         )}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <button 
-                          onClick={() => toggleDeactivate(ann)}
-                          className={`p-2 rounded-lg transition-colors ${
-                            ann.deactivated 
-                              ? "bg-slate-200 text-slate-600 hover:bg-slate-300" 
-                              : "hover:bg-red-50 text-slate-400 hover:text-red-500"
-                          }`}
-                          title={ann.deactivated ? "Reactivate Account" : "Deactivate Account"}
-                        >
-                          <Ban size={18} />
-                        </button>
+                        <div className="flex items-center justify-end gap-2">
+                          <button 
+                            onClick={() => recalculateProgress(ann)}
+                            className="p-2 rounded-lg transition-colors hover:bg-blue-50 text-slate-400 hover:text-blue-500"
+                            title="Recalculate Progress"
+                          >
+                            <RefreshCw size={18} />
+                          </button>
+                          <button 
+                            onClick={() => toggleDeactivate(ann)}
+                            className={`p-2 rounded-lg transition-colors ${
+                              ann.deactivated 
+                                ? "bg-slate-200 text-slate-600 hover:bg-slate-300" 
+                                : "hover:bg-red-50 text-slate-400 hover:text-red-500"
+                            }`}
+                            title={ann.deactivated ? "Reactivate Account" : "Deactivate Account"}
+                          >
+                            <Ban size={18} />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );

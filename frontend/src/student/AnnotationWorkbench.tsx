@@ -280,6 +280,14 @@ export default function AnnotationWorkbench() {
         // NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring) - BACKGROUND
         (async () => {
           try {
+            // Refresh annotator's completed articles from Firestore to avoid discrepancies
+            const annotatorRefresh = await getDoc(annotatorRef);
+            if (annotatorRefresh.exists()) {
+              const newData = annotatorRefresh.data() as Annotator;
+              setCompletedArticles(newData.completed_articles || []);
+              setCompletedCount(newData.completed_articles?.length || 0);
+            }
+
             if (statusChangedTo === "complete") {
               const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
               const responses = responsesSnap.docs.map(d => d.data());
@@ -308,7 +316,7 @@ export default function AnnotationWorkbench() {
               await updatePlatformStats(statsUpdate);
             }
           } catch (e) {
-            console.warn("Background stats update failed:", e);
+            console.warn("Background tasks failed:", e);
           }
         })();
       }, 3, 500); // 3 retries!
