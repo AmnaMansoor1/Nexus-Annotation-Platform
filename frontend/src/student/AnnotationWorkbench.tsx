@@ -49,11 +49,9 @@ export default function AnnotationWorkbench() {
 
   // Load article from cache or Firestore
   const loadArticleFromCacheOrDB = useCallback(async (articleId: string): Promise<Article | null> => {
-    // Check cache first
     if (articlesCache.has(articleId)) {
       return articlesCache.get(articleId) as Article;
     }
-    // If not in cache, fetch from DB and add to cache
     const articleDoc = await getDoc(doc(db, "articles", articleId));
     if (articleDoc.exists()) {
       const article = articleDoc.data() as Article;
@@ -161,168 +159,144 @@ export default function AnnotationWorkbench() {
     const articleId = currentArticle.article_id;
     const newCompletedCount = (completedCount || 0) + 1;
 
-    // 1. INSTANT UI UPDATE - DO THIS FIRST BEFORE ANY DATABASE CALLS!
+    // --- 1. INSTANT OPTIMISTIC UI UPDATE ---
     setCompletedArticles(prev => [...prev, articleId]);
     setCompletedCount(newCompletedCount);
-    
-    // 2. CHECK IF WE NEED MORE ARTICLES FIRST!
+
+    // --- 2. CAPTURE ALL VARS WE NEED TO SAVE FIRST ---
+    const savedLabel = label;
+    const savedCurrentArticle = currentArticle;
+    setSubmitting(true);
+
+    // --- 3. FIRST START THE SAVE TO DATABASE ---
+    const saveResult = retryWithBackoff(async () => {
+      const responseData = {
+        annotator_email: userEmail,
+        label: savedLabel,
+        timestamp: serverTimestamp(),
+        time_spent_sec: timeSpent,
+        is_gold_check: !!savedCurrentArticle.is_gold_standard
+      };
+
+      const responseRef = doc(db, "annotations", articleId, "responses", userEmail);
+      const articleRef = doc(db, "articles", articleId);
+      const annotatorRef = doc(db, "annotators", userEmail);
+      let statusChangedTo: string | null = null;
+
+      await runTransaction(db, async (transaction) => {
+        const responseSnap = await transaction.get(responseRef);
+        if (responseSnap.exists()) return;
+
+        const articleSnap = await transaction.get(articleRef);
+        if (!articleSnap.exists()) return;
+        const articleData = articleSnap.data() as Article;
+        const oldStatus = articleData.status;
+        const newCount = (articleData.annotation_count || 0) + 1;
+        let newStatus = oldStatus;
+        if (newCount >= 10) newStatus = "complete";
+        else if (newCount > 0) newStatus = "partial";
+
+        const annotatorSnap = await transaction.get(annotatorRef);
+        if (!annotatorSnap.exists()) return;
+        const annotatorData = annotatorSnap.data() as Annotator;
+
+        transaction.update(articleRef, {
+          annotation_count: increment(1),
+          annotated_by: arrayUnion(userEmail),
+          status: newStatus
+        });
+        transaction.set(responseRef, responseData);
+
+        if (newStatus !== oldStatus) {
+          statusChangedTo = newStatus;
+        }
+
+        const annotatorUpdates: any = {
+          completed_articles: arrayUnion(articleId)
+        };
+        if (savedCurrentArticle.is_gold_standard && savedCurrentArticle.gold_expected_label) {
+          const wasCorrect = savedLabel === savedCurrentArticle.gold_expected_label;
+          const newTotal = (annotatorData.gold_total_count || 0) + 1;
+          const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
+          annotatorUpdates.gold_total_count = newTotal;
+          annotatorUpdates.gold_correct_count = newCorrect;
+          annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
+          annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
+        }
+        const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
+        if (totalCompleted >= 20) annotatorUpdates.completed = true;
+        transaction.update(annotatorRef, annotatorUpdates);
+      });
+
+      (async () => {
+        try {
+          const annotatorRefresh = await getDoc(annotatorRef);
+          if (annotatorRefresh.exists()) {
+            const newData = annotatorRefresh.data() as Annotator;
+            setCompletedArticles(newData.completed_articles || []);
+            setCompletedCount(newData.completed_articles?.length || 0);
+          }
+          if (statusChangedTo === "complete") {
+            const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
+            const responses = responsesSnap.docs.map(d => d.data());
+            const counts = {
+              neutral: responses.filter(r => r.label === "neutral").length,
+              slightly: responses.filter(r => r.label === "slightly_manipulative").length,
+              highly: responses.filter(r => r.label === "highly_manipulative").length
+            };
+            const bias_score = calculateBiasScore(counts);
+            const fleiss_kappa = calculateFleissKappa(counts);
+            await updateDoc(articleRef, { bias_score, fleiss_kappa });
+            
+            const q = query(collection(db, "articles"), where("status", "==", "complete"));
+            const snap = await getDocs(q);
+            await syncAverageBiasScore(bias_score, snap.size);
+          }
+          if (statusChangedTo) {
+            const statsUpdate: any = {};
+            const oldStatus = savedCurrentArticle.status;
+            if (oldStatus === "pending") statsUpdate.pendingArticles = -1;
+            if (oldStatus === "partial") statsUpdate.inProgressArticles = -1;
+            if (statusChangedTo === "partial") statsUpdate.inProgressArticles = 1;
+            if (statusChangedTo === "complete") statsUpdate.completedArticles = 1;
+            await updatePlatformStats(statsUpdate);
+          }
+        } catch (e) {
+          console.warn("Background tasks failed:", e);
+        }
+      })();
+    }, 3, 500);
+
+    // --- 4. Now check for next articles / proceed with UI navigation ---
     let nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
     if (nextPendingIndex === -1 && newCompletedCount < 20) {
-      // TRY TO REFILL ASSIGNMENT POOL!
       setAssignmentRefresh(prev => prev + 1);
       await loadAssignment();
-      // Re-check next pending index after refresh
       nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
     }
 
-    // 3. SWITCH TO NEXT ARTICLE OR NAVIGATE TO DONE
+    setSubmitting(false);
+
     if (nextPendingIndex !== -1 && nextArticle) {
       setCurrentIndex(nextPendingIndex);
       setCurrentArticle(nextArticle);
       setStartTime(Date.now());
       setTimerExpired(false);
       setLabel(null);
-      // Start preloading the article after next!
       preloadNextArticle(nextPendingIndex + 1);
     } else if (newCompletedCount >= 20) {
-      navigate("/done");
-      return;
+      // Wait a tiny bit to ensure save is going, then navigate
+      setTimeout(() => navigate("/done"), 200);
     } else {
-      // STILL NO ARTICLES AFTER REFRESH - MAYBE NO MORE IN DATABASE
-      navigate("/done");
-      return;
+      setTimeout(() => navigate("/done"), 200);
     }
 
-    // 4. NOW SAVE TO DATABASE IN THE BACKGROUND - DON'T SHOW SUBMITTING SPINNER TO USER!
+    // Wait for save to complete to confirm no errors
     try {
-      await retryWithBackoff(async () => {
-        // Prepare response data
-        const responseData = {
-          annotator_email: userEmail,
-          label,
-          timestamp: serverTimestamp(),
-          time_spent_sec: timeSpent,
-          is_gold_check: !!currentArticle.is_gold_standard
-        };
-
-        const responseRef = doc(db, "annotations", articleId, "responses", userEmail);
-        const articleRef = doc(db, "articles", articleId);
-        const annotatorRef = doc(db, "annotators", userEmail);
-
-        let statusChangedTo: string | null = null;
-
-        // ATOMIC TRANSACTION (Critical Data)
-        await runTransaction(db, async (transaction) => {
-          // Check for duplicate submission
-          const responseSnap = await transaction.get(responseRef);
-          if (responseSnap.exists()) {
-            return; // Already submitted, no problem!
-          }
-
-          // Get current article state
-          const articleSnap = await transaction.get(articleRef);
-          if (!articleSnap.exists()) return;
-          
-          const articleData = articleSnap.data() as Article;
-          const oldStatus = articleData.status;
-          const newCount = (articleData.annotation_count || 0) + 1;
-          
-          let newStatus = oldStatus;
-          if (newCount >= 10) {
-            newStatus = "complete";
-          } else if (newCount > 0) {
-            newStatus = "partial";
-          }
-
-          // Get annotator state
-          const annotatorSnap = await transaction.get(annotatorRef);
-          if (!annotatorSnap.exists()) return;
-          const annotatorData = annotatorSnap.data() as Annotator;
-
-          // Perform updates
-          transaction.update(articleRef, {
-            annotation_count: increment(1),
-            annotated_by: arrayUnion(userEmail),
-            status: newStatus
-          });
-
-          transaction.set(responseRef, responseData);
-
-          if (newStatus !== oldStatus) {
-            statusChangedTo = newStatus;
-          }
-
-          const annotatorUpdates: any = {
-            completed_articles: arrayUnion(articleId)
-          };
-
-          if (currentArticle.is_gold_standard && currentArticle.gold_expected_label) {
-            const wasCorrect = label === currentArticle.gold_expected_label;
-            const newTotal = (annotatorData.gold_total_count || 0) + 1;
-            const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
-            
-            annotatorUpdates.gold_total_count = newTotal;
-            annotatorUpdates.gold_correct_count = newCorrect;
-            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
-            annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
-          } else if (currentArticle.is_gold_standard && !currentArticle.gold_expected_label) {
-            console.warn("Skipping gold check update: Article is marked as gold standard but missing gold_expected_label", articleId);
-          }
-
-          const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
-          if (totalCompleted >= 20) {
-            annotatorUpdates.completed = true;
-          }
-
-          transaction.update(annotatorRef, annotatorUpdates);
-        });
-
-        // NON-CRITICAL POST-TRANSACTION LOGIC (Stats & Scoring) - BACKGROUND
-        (async () => {
-          try {
-            // Refresh annotator's completed articles from Firestore to avoid discrepancies
-            const annotatorRefresh = await getDoc(annotatorRef);
-            if (annotatorRefresh.exists()) {
-              const newData = annotatorRefresh.data() as Annotator;
-              setCompletedArticles(newData.completed_articles || []);
-              setCompletedCount(newData.completed_articles?.length || 0);
-            }
-
-            if (statusChangedTo === "complete") {
-              const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
-              const responses = responsesSnap.docs.map(d => d.data());
-              const counts = {
-                neutral: responses.filter(r => r.label === "neutral").length,
-                slightly: responses.filter(r => r.label === "slightly_manipulative").length,
-                highly: responses.filter(r => r.label === "highly_manipulative").length
-              };
-              const bias_score = calculateBiasScore(counts);
-              const fleiss_kappa = calculateFleissKappa(counts);
-              
-              await updateDoc(articleRef, { bias_score, fleiss_kappa });
-              
-              const q = query(collection(db, "articles"), where("status", "==", "complete"));
-              const snap = await getDocs(q);
-              await syncAverageBiasScore(bias_score, snap.size);
-            }
-
-            if (statusChangedTo) {
-              const statsUpdate: any = {};
-              const oldStatus = currentArticle.status;
-              if (oldStatus === "pending") statsUpdate.pendingArticles = -1;
-              if (oldStatus === "partial") statsUpdate.inProgressArticles = -1;
-              if (statusChangedTo === "partial") statsUpdate.inProgressArticles = 1;
-              if (statusChangedTo === "complete") statsUpdate.completedArticles = 1;
-              await updatePlatformStats(statsUpdate);
-            }
-          } catch (e) {
-            console.warn("Background tasks failed:", e);
-          }
-        })();
-      }, 3, 500); // 3 retries!
+      await saveResult;
     } catch (err: any) {
-      console.error("Submit failed after retries:", err);
-      alert("Failed to save annotation. Please check your internet connection and refresh the page.");
+      console.error("Annotation failed to save after retries!", err);
+      alert("Annotation failed to save. Please refresh the page and try again!");
     }
   };
 
@@ -390,7 +364,6 @@ export default function AnnotationWorkbench() {
           <div className="bg-white rounded-[32px] p-10 shadow-xl shadow-slate-200/50 border border-slate-100 min-h-[500px] flex flex-col relative overflow-hidden group">
             <div className="absolute top-0 left-0 w-1 h-full bg-primary/10 group-hover:bg-primary transition-colors" />
             
-            {/* Article Metadata (Headline & Category) */}
             <div className="mb-8 pb-8 border-b border-slate-100 space-y-4">
               <div className="flex items-center justify-between">
                 <span className="px-4 py-1.5 bg-primary/10 text-primary rounded-xl text-[10px] font-black uppercase tracking-widest border border-primary/20">
@@ -423,7 +396,6 @@ export default function AnnotationWorkbench() {
 
         {/* Right Panel: Form */}
         <div className="md:col-span-4 space-y-10">
-          {/* Section: Manipulation Level */}
           <section className="space-y-5">
             <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
               What is the tone of this excerpt?
@@ -450,7 +422,6 @@ export default function AnnotationWorkbench() {
             </div>
           </section>
 
-          {/* Section: Submit */}
           <div className="pt-4">
             <button
               onClick={handleSubmit}
