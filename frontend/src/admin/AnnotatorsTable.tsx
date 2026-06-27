@@ -35,7 +35,7 @@ export default function AnnotatorsTable() {
       const allArticleIds = allArticlesSnap.docs.map(doc => doc.id);
       console.log(`[Recalculate] Found ${allArticleIds.length} total articles`);
       
-      const actualCompleted = [];
+      const actualCompleted: string[] = [];
       const emailsToCheck = [
         annotator.email,
         annotator.email.toLowerCase(),
