@@ -7,61 +7,74 @@ import { User, Mail, Hash, CheckCircle, Clock, ShieldAlert, Ban, Loader2, Refres
 export default function AnnotatorsTable() {
   const [annotators, setAnnotators] = useState<Annotator[]>([]);
   const [loading, setLoading] = useState(true);
-  const [createLoading, setCreateLoading] = useState(false);
-  const [createEmail, setCreateEmail] = useState("");
-  const [createName, setCreateName] = useState("");
-  const [createRegCode, setCreateRegCode] = useState("");
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(collection(db, "annotators"), (snapshot) => {
-      setAnnotators(snapshot.docs.map(doc => doc.data() as Annotator));
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
+    const loadAllAnnotators = async () => {
+      // 1. Fetch all existing annotator docs
+      const annotatorsSnap = await getDocs(collection(db, "annotators"));
+      const annotatorMap = new Map<string, Annotator>();
+      annotatorsSnap.docs.forEach(doc => {
+        const annotator = doc.data() as Annotator;
+        annotatorMap.set(annotator.email.toLowerCase(), annotator);
+      });
 
-  const handleCreateAnnotator = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!createEmail || !createName) return;
-    setCreateLoading(true);
-
-    try {
-      const cleanEmail = createEmail.toLowerCase().trim();
-      const annotatorRef = doc(db, "annotators", cleanEmail);
+      // 2. Fetch all annotation responses to find all unique annotators
+      const annotationsSnap = await getDocs(collection(db, "annotation_responses"));
+      const allAnnotatorEmails = new Set<string>();
       
-      const existingSnap = await getDoc(annotatorRef);
-      if (existingSnap.exists()) {
-        alert("Annotator already exists!");
-        setCreateLoading(false);
-        return;
+      annotationsSnap.docs.forEach(doc => {
+        const data = doc.data();
+        if (data.annotator_email) {
+          const email = data.annotator_email.toLowerCase();
+          allAnnotatorEmails.add(email);
+        }
+      });
+
+      // 3. For any email that has annotations but no annotator doc, create a temporary one and add to Firestore
+      const finalAnnotators: Annotator[] = [];
+      const existingAnnotatorEmails = new Set(annotatorMap.keys());
+      
+      for (const email of allAnnotatorEmails) {
+        if (!existingAnnotatorEmails.has(email)) {
+          // Create a new annotator doc for this user
+          const newAnnotator: Annotator = {
+            email: email,
+            full_name: email.split('@')[0],
+            completed: false,
+            completed_articles: [],
+            assigned_articles: [],
+            reliability_score: 0,
+            gold_total_count: 0,
+            gold_correct_count: 0,
+            gold_accuracy: 0
+          };
+          
+          await setDoc(doc(db, "annotators", email), newAnnotator);
+          annotatorMap.set(email, newAnnotator);
+        }
+        finalAnnotators.push(annotatorMap.get(email)!);
       }
 
-      const newAnnotator: Annotator = {
-        email: cleanEmail,
-        full_name: createName.trim(),
-        registration_code: createRegCode.trim() || undefined,
-        completed: false,
-        completed_articles: [],
-        assigned_articles: [],
-        reliability_score: 0,
-        gold_total_count: 0,
-        gold_correct_count: 0,
-        gold_accuracy: 0
-      };
+      // 4. Also add all existing annotators who might not have annotations yet
+      for (const [email, annotator] of annotatorMap.entries()) {
+        if (!allAnnotatorEmails.has(email)) {
+          finalAnnotators.push(annotator);
+        }
+      }
 
-      await setDoc(annotatorRef, newAnnotator);
-      
-      setCreateEmail("");
-      setCreateName("");
-      setCreateRegCode("");
-      alert("Annotator created successfully!");
-    } catch (err: any) {
-      console.error("Error creating annotator:", err);
-      alert("Error creating annotator: " + err.message);
-    } finally {
-      setCreateLoading(false);
-    }
-  };
+      setAnnotators(finalAnnotators);
+      setLoading(false);
+    };
+
+    loadAllAnnotators();
+
+    // Listen for any updates
+    const unsubscribe = onSnapshot(collection(db, "annotators"), () => {
+      loadAllAnnotators();
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   const toggleDeactivate = async (annotator: Annotator) => {
     try {
@@ -132,54 +145,6 @@ export default function AnnotatorsTable() {
       <div>
         <h2 className="text-2xl font-bold text-slate-80">Annotator Reliability</h2>
         <p className="text-slate-50">Track student progress and performance on gold standard checks</p>
-      </div>
-
-      {/* Manual Annotator Creation Form */}
-      <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-200">
-        <h3 className="text-lg font-bold text-slate-80 mb-6">Manually Add Annotator</h3>
-        <form onSubmit={handleCreateAnnotator} className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div>
-            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Email</label>
-            <input
-              type="email"
-              required
-              className="w-full px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition-all"
-              placeholder="student@cuilahore.edu.pk"
-              value={createEmail}
-              onChange={(e) => setCreateEmail(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Full Name</label>
-            <input
-              type="text"
-              required
-              className="w-full px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition-all"
-              placeholder="Student Name"
-              value={createName}
-              onChange={(e) => setCreateName(e.target.value)}
-            />
-          </div>
-          <div className="flex flex-col gap-2">
-            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Reg. Code (Optional)</label>
-            <div className="flex gap-3">
-              <input
-                type="text"
-                className="flex-1 px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:border-primary focus:ring-2 focus:ring-primary/20 outline-none transition-all"
-                placeholder="SP23-BSE-074"
-                value={createRegCode}
-                onChange={(e) => setCreateRegCode(e.target.value)}
-              />
-              <button
-                type="submit"
-                disabled={createLoading}
-                className="bg-primary text-white px-6 py-3 rounded-xl font-bold hover:bg-primary-dark transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                {createLoading ? <Loader2 className="animate-spin" size={20} /> : "Add"}
-              </button>
-            </div>
-          </div>
-        </form>
       </div>
 
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
