@@ -3,7 +3,6 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { auth } from "../firebase";
 import { 
   LayoutDashboard, 
-  Newspaper, 
   Users, 
   Upload, 
   Download, 
@@ -51,7 +50,6 @@ export default function AdminLayout({ children }: AdminLayoutProps) {
 
   const navItems = [
     { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
-    { to: "/admin/articles", label: "Articles", icon: Newspaper },
     { to: "/admin/annotators", label: "Annotators", icon: Users },
     { to: "/admin/upload", label: "Upload CSV", icon: Upload },
     { to: "/admin/export", label: "Export", icon: Download },

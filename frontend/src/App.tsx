@@ -13,7 +13,6 @@ const Completion = lazy(() => import("./student/Completion"));
 import AdminLogin from "./admin/AdminLogin";
 const AdminLayout = lazy(() => import("./admin/AdminLayout"));
 const Dashboard = lazy(() => import("./admin/Dashboard"));
-const ArticlesTable = lazy(() => import("./admin/ArticlesTable"));
 const AnnotatorsTable = lazy(() => import("./admin/AnnotatorsTable"));
 const UploadCSV = lazy(() => import("./admin/UploadCSV"));
 const ExportCSV = lazy(() => import("./admin/ExportCSV"));
@@ -146,7 +145,6 @@ function App() {
             {/* Admin Routes */}
             <Route path="/admin" element={isAdmin ? <Navigate to="/admin/dashboard" /> : <AdminLogin />} />
             <Route path="/admin/dashboard" element={isAdmin ? <AdminLayout><Dashboard /></AdminLayout> : <Navigate to="/admin" />} />
-            <Route path="/admin/articles" element={isAdmin ? <AdminLayout><ArticlesTable /></AdminLayout> : <Navigate to="/admin" />} />
             <Route path="/admin/annotators" element={isAdmin ? <AdminLayout><AnnotatorsTable /></AdminLayout> : <Navigate to="/admin" />} />
             <Route path="/admin/upload" element={isAdmin ? <AdminLayout><UploadCSV /></AdminLayout> : <Navigate to="/admin" />} />
             <Route path="/admin/export" element={isAdmin ? <AdminLayout><ExportCSV /></AdminLayout> : <Navigate to="/admin" />} />
