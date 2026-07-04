@@ -1,12 +1,13 @@
 import { useState } from "react";
-import { collection, getDocs, query, orderBy } from "firebase/firestore";
+import { collection, getDocs, query, orderBy, writeBatch, doc, deleteDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { Article } from "../types";
 import { downloadCSV } from "../utils/csvExport";
-import { Download, Loader2, FileJson, Table } from "lucide-react";
+import { Download, Loader2, FileJson, Table, Trash2 } from "lucide-react";
 
 export default function ExportCSV() {
   const [loading, setLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const handleExport = async () => {
     setLoading(true);
@@ -64,6 +65,31 @@ export default function ExportCSV() {
     }
   };
 
+  const handleDeleteAllArticles = async () => {
+    if (!window.confirm("Are you sure you want to DELETE ALL articles? This cannot be undone!")) return;
+    setDeleteLoading(true);
+    try {
+      // Use batches to delete all articles (Firestore limit is 500 per batch)
+      const articlesSnap = await getDocs(collection(db, "articles"));
+      const batchSize = 500;
+      const articles = articlesSnap.docs;
+      for (let i = 0; i < articles.length; i += batchSize) {
+        const batch = writeBatch(db);
+        const chunk = articles.slice(i, i + batchSize);
+        chunk.forEach((doc) => {
+          batch.delete(doc.ref);
+        });
+        await batch.commit();
+      }
+
+      alert(`Successfully deleted ${articles.length} articles!`);
+    } catch (err) {
+      alert("Delete failed: " + err);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-8">
       <div>
@@ -71,7 +97,7 @@ export default function ExportCSV() {
         <p className="text-slate-500">Download the complete annotated dataset</p>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
         <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 space-y-6">
           <div className="w-16 h-16 bg-primary/10 text-primary rounded-2xl flex items-center justify-center">
             <Table size={32} />
@@ -108,6 +134,26 @@ export default function ExportCSV() {
             className="w-full bg-slate-800 text-slate-500 py-4 rounded-xl font-bold cursor-not-allowed flex items-center justify-center gap-2"
           >
             Coming Soon
+          </button>
+        </div>
+
+        <div className="bg-red-50 p-8 rounded-2xl shadow-sm border border-red-200 space-y-6">
+          <div className="w-16 h-16 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center">
+            <Trash2 size={32} />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-xl font-bold text-red-900">Delete All Articles</h3>
+            <p className="text-red-600 text-sm leading-relaxed">
+              Permanently delete ALL articles from the database (cannot be undone). Use this to reset the article library before importing the new CSV.
+            </p>
+          </div>
+          <button
+            onClick={handleDeleteAllArticles}
+            disabled={deleteLoading}
+            className="w-full bg-red-600 text-white py-4 rounded-xl font-bold hover:bg-red-700 transition-all flex items-center justify-center gap-2 shadow-lg shadow-red-200"
+          >
+            {deleteLoading ? <Loader2 className="animate-spin" size={20} /> : <Trash2 size={20} />}
+            Delete All Articles
           </button>
         </div>
       </div>
