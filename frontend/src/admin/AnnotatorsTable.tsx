@@ -9,69 +9,54 @@ export default function AnnotatorsTable() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const loadAllAnnotators = async () => {
-      // 1. Fetch all existing annotator docs
-      const annotatorsSnap = await getDocs(collection(db, "annotators"));
-      const annotatorMap = new Map<string, Annotator>();
-      annotatorsSnap.docs.forEach(doc => {
-        const annotator = doc.data() as Annotator;
-        annotatorMap.set(annotator.email.toLowerCase(), annotator);
-      });
+    // 1. First, check all annotations to find unique annotators, auto-create any missing
+    const initializeAnnotatorsFromAnnotations = async () => {
+      try {
+        const annotationsSnap = await getDocs(collection(db, "annotation_responses"));
+        const annotatorsRef = collection(db, "annotators");
+        const existingAnnotatorsSnap = await getDocs(annotatorsRef);
+        const existingEmails = new Set(existingAnnotatorsSnap.docs.map(doc => doc.id));
 
-      // 2. Fetch all annotation responses to find all unique annotators
-      const annotationsSnap = await getDocs(collection(db, "annotation_responses"));
-      const allAnnotatorEmails = new Set<string>();
-      
-      annotationsSnap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.annotator_email) {
-          const email = data.annotator_email.toLowerCase();
-          allAnnotatorEmails.add(email);
+        for (const annotationDoc of annotationsSnap.docs) {
+          const data = annotationDoc.data();
+          if (data.annotator_email) {
+            const email = data.annotator_email.toLowerCase();
+            if (!existingEmails.has(email)) {
+              const newAnnotator: Annotator = {
+                email: email,
+                full_name: email.split('@')[0],
+                completed: false,
+                completed_articles: [],
+                assigned_articles: [],
+                reliability_score: 0,
+                gold_total_count: 0,
+                gold_correct_count: 0,
+                gold_accuracy: 0
+              };
+              await setDoc(doc(db, "annotators", email), newAnnotator);
+              existingEmails.add(email);
+            }
+          }
         }
-      });
-
-      // 3. For any email that has annotations but no annotator doc, create a temporary one and add to Firestore
-      const finalAnnotators: Annotator[] = [];
-      const existingAnnotatorEmails = new Set(annotatorMap.keys());
-      
-      for (const email of allAnnotatorEmails) {
-        if (!existingAnnotatorEmails.has(email)) {
-          // Create a new annotator doc for this user
-          const newAnnotator: Annotator = {
-            email: email,
-            full_name: email.split('@')[0],
-            completed: false,
-            completed_articles: [],
-            assigned_articles: [],
-            reliability_score: 0,
-            gold_total_count: 0,
-            gold_correct_count: 0,
-            gold_accuracy: 0
-          };
-          
-          await setDoc(doc(db, "annotators", email), newAnnotator);
-          annotatorMap.set(email, newAnnotator);
-        }
-        finalAnnotators.push(annotatorMap.get(email)!);
+      } catch (err) {
+        console.error("Error initializing annotators from annotations:", err);
       }
-
-      // 4. Also add all existing annotators who might not have annotations yet
-      for (const [email, annotator] of annotatorMap.entries()) {
-        if (!allAnnotatorEmails.has(email)) {
-          finalAnnotators.push(annotator);
-        }
-      }
-
-      setAnnotators(finalAnnotators);
-      setLoading(false);
     };
 
-    loadAllAnnotators();
+    initializeAnnotatorsFromAnnotations();
 
-    // Listen for any updates
-    const unsubscribe = onSnapshot(collection(db, "annotators"), () => {
-      loadAllAnnotators();
-    });
+    // 2. Now listen for realtime updates to annotators collection
+    const unsubscribe = onSnapshot(
+      collection(db, "annotators"), 
+      (snapshot) => {
+        setAnnotators(snapshot.docs.map(doc => doc.data() as Annotator));
+        setLoading(false);
+      }, 
+      (error) => {
+        console.error("Error loading annotators:", error);
+        setLoading(false);
+      }
+    );
 
     return () => unsubscribe();
   }, []);

@@ -81,10 +81,22 @@ export default function Login() {
           }
         }
         
-        // 2. Final check for Firestore profile
-        const snap = await getDoc(doc(db, "annotators", cleanEmail));
+        // 2. Final check for Firestore profile - if missing, create it!
+        let snap = await getDoc(doc(db, "annotators", cleanEmail));
         if (!snap.exists()) {
-          throw new Error("Profile data not found. Please contact admin.");
+          const newUser: Annotator = {
+            email: cleanEmail,
+            full_name: cleanEmail.split('@')[0],
+            completed: false,
+            completed_articles: [],
+            assigned_articles: [],
+            reliability_score: 0,
+            gold_total_count: 0,
+            gold_correct_count: 0,
+            gold_accuracy: 0
+          };
+          await setDoc(doc(db, "annotators", cleanEmail), newUser);
+          await updatePlatformStats({ totalAnnotators: 1 });
         }
 
         if (cleanEmail === "admin@gmail.com") navigate("/admin/dashboard");
