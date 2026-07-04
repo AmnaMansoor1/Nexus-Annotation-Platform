@@ -21,10 +21,17 @@ export default function UploadCSV() {
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
+        console.log("Parsed CSV data:", results.data);
+        // Validate we have article_id on each row
+        const invalidRows = results.data.filter((row: any) => !row.article_id);
+        if (invalidRows.length > 0) {
+          alert(`Error: ${invalidRows.length} row(s) missing 'article_id' column!`);
+        }
         setData(results.data);
         setPreview(results.data.slice(0, 5));
       },
       error: (err) => {
+        console.error("CSV parsing error:", err);
         alert("Error parsing CSV: " + err.message);
       }
     });
@@ -36,80 +43,91 @@ export default function UploadCSV() {
     let imported = 0;
     let skipped = 0;
 
-    // Use batches for efficiency (Firestore limit is 500 per batch)
-    const batchSize = 100;
-    for (let i = 0; i < data.length; i += batchSize) {
-      const batch = writeBatch(db);
-      const chunk = data.slice(i, i + batchSize);
-      let chunkImported = 0;
+    try {
+      // Use batches for efficiency (Firestore limit is 500 per batch)
+      const batchSize = 100;
+      for (let i = 0; i < data.length; i += batchSize) {
+        const batch = writeBatch(db);
+        const chunk = data.slice(i, i + batchSize);
+        let chunkImported = 0;
 
-      // 1. Pre-check which articles already exist in this chunk (Parallelized)
-      const existenceChecks = await Promise.all(chunk.map(async (row) => {
-        const articleId = row.article_id;
-        if (!articleId) return { row, exists: true }; // Skip empty IDs
-        const docSnap = await getDoc(doc(db, "articles", articleId));
-        return { row, exists: docSnap.exists() };
-      }));
+        console.log(`Processing chunk ${i / batchSize + 1}, rows:`, chunk);
 
-      for (const { row, exists } of existenceChecks) {
-        if (exists) {
-          skipped++;
-          continue;
+        // 1. Pre-check which articles already exist in this chunk (Parallelized)
+        const existenceChecks = await Promise.all(chunk.map(async (row) => {
+          const articleId = row.article_id;
+          if (!articleId) return { row, exists: true }; // Skip empty IDs
+          const docSnap = await getDoc(doc(db, "articles", articleId));
+          return { row, exists: docSnap.exists() };
+        }));
+
+        for (const { row, exists } of existenceChecks) {
+          if (exists) {
+            skipped++;
+            continue;
+          }
+
+          const articleId = row.article_id;
+          const docRef = doc(db, "articles", articleId);
+
+          const article: Article = {
+            article_id: articleId,
+            headline: row.headline || "",
+            display_text: row.display_text || row.full_text || row.summary || "", // Map your CSV text fields
+            source: row.source || "",
+            author: row.author || "",
+            date_published: row.date_published || "",
+            url: row.url || "",
+            category: row.category || "",
+            article_type: (row.article_type as any) || "News Article",
+            word_count: parseInt(row.word_count) || 0,
+            status: "pending",
+            annotation_count: 0,
+            annotated_by: [],
+            assigned_to: [],
+            assigned_count: 0,
+            bias_score: null,
+            fleiss_kappa: null,
+            is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1",
+            gold_expected_label: row.gold_expected_label || undefined
+          };
+          console.log("Adding article to batch:", articleId);
+          batch.set(docRef, article);
+          chunkImported++;
         }
 
-        const articleId = row.article_id;
-        const docRef = doc(db, "articles", articleId);
+        await batch.commit();
+        console.log(`Committed chunk ${i / batchSize + 1}, imported ${chunkImported}`);
+        imported += chunkImported;
+        setProgress(Math.min(100, Math.round(((i + batchSize) / data.length) * 100)));
+        
+        // Update platform stats for this chunk
+        if (chunkImported > 0) {
+          // Calculate category distribution for this chunk
+          const categories = chunk.reduce((acc: Record<string, number>, row) => {
+            const cat = row.category || "Uncategorized";
+            acc[cat] = (acc[cat] || 0) + 1;
+            return acc;
+          }, {});
 
-        const article: Article = {
-          article_id: articleId,
-          headline: row.headline || "",
-          display_text: row.display_text || "",
-          source: row.source || "",
-          author: row.author || "",
-          date_published: row.date_published || "",
-          url: row.url || "",
-          category: row.category || "",
-          article_type: (row.article_type as any) || "News Article",
-          word_count: parseInt(row.word_count) || 0,
-          status: "pending",
-          annotation_count: 0,
-          annotated_by: [],
-          assigned_to: [],
-          assigned_count: 0,
-          bias_score: null,
-          fleiss_kappa: null,
-          is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1",
-          gold_expected_label: row.gold_expected_label || undefined
-        };
-        batch.set(docRef, article);
-        chunkImported++;
+          await updatePlatformStats({
+            totalArticles: chunkImported,
+            pendingArticles: chunkImported,
+            categoryDistribution: categories
+          });
+        }
       }
 
-      await batch.commit();
-      imported += chunkImported;
-      setProgress(Math.min(100, Math.round(((i + batchSize) / data.length) * 100)));
-      
-      // Update platform stats for this chunk
-      if (chunkImported > 0) {
-        // Calculate category distribution for this chunk
-        const categories = chunk.reduce((acc: Record<string, number>, row) => {
-          const cat = row.category || "Uncategorized";
-          acc[cat] = (acc[cat] || 0) + 1;
-          return acc;
-        }, {});
-
-        await updatePlatformStats({
-          totalArticles: chunkImported,
-          pendingArticles: chunkImported,
-          categoryDistribution: categories
-        });
-      }
+      setStats({ imported, skipped });
+      console.log("Import complete:", { imported, skipped });
+    } catch (err: any) {
+      console.error("Error importing articles:", err);
+      alert("Error importing articles: " + (err.message || JSON.stringify(err)));
+    } finally {
+      setLoading(false);
+      setData([]);
+      setPreview([]);
     }
-
-    setStats({ imported, skipped });
-    setLoading(false);
-    setData([]);
-    setPreview([]);
   };
 
   return (
