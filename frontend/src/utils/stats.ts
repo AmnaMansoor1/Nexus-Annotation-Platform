@@ -36,11 +36,17 @@ export async function updatePlatformStats(updates: Partial<{
   const ref = doc(db, SUMMARY_PATH);
   const firebaseUpdates: any = {};
   
+  // Sanitize category names to remove invalid Firestore field path characters
+  const sanitizeCategory = (category: string) => {
+    return category.replace(/[~*/[\]]/g, "_");
+  };
+  
   for (const [key, value] of Object.entries(updates)) {
     if (key === "categoryDistribution" && typeof value === "object") {
       // For category distribution, we use dot notation to increment specific keys
       for (const [category, count] of Object.entries(value)) {
-        firebaseUpdates[`categoryDistribution.${category}`] = increment(count as number);
+        const sanitizedCategory = sanitizeCategory(category);
+        firebaseUpdates[`categoryDistribution.${sanitizedCategory}`] = increment(count as number);
       }
     } else {
       firebaseUpdates[key] = increment(value as number);
