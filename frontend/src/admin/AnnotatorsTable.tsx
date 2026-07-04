@@ -9,49 +9,13 @@ export default function AnnotatorsTable() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // 1. First, check all annotations to find unique annotators, auto-create any missing
-    const initializeAnnotatorsFromAnnotations = async () => {
-      try {
-        const annotationsSnap = await getDocs(collection(db, "annotation_responses"));
-        const annotatorsRef = collection(db, "annotators");
-        const existingAnnotatorsSnap = await getDocs(annotatorsRef);
-        const existingEmails = new Set(existingAnnotatorsSnap.docs.map(doc => doc.id));
-
-        for (const annotationDoc of annotationsSnap.docs) {
-          const data = annotationDoc.data();
-          if (data.annotator_email) {
-            const email = data.annotator_email.toLowerCase();
-            if (!existingEmails.has(email)) {
-              const newAnnotator: Annotator = {
-                email: email,
-                full_name: email.split('@')[0],
-                completed: false,
-                completed_articles: [],
-                assigned_articles: [],
-                reliability_score: 0,
-                gold_total_count: 0,
-                gold_correct_count: 0,
-                gold_accuracy: 0
-              };
-              await setDoc(doc(db, "annotators", email), newAnnotator);
-              existingEmails.add(email);
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Error initializing annotators from annotations:", err);
-      }
-    };
-
-    initializeAnnotatorsFromAnnotations();
-
-    // 2. Now listen for realtime updates to annotators collection
+    // Listen for real-time updates to annotators collection only
     const unsubscribe = onSnapshot(
-      collection(db, "annotators"), 
+      collection(db, "annotators"),
       (snapshot) => {
         setAnnotators(snapshot.docs.map(doc => doc.data() as Annotator));
         setLoading(false);
-      }, 
+      },
       (error) => {
         console.error("Error loading annotators:", error);
         setLoading(false);

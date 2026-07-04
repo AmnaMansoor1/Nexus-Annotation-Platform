@@ -70,27 +70,30 @@ export default function UploadCSV() {
           const articleId = row.article_id;
           const docRef = doc(db, "articles", articleId);
 
-          const article: Article = {
-            article_id: articleId,
-            headline: row.headline || "",
-            display_text: row.display_text || row.full_text || row.summary || "", // Map your CSV text fields
-            source: row.source || "",
-            author: row.author || "",
-            date_published: row.date_published || "",
-            url: row.url || "",
-            category: row.category || "",
-            article_type: (row.article_type as any) || "News Article",
-            word_count: parseInt(row.word_count) || 0,
-            status: "pending",
-            annotation_count: 0,
-            annotated_by: [],
-            assigned_to: [],
-            assigned_count: 0,
-            bias_score: null,
-            fleiss_kappa: null,
-            is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1",
-            gold_expected_label: row.gold_expected_label || undefined
-          };
+          // Build article object, only include gold_expected_label if it exists
+        const article: any = {
+          article_id: articleId,
+          headline: row.headline || "",
+          display_text: row.display_text || row.full_text || row.summary || "",
+          source: row.source || "",
+          author: row.author || "",
+          date_published: row.date_published || "",
+          url: row.url || "",
+          category: row.category || "",
+          article_type: (row.article_type as any) || "News Article",
+          word_count: parseInt(row.word_count) || 0,
+          status: "pending",
+          annotation_count: 0,
+          annotated_by: [],
+          assigned_to: [],
+          assigned_count: 0,
+          bias_score: null,
+          fleiss_kappa: null,
+          is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"
+        };
+        if (row.gold_expected_label) {
+          article.gold_expected_label = row.gold_expected_label;
+        }
           console.log("Adding article to batch:", articleId);
           batch.set(docRef, article);
           chunkImported++;
