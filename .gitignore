@@ -25,3 +25,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Trae AI files
+.trae/
+
+# Datasets (optional)
+annotation_dataset_v6.csv
