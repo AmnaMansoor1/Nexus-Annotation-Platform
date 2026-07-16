@@ -16,7 +16,6 @@ const Dashboard = lazy(() => import("./admin/Dashboard"));
 const AnnotatorsTable = lazy(() => import("./admin/AnnotatorsTable"));
 const UploadCSV = lazy(() => import("./admin/UploadCSV"));
 const ExportCSV = lazy(() => import("./admin/ExportCSV"));
-const Settings = lazy(() => import("./admin/Settings"));
 
 // Loading Component for Suspense
 const PageLoader = () => (
@@ -148,7 +147,6 @@ function App() {
             <Route path="/admin/annotators" element={isAdmin ? <AdminLayout><AnnotatorsTable /></AdminLayout> : <Navigate to="/admin" />} />
             <Route path="/admin/upload" element={isAdmin ? <AdminLayout><UploadCSV /></AdminLayout> : <Navigate to="/admin" />} />
             <Route path="/admin/export" element={isAdmin ? <AdminLayout><ExportCSV /></AdminLayout> : <Navigate to="/admin" />} />
-            <Route path="/admin/settings" element={isAdmin ? <AdminLayout><Settings /></AdminLayout> : <Navigate to="/admin" />} />
           </Routes>
         </Suspense>
       </Router>

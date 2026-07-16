@@ -30,8 +30,19 @@ export default function AnnotationWorkbench() {
   const navigate = useNavigate();
   const session = JSON.parse(localStorage.getItem("nexus_user_session") || "{}");
   const userEmail = (session.email || "").toLowerCase().trim();
+  console.log("[AnnotationWorkbench] User email from session:", userEmail);
   const [assignmentRefresh, setAssignmentRefresh] = useState(0);
-  const { assignedArticles, loading: assignmentLoading, loadAssignment } = useArticleAssignment(userEmail, assignmentRefresh);
+  // Destructure all returns from useArticleAssignment!
+  const { 
+    assignedArticles, 
+    loading: assignmentLoading, 
+    error: assignmentError, 
+    loadAssignment 
+  } = useArticleAssignment(userEmail, assignmentRefresh);
+  console.log("[AnnotationWorkbench] useArticleAssignment returned: assignedArticles=", assignedArticles, "assignmentLoading=", assignmentLoading);
+  
+  // Add state for assignedArticles to store locally!
+  const [assignedArticlesState, setAssignedArticlesState] = useState<string[]>([]);
 
   const [completedArticles, setCompletedArticles] = useState<string[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -47,6 +58,13 @@ export default function AnnotationWorkbench() {
 
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
+  
+  // Sync our local assignedArticlesState with the one from useArticleAssignment
+  useEffect(() => {
+    if (assignedArticles.length > 0) {
+      setAssignedArticlesState(assignedArticles);
+    }
+  }, [assignedArticles]);
 
   // Load article from cache or Firestore
   const loadArticleFromCacheOrDB = useCallback(async (articleId: string): Promise<Article | null> => {
@@ -68,14 +86,14 @@ export default function AnnotationWorkbench() {
 
   // Preload next article
   const preloadNextArticle = useCallback(async (nextIndex: number): Promise<void> => {
-    if (nextIndex < assignedArticles.length) {
-      const nextArticleId = assignedArticles[nextIndex];
+    if (nextIndex < assignedArticlesState.length) {
+      const nextArticleId = assignedArticlesState[nextIndex];
       if (!completedArticles.includes(nextArticleId)) {
         const article = await loadArticleFromCacheOrDB(nextArticleId);
         if (article) setNextArticle(article);
       }
     }
-  }, [assignedArticles, completedArticles, loadArticleFromCacheOrDB]);
+  }, [assignedArticlesState, completedArticles, loadArticleFromCacheOrDB]);
 
   // Update lastActive timestamp on every action
   useEffect(() => {
@@ -108,22 +126,30 @@ export default function AnnotationWorkbench() {
 
   // Load current article based on assigned pool and local completed state
   useEffect(() => {
+    console.log("[AnnotationWorkbench] Article load useEffect triggered: assignedArticlesState=", assignedArticlesState, "completedArticles=", completedArticles, "assignmentLoading=", assignmentLoading);
     async function loadArticle() {
-      if (assignedArticles.length === 0) {
+      console.log("[AnnotationWorkbench] loadArticle function called");
+      if (assignedArticlesState.length === 0) {
+        console.log("[AnnotationWorkbench] assignedArticlesState is empty!");
         if (!assignmentLoading) setLoading(false);
         return;
       }
       
-      const firstPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id));
+      const firstPendingIndex = assignedArticlesState.findIndex(id => !completedArticles.includes(id));
       
       if (firstPendingIndex === -1) {
-        if (!assignmentLoading) navigate("/done");
+        // Don't navigate to /done unless we actually have 20 completed!
+        if (!assignmentLoading && completedArticles.length >= 20) {
+          navigate("/done");
+        } else if (!assignmentLoading) {
+          setLoading(false);
+        }
         return;
       }
 
       try {
         setCurrentIndex(firstPendingIndex);
-        const articleId = assignedArticles[firstPendingIndex];
+        const articleId = assignedArticlesState[firstPendingIndex];
         const article = await loadArticleFromCacheOrDB(articleId);
         
         if (article) {
@@ -145,7 +171,7 @@ export default function AnnotationWorkbench() {
     if (!assignmentLoading) {
       loadArticle();
     }
-  }, [assignedArticles, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle]);
+  }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle]);
 
   const handleSubmit = async () => {
     if (!currentArticle || !label || !timerExpired) return;
@@ -160,8 +186,10 @@ export default function AnnotationWorkbench() {
     const articleId = currentArticle.article_id;
 
     // --- 1. INSTANT OPTIMISTIC UI UPDATE ---
-    setCompletedArticles(prev => [...prev, articleId]);
-    setCompletedCount(prev => prev + 1);
+    const newCompletedArticles = [...completedArticles, articleId];
+    setCompletedArticles(newCompletedArticles);
+    const newCompletedCount = completedCount + 1;
+    setCompletedCount(newCompletedCount);
 
     // --- 2. CAPTURE ALL VARS WE NEED TO SAVE FIRST ---
     const savedLabel = label;
@@ -321,22 +349,81 @@ export default function AnnotationWorkbench() {
       // --- 6. If NOT 20, proceed with next article ---
       setSubmitting(false);
       
-      let nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
-      if (nextPendingIndex === -1 && actualCompletedCountFromFirestore < 20) {
-        setAssignmentRefresh(prev => prev + 1);
-        await loadAssignment();
-        nextPendingIndex = assignedArticles.findIndex(id => !completedArticles.includes(id) && id !== articleId);
+      // First, get the LATEST data from Firestore directly to avoid relying on stale state!
+      const latestAnnotatorDoc = await getDoc(doc(db, "annotators", userEmail));
+      let latestAssignedArticles: string[] = [];
+      let latestCompletedArticles: string[] = [];
+      
+      if (latestAnnotatorDoc.exists()) {
+        const latestAnnotatorData = latestAnnotatorDoc.data() as Annotator;
+        latestAssignedArticles = latestAnnotatorData.assigned_articles || [];
+        latestCompletedArticles = latestAnnotatorData.completed_articles || [];
+        
+        // Update our local state with the latest data
+        setAssignedArticlesState(latestAssignedArticles);
+        setCompletedArticles(latestCompletedArticles);
+        setCompletedCount(latestCompletedArticles.length);
+      } else {
+        // Fall back to local state if Firestore fails
+        latestAssignedArticles = assignedArticlesState;
+        latestCompletedArticles = newCompletedArticles;
       }
       
-      if (nextPendingIndex !== -1 && nextArticle) {
-        setCurrentIndex(nextPendingIndex);
-        setCurrentArticle(nextArticle);
-        setStartTime(Date.now());
-        setTimerExpired(false);
-        setLabel(null);
-        preloadNextArticle(nextPendingIndex + 1);
+      // Find next pending index using the LATEST data
+      let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
+      
+      // If we still don't have a next article, and haven't reached 20 completed, try to load more!
+      if (nextPendingIndex === -1 && latestCompletedArticles.length < 20) {
+        console.log("[AnnotationWorkbench] No next article, trying to load more articles!");
+        setAssignmentRefresh(prev => prev + 1);
+        await loadAssignment();
+        
+        // Get the VERY latest data after loadAssignment completes
+        const afterLoadAnnotatorDoc = await getDoc(doc(db, "annotators", userEmail));
+        if (afterLoadAnnotatorDoc.exists()) {
+          const afterLoadData = afterLoadAnnotatorDoc.data() as Annotator;
+          latestAssignedArticles = afterLoadData.assigned_articles || [];
+          latestCompletedArticles = afterLoadData.completed_articles || [];
+          
+          // Update our state with this new data
+          setAssignedArticlesState(latestAssignedArticles);
+          setCompletedArticles(latestCompletedArticles);
+          setCompletedCount(latestCompletedArticles.length);
+          
+          // Check again for a next pending index
+          nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
+        }
+      }
+      
+      if (nextPendingIndex !== -1) {
+        // Load the next article directly from latestAssignedArticles
+        const nextArticleId = latestAssignedArticles[nextPendingIndex];
+        const newNextArticle = await loadArticleFromCacheOrDB(nextArticleId);
+        if (newNextArticle) {
+          setCurrentIndex(nextPendingIndex);
+          setCurrentArticle(newNextArticle);
+          setStartTime(Date.now());
+          setTimerExpired(false);
+          setLabel(null);
+          setNextArticle(null); // Clear stale next article
+          await preloadNextArticle(nextPendingIndex + 1); // Preload next one
+        } else {
+          // If we still don't have 20 completed, don't navigate away yet!
+          if (latestCompletedArticles.length < 20) {
+            console.warn("[AnnotationWorkbench] Next article not found, but we haven't completed 20 yet—waiting for more articles!");
+            alert("Waiting for more articles to be assigned. Please refresh the page or try again later.");
+          } else {
+            navigate("/done");
+          }
+        }
       } else {
-        navigate("/done");
+        // Only navigate to /done if we have completed 20 articles!
+        if (latestCompletedArticles.length >= 20) {
+          navigate("/done");
+        } else {
+          console.warn("[AnnotationWorkbench] No next article, but we haven't completed 20 yet—waiting!");
+          alert("You've annotated all available articles! Please check back later for more to reach your 20-article target.");
+        }
       }
 
     } catch (err: any) {

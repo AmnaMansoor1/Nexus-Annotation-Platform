@@ -53,7 +53,6 @@ export default function AdminLayout({ children }: AdminLayoutProps) {
     { to: "/admin/annotators", label: "Annotators", icon: Users },
     { to: "/admin/upload", label: "Upload CSV", icon: Upload },
     { to: "/admin/export", label: "Export", icon: Download },
-    { to: "/admin/settings", label: "Settings", icon: SettingsIcon },
   ];
 
   return (
