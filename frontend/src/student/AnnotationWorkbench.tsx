@@ -115,7 +115,7 @@ export default function AnnotationWorkbench() {
           const data = annotatorDoc.data() as Annotator;
           const completed = data.completed_articles || [];
           setCompletedArticles(completed);
-          setCompletedCount(completed.length);
+          setCompletedCount(Math.min(completed.length, 20));
         }
       } catch (err) {
         console.error("Error loading annotator:", err);
@@ -188,7 +188,7 @@ export default function AnnotationWorkbench() {
     // --- 1. INSTANT OPTIMISTIC UI UPDATE ---
     const newCompletedArticles = [...completedArticles, articleId];
     setCompletedArticles(newCompletedArticles);
-    const newCompletedCount = completedCount + 1;
+    const newCompletedCount = Math.min(completedCount + 1, 20);
     setCompletedCount(newCompletedCount);
 
     // --- 2. CAPTURE ALL VARS WE NEED TO SAVE FIRST ---
@@ -263,7 +263,7 @@ export default function AnnotationWorkbench() {
             if (annotatorRefresh.exists()) {
               const newData = annotatorRefresh.data() as Annotator;
               setCompletedArticles(newData.completed_articles || []);
-              setCompletedCount(newData.completed_articles?.length || 0);
+              setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
             }
             if (statusChangedTo === "complete") {
               const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
@@ -320,7 +320,7 @@ export default function AnnotationWorkbench() {
           if (annotatorDocAfter.exists()) {
             const data = annotatorDocAfter.data() as Annotator;
             setCompletedArticles(data.completed_articles || []);
-            setCompletedCount(data.completed_articles?.length || 0);
+            setCompletedCount(Math.min(data.completed_articles?.length || 0, 20));
             
             if (data.completed_articles?.length >= 20 && data.completed === true) {
               success = true;

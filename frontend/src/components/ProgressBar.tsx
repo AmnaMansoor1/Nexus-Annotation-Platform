@@ -4,12 +4,14 @@ interface ProgressBarProps {
 }
 
 export default function ProgressBar({ current, total }: ProgressBarProps) {
-  const percentage = (current / total) * 100;
+  // Clamp values so they can't exceed total or go below 0
+  const clampedCurrent = Math.max(1, Math.min(current, total));
+  const percentage = Math.max(0, Math.min((clampedCurrent / total) * 100, 100));
 
   return (
     <div className="w-full space-y-2">
       <div className="flex justify-between text-sm font-semibold text-slate-500">
-        <span>Article {current} of {total}</span>
+        <span>Article {clampedCurrent} of {total}</span>
         <span>{Math.round(percentage)}%</span>
       </div>
       <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
