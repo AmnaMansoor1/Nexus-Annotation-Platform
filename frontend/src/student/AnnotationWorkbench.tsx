@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { db } from "../firebase";
@@ -58,6 +58,14 @@ export default function AnnotationWorkbench() {
 
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
+
+  // Stable timer complete handler
+  const handleTimerComplete = useCallback(() => {
+    setTimerExpired(true);
+  }, []);
+
+  // Track last loaded article to prevent unnecessary reloads
+  const lastLoadedArticleIdRef = useRef<string | null>(null);
   
   // Sync our local assignedArticlesState with the one from useArticleAssignment
   useEffect(() => {
@@ -150,16 +158,22 @@ export default function AnnotationWorkbench() {
       try {
         setCurrentIndex(firstPendingIndex);
         const articleId = assignedArticlesState[firstPendingIndex];
-        const article = await loadArticleFromCacheOrDB(articleId);
         
-        if (article) {
-          setCurrentArticle(article);
-          setStartTime(Date.now());
-          setTimerExpired(false);
-          setLabel(null);
+        // Only reset label and reload if we're getting a NEW article!
+        if (articleId !== lastLoadedArticleIdRef.current) {
+          lastLoadedArticleIdRef.current = articleId;
           
-          // Preload the next article right away!
-          await preloadNextArticle(firstPendingIndex + 1);
+          const article = await loadArticleFromCacheOrDB(articleId);
+          
+          if (article) {
+            setCurrentArticle(article);
+            setStartTime(Date.now());
+            setTimerExpired(false);
+            setLabel(null);
+            
+            // Preload the next article right away!
+            await preloadNextArticle(firstPendingIndex + 1);
+          }
         }
       } catch (err) {
         console.error("Error loading article:", err);
@@ -487,7 +501,7 @@ export default function AnnotationWorkbench() {
               <TimerRing
                 key={currentArticle.article_id}
                 duration={10}
-                onComplete={() => setTimerExpired(true)}
+                onComplete={handleTimerComplete}
               />
             </div>
           </div>
