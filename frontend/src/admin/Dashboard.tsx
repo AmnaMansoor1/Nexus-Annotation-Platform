@@ -156,8 +156,6 @@ export default function Dashboard() {
     { label: "Fully Annotated", value: stats.completedArticles, icon: CheckCircle2, color: "bg-green-500" },
     { label: "In Progress", value: stats.inProgressArticles, icon: Clock, color: "bg-yellow-500" },
     { label: "Pending", value: stats.pendingArticles, icon: TrendingUp, color: "bg-slate-400" },
-    { label: "Total Annotators", value: stats.totalAnnotators, icon: Users, color: "bg-purple-500" },
-    { label: "Annotators Completed", value: stats.completedAnnotators, icon: Activity, color: "bg-teal-500" },
   ];
 
   if (loading) {
