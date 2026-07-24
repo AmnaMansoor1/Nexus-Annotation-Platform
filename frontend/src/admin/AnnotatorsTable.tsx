@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { collection, onSnapshot, doc, updateDoc, getDoc, getDocs, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator } from "../types";
+import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { User, Mail, Hash, CheckCircle, Clock, ShieldAlert, Ban, Loader2, RefreshCw } from "lucide-react";
 
 export default function AnnotatorsTable() {
@@ -27,7 +28,7 @@ export default function AnnotatorsTable() {
 
   const toggleDeactivate = async (annotator: Annotator) => {
     try {
-      const ref = doc(db, "annotators", annotator.email);
+      const ref = doc(db, "annotators", sanitizeEmailForDocId(annotator.email));
       await updateDoc(ref, { deactivated: !annotator.deactivated });
     } catch (err) {
       alert("Error updating annotator: " + err);
@@ -54,7 +55,7 @@ export default function AnnotatorsTable() {
       for (const articleId of allArticleIds) {
         for (const email of emailsToCheck) {
           const responseDoc = await getDoc(
-            doc(db, "annotations", articleId, "responses", email)
+            doc(db, "annotations", articleId, "responses", sanitizeEmailForDocId(email))
           );
           if (responseDoc.exists()) {
             console.log(`[Recalculate] Found annotation for article: ${articleId} (using email: ${email}`);
@@ -69,7 +70,7 @@ export default function AnnotatorsTable() {
       console.log(`[Recalculate] Total completed articles found: ${actualCompleted.length}`);
       
       // Now update annotator document in Firestore
-      const annotatorRef = doc(db, "annotators", annotator.email);
+      const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(annotator.email));
       await updateDoc(annotatorRef, {
         completed_articles: actualCompleted,
         completed: actualCompleted.length >= 20

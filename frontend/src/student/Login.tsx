@@ -5,7 +5,28 @@ import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from "fire
 import { db, auth } from "../firebase";
 import { Annotator } from "../types";
 import { updatePlatformStats } from "../utils/stats";
+import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { UserPlus, LogIn, Mail, User, Loader2, Lock } from "lucide-react";
+
+// Firestore rules allow reads ONLY when the doc already exists and the stored
+// `email` field matches the caller. For non-existent docs (e.g. first-time
+// sign-ins) `getDoc` throws PERMISSION_DENIED instead of returning
+// `snap.exists() === false`. We wrap getDoc calls here to normalise both
+// outcomes into a single "does not exist" result so the rest of the flow is
+// unchanged.
+async function safeGetAnnotatorDoc(email: string) {
+  try {
+    const snap = await getDoc(doc(db, "annotators", sanitizeEmailForDocId(email)));
+    return snap;
+  } catch (err: any) {
+    if (err && (err.code === "permission-denied" || err.code === "firestore/permission-denied" ||
+      (typeof err.message === "string" && /permission|insufficient/i.test(err.message)))) {
+      // Treat as "doc doesn't exist yet" so the downstream setDoc(merge) path runs.
+      return { exists: () => false } as any;
+    }
+    throw err;
+  }
+}
 
 export default function Login() {
   const [email, setEmail] = useState("");
@@ -15,6 +36,16 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+
+  // Only @cuilahore.edu.pk student emails and the admin account are allowed.
+  const ALLOWED_DOMAIN = "@cuilahore.edu.pk";
+  const ADMIN_EMAIL = "admin@gmail.com";
+
+  const isAllowedEmail = (e: string) => {
+    const lower = e.toLowerCase().trim();
+    if (lower === ADMIN_EMAIL) return true;
+    return lower.endsWith(ALLOWED_DOMAIN);
+  };
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -26,6 +57,12 @@ export default function Login() {
       // we use a deterministic password for student accounts.
       // We trim and lowercase the email to ensure consistency.
       const cleanEmail = email.toLowerCase().trim();
+
+      if (!cleanEmail) throw new Error("Email is required.");
+      if (!isAllowedEmail(cleanEmail)) {
+        throw new Error(`Access restricted. Only ${ALLOWED_DOMAIN} emails are permitted.`);
+      }
+
       const studentAuthPassword = `nexus_${cleanEmail.replace(/[^a-z0-9]/g, '')}_2026`;
 
       if (mode === "signup") {
@@ -50,7 +87,7 @@ export default function Login() {
           gold_accuracy: 0
         };
 
-        await setDoc(doc(db, "annotators", cleanEmail), newUser);
+        await setDoc(doc(db, "annotators", sanitizeEmailForDocId(cleanEmail)), newUser);
         await updatePlatformStats({ totalAnnotators: 1 });
         
         navigate("/welcome");
@@ -64,7 +101,7 @@ export default function Login() {
           if (authErr.code === "auth/invalid-credential" || authErr.code === "auth/user-not-found") {
             try {
               // Check if they exist in Firestore first
-              const snap = await getDoc(doc(db, "annotators", cleanEmail));
+              const snap = await safeGetAnnotatorDoc(cleanEmail);
               if (snap.exists()) {
                 await createUserWithEmailAndPassword(auth, cleanEmail, studentAuthPassword);
               } else {
@@ -82,7 +119,7 @@ export default function Login() {
         }
         
         // 2. Final check for Firestore profile - if missing, create it!
-        let snap = await getDoc(doc(db, "annotators", cleanEmail));
+        let snap = await safeGetAnnotatorDoc(cleanEmail);
         if (!snap.exists()) {
           const newUser: Annotator = {
             email: cleanEmail,
@@ -95,7 +132,7 @@ export default function Login() {
             gold_correct_count: 0,
             gold_accuracy: 0
           };
-          await setDoc(doc(db, "annotators", cleanEmail), newUser);
+          await setDoc(doc(db, "annotators", sanitizeEmailForDocId(cleanEmail)), newUser);
           await updatePlatformStats({ totalAnnotators: 1 });
         }
 

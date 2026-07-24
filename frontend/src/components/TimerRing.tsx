@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface TimerRingProps {
   duration: number;
@@ -11,10 +11,14 @@ export default function TimerRing({ duration, onComplete }: TimerRingProps) {
   const radius = 20;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (timeLeft / duration) * circumference;
+  const firedRef = useRef(false);
 
   useEffect(() => {
     if (timeLeft <= 0) {
-      onComplete();
+      if (!firedRef.current) {
+        firedRef.current = true;
+        onComplete();
+      }
       return;
     }
 

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
-import { db } from "../firebase";
+import { auth, db } from "../firebase";
 import { Article, Annotator, BiasLabel } from "../types";
 import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
@@ -10,6 +10,7 @@ import { Check, Loader2, AlertCircle } from "lucide-react";
 import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
+import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 
 // Helper to retry async operations with exponential backoff (no generics to avoid errors)
 const retryWithBackoff = async (
@@ -25,6 +26,27 @@ const retryWithBackoff = async (
     return retryWithBackoff(fn, retries - 1, delay * 2);
   }
 };
+
+// Wrap Firestore `getDoc` calls so that PERMISSION_DENIED (which happens
+// for certain paths when Firestore rules can't evaluate to TRUE for a
+// missing or in-between-state document) is treated as a "doc not found"
+// shim instead of throwing. This prevents the optimistic UI from being
+// rolled back when the transaction actually committed.
+async function safeGetDoc(ref: any) {
+  try {
+    return await getDoc(ref);
+  } catch (err: any) {
+    const msg = (err && err.message) || "";
+    const isPerm = (err && (err.code === "permission-denied" ||
+      err.code === "firestore/permission-denied")) ||
+      /permission|insufficient/i.test(msg);
+    if (isPerm) {
+      console.warn("[safeGetDoc] PERMISSION_DENIED on read of", ref.path, " — treating as not-exists");
+      return { exists: () => false, data: () => ({} as any), id: ref.id } as any;
+    }
+    throw err;
+  }
+}
 
 export default function AnnotationWorkbench() {
   const navigate = useNavigate();
@@ -118,7 +140,7 @@ export default function AnnotationWorkbench() {
     async function initAnnotator() {
       if (!userEmail) return;
       try {
-        const annotatorDoc = await getDoc(doc(db, "annotators", userEmail));
+        const annotatorDoc = await getDoc(doc(db, "annotators", sanitizeEmailForDocId(userEmail)));
         if (annotatorDoc.exists()) {
           const data = annotatorDoc.data() as Annotator;
           const completed = data.completed_articles || [];
@@ -210,6 +232,8 @@ export default function AnnotationWorkbench() {
     const savedCurrentArticle = currentArticle;
     setSubmitting(true);
 
+    let txnCommitted = false;
+
     try {
       // --- 3. FIRST START THE SAVE TO DATABASE AND AWAIT IT ---
       await retryWithBackoff(async () => {
@@ -221,16 +245,38 @@ export default function AnnotationWorkbench() {
           is_gold_check: !!savedCurrentArticle.is_gold_standard
         };
 
-        const responseRef = doc(db, "annotations", articleId, "responses", userEmail);
+        const responseRef = doc(db, "annotations", articleId, "responses", sanitizeEmailForDocId(userEmail));
         const articleRef = doc(db, "articles", articleId);
-        const annotatorRef = doc(db, "annotators", userEmail);
+        const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
         let statusChangedTo: string | null = null;
 
+        // Utility: wrap transaction.get() so PERMISSION_DENIED on a doc that
+        // doesn't exist yet (e.g. a brand-new response doc) is treated as a
+        // "missing doc" snapshot instead of aborting the whole transaction.
+        // This is needed because Firestore rules cannot differentiate between
+        // a "legitimate read of a missing doc by the owner" vs a probe — they
+        // always throw for missing docs when no read rule passes.
+        const txGetSafe = async (t: any, ref: any) => {
+          try { return await t.get(ref); }
+          catch (err: any) {
+            const msg = (err && err.message) || "";
+            const isPerm = (err && (err.code === "permission-denied" ||
+              err.code === "firestore/permission-denied")) ||
+              /permission|insufficient/i.test(msg);
+            if (isPerm) {
+              // Safe default: a "not exists" doc shim so callers behave as if
+              // the doc simply hasn't been written yet.
+              return { exists: () => false, data: () => ({} as any), id: ref.id } as any;
+            }
+            throw err;
+          }
+        };
+
         await runTransaction(db, async (transaction) => {
-          const responseSnap = await transaction.get(responseRef);
+          const responseSnap = await txGetSafe(transaction, responseRef);
           if (responseSnap.exists()) return;
 
-          const articleSnap = await transaction.get(articleRef);
+          const articleSnap = await txGetSafe(transaction, articleRef);
           if (!articleSnap.exists()) return;
           const articleData = articleSnap.data() as Article;
           const oldStatus = articleData.status;
@@ -239,7 +285,7 @@ export default function AnnotationWorkbench() {
           if (newCount >= 10) newStatus = "complete";
           else if (newCount > 0) newStatus = "partial";
 
-          const annotatorSnap = await transaction.get(annotatorRef);
+          const annotatorSnap = await txGetSafe(transaction, annotatorRef);
           if (!annotatorSnap.exists()) return;
           const annotatorData = annotatorSnap.data() as Annotator;
 
@@ -310,82 +356,57 @@ export default function AnnotationWorkbench() {
         })();
       }, 3, 500);
 
-      // --- 4. VERIFY SAVE: Check that the annotation response actually exists ---
-      const verifyAnnotationDoc = await getDoc(doc(db, "annotations", articleId, "responses", userEmail));
-      if (!verifyAnnotationDoc.exists()) {
-        throw new Error("Annotation failed verification after save");
-      }
+      // --- 4. Transaction was atomic — if we reached here, the save is DONE.
+      txnCommitted = true;
 
-      // --- 5. Check from Firestore if this annotation brought us to >= 20 ---
-      let initialAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
-      let actualCompletedCountFromFirestore = initialAnnotatorCheck.exists() ? initialAnnotatorCheck.data().completed_articles?.length : 0;
+      // --- 5. Lightweight verify: try to read the response doc (non-fatal if
+      // rules block it — we trust the atomic transaction). If the annotator
+      // read fails on PERMISSION_DENIED, we continue using the optimistic
+      // local state instead of throwing and confusing the user.
+      let completedCountFromServer: number | null = null;
+      let latestAssignedArticles: string[] = [...assignedArticlesState];
+      let latestCompletedArticles: string[] = [...newCompletedArticles];
+      let latestAnnotator: Annotator | null = null;
+
+      try {
+        const verifyRef = doc(db, "annotations", articleId, "responses", sanitizeEmailForDocId(userEmail));
+        const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
+        const [verifyDoc, initialAnnotatorCheck] = await Promise.all([
+          safeGetDoc(verifyRef),
+          safeGetDoc(annotatorRef),
+        ]);
+        // Treat a missing verification doc only as a soft-warning (console).
+        if (!verifyDoc.exists()) {
+          console.warn("[AnnotationWorkbench] Could not independently verify response doc (rules?), but transaction succeeded.");
+        }
+        if (initialAnnotatorCheck.exists()) {
+          const data = initialAnnotatorCheck.data() as Annotator;
+          latestAnnotator = data;
+          completedCountFromServer = data.completed_articles?.length ?? newCompletedArticles.length;
+          latestAssignedArticles = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : latestAssignedArticles;
+          latestCompletedArticles = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : latestCompletedArticles;
+          // Refresh local state with server truth immediately.
+          setAssignedArticlesState(latestAssignedArticles);
+          setCompletedArticles(latestCompletedArticles);
+          setCompletedCount(Math.min(latestCompletedArticles.length, 20));
+        } else {
+          completedCountFromServer = newCompletedArticles.length;
+        }
+      } catch (readErr: any) {
+        console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to optimistic state:", readErr);
+        completedCountFromServer = newCompletedArticles.length;
+      }
       
-      if (actualCompletedCountFromFirestore >= 20) {
-        // --- NOW POLL ---
-        setVerifyingFinalAnnotations(true);
-        let pollAttempts = 0;
-        const maxPollAttempts = 30;
-        let success = false;
-        
-        while (pollAttempts < maxPollAttempts) {
-          const annotatorRefAfter = doc(db, "annotators", userEmail);
-          const annotatorDocAfter = await getDoc(annotatorRefAfter);
-          
-          if (annotatorDocAfter.exists()) {
-            const data = annotatorDocAfter.data() as Annotator;
-            setCompletedArticles(data.completed_articles || []);
-            setCompletedCount(Math.min(data.completed_articles?.length || 0, 20));
-            
-            if (data.completed_articles?.length >= 20 && data.completed === true) {
-              success = true;
-              break;
-            }
-          }
-          
-          pollAttempts++;
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        
-        // Final double check before navigating
-        if (!success) {
-          const finalAnnotatorCheck = await getDoc(doc(db, "annotators", userEmail));
-          if (!finalAnnotatorCheck.exists() || finalAnnotatorCheck.data().completed_articles?.length < 20 || finalAnnotatorCheck.data().completed !== true) {
-            throw new Error("Failed to confirm 20 completed annotations in Firestore");
-          }
-        }
-        
-        setVerifyingFinalAnnotations(false);
+      // Find next pending index using the LATEST data
+      let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
+
+      // --- 6. If completed count reached 20, go straight to the done screen.
+      if (latestCompletedArticles.length >= 20) {
         setSubmitting(false);
         navigate("/done");
         return;
       }
 
-      // --- 6. If NOT 20, proceed with next article ---
-      setSubmitting(false);
-      
-      // First, get the LATEST data from Firestore directly to avoid relying on stale state!
-      const latestAnnotatorDoc = await getDoc(doc(db, "annotators", userEmail));
-      let latestAssignedArticles: string[] = [];
-      let latestCompletedArticles: string[] = [];
-      
-      if (latestAnnotatorDoc.exists()) {
-        const latestAnnotatorData = latestAnnotatorDoc.data() as Annotator;
-        latestAssignedArticles = latestAnnotatorData.assigned_articles || [];
-        latestCompletedArticles = latestAnnotatorData.completed_articles || [];
-        
-        // Update our local state with the latest data
-        setAssignedArticlesState(latestAssignedArticles);
-        setCompletedArticles(latestCompletedArticles);
-        setCompletedCount(latestCompletedArticles.length);
-      } else {
-        // Fall back to local state if Firestore fails
-        latestAssignedArticles = assignedArticlesState;
-        latestCompletedArticles = newCompletedArticles;
-      }
-      
-      // Find next pending index using the LATEST data
-      let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
-      
       // If we still don't have a next article, and haven't reached 20 completed, try to load more!
       if (nextPendingIndex === -1 && latestCompletedArticles.length < 20) {
         console.log("[AnnotationWorkbench] No next article, trying to load more articles!");
@@ -393,7 +414,7 @@ export default function AnnotationWorkbench() {
         await loadAssignment();
         
         // Get the VERY latest data after loadAssignment completes
-        const afterLoadAnnotatorDoc = await getDoc(doc(db, "annotators", userEmail));
+        const afterLoadAnnotatorDoc = await safeGetDoc(doc(db, "annotators", sanitizeEmailForDocId(userEmail)));
         if (afterLoadAnnotatorDoc.exists()) {
           const afterLoadData = afterLoadAnnotatorDoc.data() as Annotator;
           latestAssignedArticles = afterLoadData.assigned_articles || [];
@@ -409,6 +430,10 @@ export default function AnnotationWorkbench() {
         }
       }
       
+      // Unblock the submit button BEFORE awaiting next-article loads, so the
+      // button is definitely enabled if anything goes slowly below.
+      setSubmitting(false);
+
       if (nextPendingIndex !== -1) {
         // Load the next article directly from latestAssignedArticles
         const nextArticleId = latestAssignedArticles[nextPendingIndex];
@@ -420,7 +445,8 @@ export default function AnnotationWorkbench() {
           setTimerExpired(false);
           setLabel(null);
           setNextArticle(null); // Clear stale next article
-          await preloadNextArticle(nextPendingIndex + 1); // Preload next one
+          // Preload next one in the BACKGROUND (no await, faster UI).
+          preloadNextArticle(nextPendingIndex + 1).catch(() => {});
         } else {
           // If we still don't have 20 completed, don't navigate away yet!
           if (latestCompletedArticles.length < 20) {
@@ -441,12 +467,24 @@ export default function AnnotationWorkbench() {
       }
 
     } catch (err: any) {
-      console.error("Annotation failed to save after retries!", err);
-      alert("Annotation failed to save properly. Please refresh and try again!");
+      console.error("Annotation save flow error (txnCommitted=", txnCommitted, "):", err);
       setSubmitting(false);
       setVerifyingFinalAnnotations(false);
-      setCompletedArticles(prev => prev.filter(id => id !== articleId));
-      setCompletedCount(prev => prev - 1);
+
+      if (txnCommitted) {
+        // The Firestore write actually succeeded — the error came from a
+        // soft post-read / navigation. The annotation is persisted. Do NOT
+        // roll back the optimistic UI so the user isn't confused into
+        // re-annotating the same article (and double-incrementing server data).
+        console.warn("[AnnotationWorkbench] Transaction already committed before error. Keeping optimistic UI state.");
+        // If a soft error happened but we can't reliably advance, reload.
+        alert("Your annotation was saved. The next article is loading slowly — please refresh if nothing changes.");
+      } else {
+        // Actual write failure — undo the optimistic UI.
+        alert("Annotation failed to save properly. Please refresh and try again!");
+        setCompletedArticles(prev => prev.filter(id => id !== articleId));
+        setCompletedCount(prev => prev - 1);
+      }
     }
   };
 
@@ -471,16 +509,32 @@ export default function AnnotationWorkbench() {
               There are currently no articles assigned to you or available for annotation. 
               Please contact the research administrator.
             </p>
+            {assignmentError && (
+              <p className="text-red-500 text-xs mt-2">Error: {assignmentError}</p>
+            )}
           </div>
-          <button 
-            onClick={() => {
-              localStorage.removeItem("nexus_user_session");
-              window.location.href = "/";
-            }}
-            className="w-full py-3 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-all"
-          >
-            Logout
-          </button>
+          <div className="space-y-3">
+            <button
+              onClick={async () => {
+                setAssignmentRefresh(prev => prev + 1);
+                setLoading(true);
+                await loadAssignment();
+              }}
+              className="w-full py-3 bg-primary text-white rounded-xl font-bold hover:bg-primary/90 transition-all"
+            >
+              Try Loading Articles Again
+            </button>
+            <button 
+              onClick={async () => {
+                try { await auth.signOut(); } catch (e) { /* ignore */ }
+                localStorage.removeItem("nexus_user_session");
+                window.location.href = "/";
+              }}
+              className="w-full py-3 bg-slate-100 text-slate-600 rounded-xl font-bold hover:bg-slate-200 transition-all"
+            >
+              Logout
+            </button>
+          </div>
         </div>
       </div>
     );

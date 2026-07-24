@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { auth, db } from "../firebase";
 import { Annotator } from "../types";
+import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { CheckCircle2, LogOut, Clock } from "lucide-react";
 
 export default function Completion() {
@@ -13,7 +14,7 @@ export default function Completion() {
     async function checkStatus() {
       if (!userEmail) return;
       try {
-        const docRef = doc(db, "annotators", userEmail);
+        const docRef = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
         const snap = await getDoc(docRef);
         if (snap.exists()) {
           setIsFullyDone(snap.data().completed);

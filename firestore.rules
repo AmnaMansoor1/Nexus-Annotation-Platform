@@ -3,60 +3,104 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // Helper functions
     function isAuthenticated() {
       return request.auth != null;
     }
     
     function isAdmin() {
-      if (!isAuthenticated()) return false;
-      
-      // Try to get admin config
-      let adminConfig = get(/databases/$(database)/documents/admin_config/settings).data;
-      
-      // Fallback: if no admin config exists, use default admin@gmail.com
-      let allowedEmails = adminConfig.admin_emails != null ? adminConfig.admin_emails : ["admin@gmail.com"];
-      
-      return request.auth.token.email.lower() in allowedEmails;
+      return isAuthenticated() && request.auth.token.email.lower() == "admin@gmail.com";
     }
     
-    function isOwner(email) {
-      return isAuthenticated() && request.auth.token.email.lower() == email.lower();
+    function authEmailLower() {
+      return isAuthenticated() ? request.auth.token.email.lower() : "";
     }
 
-    // 1. Articles Collection
+    // Domain whitelist. Enforced server-side on annotator doc creation so
+    // the client-side validation in Login.tsx cannot be bypassed via the
+    // Firebase SDK/REST API. Admin account is always exempt.
+    //
+    // Note: rules language does NOT support .endsWith() and does NOT support
+    // let/var (pure expressions only). We use .matches() with a regex and
+    // inline the .lower() call.
+    function isAllowedStudentEmail(email) {
+      return email.lower() == "admin@gmail.com"
+          || email.lower().matches(".*@cuilahore\\.edu\\.pk$");
+    }
+
+    // Note: Firestore rules language (as of rules v2) does NOT support string
+    // replacement (no .replace() or .replaceAll()). String ops in rules are
+    // limited to: .size(), .lower(), .upper(), .matches(), .trim(), .split(),
+    // index access s[i], substring s[a:b], and concatenation.
+    //
+    // Therefore ownership CANNOT be validated by sanitizing the email inside
+    // rules. Instead we:
+    //   - ALWAYS store the raw (unsanitized) email inside the document as a
+    //     regular field (paths are sanitized, field values are not).
+    //   - Match rules against the stored field, NOT the doc ID path.
+    //   - For reads of non-existent docs (e.g., first-time login checks), the
+    //     client treats a PERMISSION_DENIED as "doc doesn't exist yet" and
+    //     then creates via `setDoc(merge:true)` — which WILL be allowed by
+    //     the create/update rules because they can validate the field on the
+    //     incoming request payload.
+
+    function resourceHasEmail(pathField) {
+      return resource != null 
+          && resource.data[pathField] is string 
+          && resource.data[pathField].lower() == authEmailLower();
+    }
+
+    function requestHasEmail(pathField) {
+      return request.resource.data[pathField] is string 
+          && request.resource.data[pathField].lower() == authEmailLower();
+    }
+
     match /articles/{articleId} {
-      // Admins have full access
-      allow read, write: if isAdmin();
-      
-      // Students can read articles but cannot delete or create them
       allow read: if isAuthenticated();
-      
-      // Students can only update specific fields via the workbench transaction
+      allow write: if isAdmin();
       allow update: if isAuthenticated() && 
                     (request.resource.data.diff(resource.data).affectedKeys()
-                    .hasAny(['annotation_count', 'annotated_by', 'status', 'bias_score', 'fleiss_kappa']));
+                    .hasAny(['annotation_count', 'annotated_by', 'status', 'bias_score', 'fleiss_kappa', 'assigned_count', 'assigned_to']));
     }
 
-    // 2. Annotators Collection
-    match /annotators/{email} {
+    match /annotators/{docId} {
       allow read, write: if isAdmin();
-      allow read, update: if isOwner(email);
-      allow create: if isAuthenticated(); // Allow new student signups
+      // Reads: only allowed when the doc ALREADY exists and the stored
+      // `email` field matches the caller's auth email. If the doc does NOT
+      // exist yet, read throws PERMISSION_DENIED which the caller treats as
+      // "doc missing" and then creates via setDoc.
+      allow read:   if resourceHasEmail('email');
+      // Updates: caller owns the existing doc AND the stored email (even
+      // after the update) remains on the domain whitelist.
+      allow update: if resourceHasEmail('email')
+                       && isAllowedStudentEmail(resource.data.email);
+      // Creates: the INCOMING document has `email` equal to the caller's auth
+      // email AND that email is on the domain whitelist. This prevents API
+      // callers from bypassing Login.tsx validation.
+      allow create: if requestHasEmail('email')
+                       && isAllowedStudentEmail(request.resource.data.email);
     }
 
-    // 3. Annotations Collection
     match /annotations/{articleId} {
-      allow read: if isAdmin();
-      
-      match /responses/{email} {
-        allow read: if isAdmin() || isOwner(email);
-        allow create: if isAuthenticated() && isOwner(email);
-        allow update: if false; // Once submitted, annotations cannot be changed
+      allow read: if isAuthenticated();
+      match /responses/{docId} {
+        // Any authenticated user can read annotation responses. This is
+        // required so annotators can compute consensus metrics (bias_score
+        // / Fleiss' kappa) once an article reaches completion. Response docs
+        // do not contain any PII beyond the annotator's email and label
+        // choice, which is the core research data itself.
+        allow read:   if isAuthenticated();
+        // Creates: allowed only when the INCOMING document has
+        // `annotator_email` equal to the caller's auth email, AND that email
+        // is on the domain whitelist. So responses can only be written by
+        // legitimate signed-in users.
+        allow create: if isAuthenticated()
+                         && requestHasEmail('annotator_email')
+                         && isAllowedStudentEmail(request.resource.data.annotator_email);
+        allow update: if false;
+        allow delete: if isAdmin();
       }
     }
 
-    // 4. Admin Config & Stats
     match /admin_config/{document=**} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
@@ -64,7 +108,7 @@ service cloud.firestore {
 
     match /stats/{document=**} {
       allow read: if isAuthenticated();
-      allow write: if isAuthenticated(); // Allow status increments
+      allow write: if isAuthenticated();
     }
   }
 }
