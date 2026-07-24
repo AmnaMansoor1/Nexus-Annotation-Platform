@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { collection, getDocs, query, orderBy } from "firebase/firestore";
+import { collection, getDocsFromServer, query, orderBy } from "firebase/firestore";
 import { db } from "../firebase";
 import { Article } from "../types";
 import { downloadCSV } from "../utils/csvExport";
@@ -12,12 +12,13 @@ export default function ExportCSV() {
     setLoading(true);
     try {
       const q = query(collection(db, "articles"), orderBy("article_id"));
-      const snap = await getDocs(q);
+      const snap = await getDocsFromServer(q);
       const articles = snap.docs.map(doc => doc.data() as Article);
 
       const exportData = await Promise.all(articles.map(async (article) => {
-        // Fetch all responses for this article
-        const responsesSnap = await getDocs(collection(db, "annotations", article.article_id, "responses"));
+        const responsesSnap = await getDocsFromServer(
+          collection(db, "annotations", article.article_id, "responses")
+        );
         const responses = responsesSnap.docs.map(d => d.data());
 
         // 1. Base article data

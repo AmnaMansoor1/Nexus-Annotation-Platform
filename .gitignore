@@ -31,3 +31,16 @@ dist-ssr
 
 # Datasets (optional)
 annotation_dataset_v6.csv
+
+# Firebase Admin secrets (NEVER commit)
+service-account.json
+serviceAccountKey.json
+*.firebase-service-account.json
+firebase-adminsdk-*.json
+
+# Local admin/dev scripts (not part of the app deployment)
+backend/src/wipe-annotations.js
+backend/src/verify-wipe.js
+backend/src/deep-scan.mjs
+backend/src/quick-check.mjs
+backend/src/scan-exact-export.mjs

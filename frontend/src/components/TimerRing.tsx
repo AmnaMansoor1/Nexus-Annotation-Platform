@@ -11,23 +11,44 @@ export default function TimerRing({ duration, onComplete }: TimerRingProps) {
   const radius = 20;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (timeLeft / duration) * circumference;
+
   const firedRef = useRef(false);
+  const activeRef = useRef(true);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
 
   useEffect(() => {
-    if (timeLeft <= 0) {
-      if (!firedRef.current) {
-        firedRef.current = true;
-        onComplete();
-      }
-      return;
-    }
+    activeRef.current = true;
+    firedRef.current = false;
+    setTimeLeft(duration);
 
-    const timer = setInterval(() => {
-      setTimeLeft((prev) => prev - 1);
+    intervalRef.current = setInterval(() => {
+      if (!activeRef.current) return;
+      setTimeLeft((prev) => {
+        if (!activeRef.current) return prev;
+        const next = prev - 1;
+        return next < 0 ? 0 : next;
+      });
     }, 1000);
 
-    return () => clearInterval(timer);
-  }, [timeLeft, onComplete]);
+    return () => {
+      activeRef.current = false;
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [duration]);
+
+  useEffect(() => {
+    if (timeLeft <= 0 && !firedRef.current) {
+      firedRef.current = true;
+      try {
+        onCompleteRef.current();
+      } catch {}
+    }
+  }, [timeLeft]);
 
   return (
     <div className="relative inline-flex items-center justify-center">

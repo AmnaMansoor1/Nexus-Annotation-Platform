@@ -86,6 +86,25 @@ export default function AnnotationWorkbench() {
     setTimerExpired(true);
   }, []);
 
+  // Watchdog: if > (duration + 2s grace) has elapsed since startTime and timerExpired is
+  // still false for the CURRENT article, force-set it. This guarantees Submit button
+  // enables even if TimerRing's StrictMode double-fire / interval leak / race condition
+  // on Article-2 transition dropped the onComplete callback.
+  useEffect(() => {
+    if (!startTime || timerExpired) return;
+    const MAX_WAIT_MS = (10 + 2) * 1000;
+    const elapsed = Date.now() - startTime;
+    const waitMs = Math.max(0, MAX_WAIT_MS - elapsed);
+    const t = setTimeout(() => {
+      setTimerExpired((prev) => {
+        if (prev) return prev;
+        console.warn("[AnnotationWorkbench] Watchdog forcing timerExpired=true (TimerRing may have missed onComplete)");
+        return true;
+      });
+    }, waitMs);
+    return () => clearTimeout(t);
+  }, [startTime, timerExpired, currentArticle]);
+
   // Track last loaded article to prevent unnecessary reloads
   const lastLoadedArticleIdRef = useRef<string | null>(null);
   
@@ -189,8 +208,8 @@ export default function AnnotationWorkbench() {
           
           if (article) {
             setCurrentArticle(article);
-            setStartTime(Date.now());
             setTimerExpired(false);
+            setStartTime(Date.now());
             setLabel(null);
             
             // Preload the next article right away!
@@ -441,8 +460,8 @@ export default function AnnotationWorkbench() {
         if (newNextArticle) {
           setCurrentIndex(nextPendingIndex);
           setCurrentArticle(newNextArticle);
-          setStartTime(Date.now());
           setTimerExpired(false);
+          setStartTime(Date.now());
           setLabel(null);
           setNextArticle(null); // Clear stale next article
           // Preload next one in the BACKGROUND (no await, faster UI).
