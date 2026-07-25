@@ -307,6 +307,11 @@ export default function AnnotationWorkbench() {
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);
           if (!annotatorSnap.exists()) return;
           const annotatorData = annotatorSnap.data() as Annotator;
+          const serverCompletedIds = Array.isArray(annotatorData.completed_articles)
+            ? annotatorData.completed_articles.filter((id: string) => id && id !== articleId)
+            : [];
+          const serverCountBefore = serverCompletedIds.length;
+          const newTotal = serverCountBefore + 1;
 
           transaction.update(articleRef, {
             annotation_count: increment(1),
@@ -324,16 +329,21 @@ export default function AnnotationWorkbench() {
           };
           if (savedCurrentArticle.is_gold_standard && savedCurrentArticle.gold_expected_label) {
             const wasCorrect = savedLabel === savedCurrentArticle.gold_expected_label;
-            const newTotal = (annotatorData.gold_total_count || 0) + 1;
+            const newTotalGold = (annotatorData.gold_total_count || 0) + 1;
             const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
-            annotatorUpdates.gold_total_count = newTotal;
+            annotatorUpdates.gold_total_count = newTotalGold;
             annotatorUpdates.gold_correct_count = newCorrect;
-            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
+            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotalGold) * 100);
             annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
           }
-          const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
-          if (totalCompleted >= 20) annotatorUpdates.completed = true;
+          const wasCompletedBefore = !!annotatorData.completed && serverCountBefore >= 20;
+          const isCompletedNow = newTotal >= 20;
+          annotatorUpdates.completed = isCompletedNow;
           transaction.update(annotatorRef, annotatorUpdates);
+
+          // Track whether this submit caused annotator to cross the 20/20 finish line
+          // for later stats update (outside tx)
+          (window as any).__nexus_justFinishedAnnotator = !wasCompletedBefore && isCompletedNow;
         });
 
         (async () => {
@@ -419,8 +429,24 @@ export default function AnnotationWorkbench() {
       // Find next pending index using the LATEST data
       let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
 
+      // ---- CRITICAL: Decide done-state ONLY from server-TRUTH counts. ----
+      // We ALREADY refreshed latestCompletedArticles from the annotator doc
+      // (the one just updated by the transaction). This avoids navigating to
+      // /done prematurely when the optimistic local state was off-by-one AND
+      // avoids 19/20 display bug on the admin dashboard because the annotator
+      // doc (and `completed` boolean) are guaranteed 20 IDs before we leave.
+      const serverDone = latestCompletedArticles.length >= 20;
+
+      // Update completedAnnotators platform stat IFF this submit was the
+      // one that crossed the finish line (freshly completed annotator).
+      if (serverDone && (window as any).__nexus_justFinishedAnnotator) {
+        try { await updatePlatformStats({ completedAnnotators: 1 }); }
+        catch (e) { console.warn("Could not bump completedAnnotators stat:", e); }
+        try { delete (window as any).__nexus_justFinishedAnnotator; } catch {}
+      }
+
       // --- 6. If completed count reached 20, go straight to the done screen.
-      if (latestCompletedArticles.length >= 20) {
+      if (serverDone) {
         setSubmitting(false);
         navigate("/done");
         return;

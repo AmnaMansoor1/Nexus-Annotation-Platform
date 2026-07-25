@@ -114,13 +114,16 @@ export default function Dashboard() {
       }, {});
 
       // 3. Build new summary
+      const completedAnnotatorCount = annotators.filter(a =>
+        Array.isArray(a.completed_articles) && a.completed_articles.length >= 20
+      ).length;
       const newSummary: PlatformSummary = {
         totalArticles: articles.length,
         completedArticles: articles.filter(a => a.status === "complete").length,
         inProgressArticles: articles.filter(a => a.status === "partial").length,
         pendingArticles: articles.filter(a => a.status === "pending").length,
         totalAnnotators: annotators.length,
-        completedAnnotators: annotators.filter(a => a.completed).length,
+        completedAnnotators: completedAnnotatorCount,
         avgBiasScore: stats.avgBiasScore, // Keep current avg bias score
         needsReview: articles.filter(a => a.status === "partial" && a.annotation_count >= 10).length,
         categoryDistribution: categories

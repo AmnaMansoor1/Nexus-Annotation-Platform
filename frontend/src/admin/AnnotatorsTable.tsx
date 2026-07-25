@@ -121,6 +121,7 @@ export default function AnnotatorsTable() {
                 annotators.map((ann) => {
                   const completedCount = ann.completed_articles?.length || 0;
                   const progress = (completedCount / 20) * 100;
+                  const isTrulyDone = completedCount >= 20;
 
                   return (
                     <tr key={ann.email} className={`hover:bg-slate-50/50 transition-colors group ${ann.deactivated ? "opacity-50" : ""}`}>
@@ -145,7 +146,7 @@ export default function AnnotatorsTable() {
                           <span className="text-sm font-bold text-slate-700">{completedCount}/20</span>
                           <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                             <div 
-                              className={`h-full transition-all duration-500 ${ann.completed ? "bg-green-500" : "bg-primary"}`}
+                              className={`h-full transition-all duration-500 ${isTrulyDone ? "bg-green-500" : "bg-primary"}`}
                               style={{ width: `${progress}%` }}
                             />
                           </div>
@@ -156,7 +157,7 @@ export default function AnnotatorsTable() {
                           <span className="px-3 py-1 rounded-full bg-red-100 text-red-700 text-[10px] font-bold uppercase tracking-wider border border-red-200">
                             Deactivated
                           </span>
-                        ) : ann.completed ? (
+                        ) : isTrulyDone ? (
                           <span className="px-3 py-1 rounded-full bg-green-100 text-green-700 text-[10px] font-bold uppercase tracking-wider border border-green-200">
                             Completed
                           </span>
