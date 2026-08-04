@@ -1,6 +1,6 @@
 /**
- * Computes bias score based on 10 annotations.
- * bias_score = (HM_count×2 + SM_count×1 + N_count×0) / 10 × 2.5
+ * Computes bias score from the collected annotations for one article.
+ * bias_score = (HM_count×2 + SM_count×1 + N_count×0) / n × 2.5
  * This maps 0-2 range to 0-5 scale.
  */
 export function calculateBiasScore(counts: { neutral: number; slightly: number; highly: number }): number {

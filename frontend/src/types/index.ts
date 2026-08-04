@@ -14,6 +14,7 @@ export interface Article {
   article_type: "News Article" | "Blog" | "Opinion";
   word_count: number;
   status: ArticleStatus;
+  required_annotations?: number;
   annotation_count: number;
   annotated_by: string[];
   assigned_to: string[];

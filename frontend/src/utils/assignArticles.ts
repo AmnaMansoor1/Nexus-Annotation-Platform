@@ -1,6 +1,7 @@
 import { collection, query, where, getDocs, doc, getDoc, limit, orderBy, runTransaction, increment, arrayUnion, writeBatch, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { Article, AdminConfig } from "../types";
+import { getRequiredAnnotations } from "./annotationConfig";
 
 const randomDelay = (min: number = 100, max: number = 1000) =>
   new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
@@ -10,11 +11,12 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   await randomDelay(100, 500);
 
   let goldIds: string[] = [];
+  let adminConfig: AdminConfig | null = null;
   try {
     console.log("[assignArticlesForAnnotator] Fetching admin_config/settings");
     const adminDoc = await getDoc(doc(db, "admin_config", "settings"));
     if (adminDoc.exists()) {
-      const adminConfig = adminDoc.data() as AdminConfig;
+      adminConfig = adminDoc.data() as AdminConfig;
       goldIds = adminConfig.gold_article_ids || [];
       console.log("[assignArticlesForAnnotator] Gold article IDs from config:", goldIds);
     }
@@ -48,11 +50,12 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       })
       .filter(article => {
         const okStatus = article.status === "pending" || article.status === "partial";
-        const notFull = article.assigned_count < 10;
+        const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
+        const notFull = article.assigned_count < requiredAnnotations;
         const notAssigned = !article.assigned_to.includes(email);
         const notGold = !article.is_gold_standard;
         const ok = okStatus && notFull && notAssigned && notGold;
-        console.log("[assignArticlesForAnnotator] Article", article.article_id, "status=", article.status, "count=", article.assigned_count, "assigned_to_me=", article.assigned_to.includes(email), "gold=", article.is_gold_standard, "=> ELIGIBLE:", ok);
+        console.log("[assignArticlesForAnnotator] Article", article.article_id, "status=", article.status, "count=", article.assigned_count, "required=", requiredAnnotations, "assigned_to_me=", article.assigned_to.includes(email), "gold=", article.is_gold_standard, "=> ELIGIBLE:", ok);
         return ok;
       });
     console.log("[assignArticlesForAnnotator] Strategy 1 eligible articles:", eligibleArticles.length);
@@ -82,7 +85,10 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
             status: ((data as any).status === "pending" || (data as any).status === "partial") ? (data as any).status : "pending"
           } as Article;
         })
-        .filter(article => article.assigned_count < 10 && !article.assigned_to.includes(email) && !article.is_gold_standard);
+        .filter(article => {
+          const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
+          return article.assigned_count < requiredAnnotations && !article.assigned_to.includes(email) && !article.is_gold_standard;
+        });
       console.log("[assignArticlesForAnnotator] Strategy 2 eligible articles:", eligibleArticles.length);
     } catch (err2) {
       console.warn("[assignArticlesForAnnotator] Strategy 2 also failed:", err2);
@@ -92,7 +98,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   // 3. Randomly select
   console.log("[assignArticlesForAnnotator] Total eligible articles found:", eligibleArticles.length);
   if (eligibleArticles.length === 0) {
-    console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND. Check: 1) Do articles exist? 2) Do they have status=pending/partial? 3) assigned_count<10? 4) Not already assigned to this user?");
+    console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND. Check: 1) Do articles exist? 2) Do they have status=pending/partial? 3) assigned_count<required_annotations? 4) Not already assigned to this user?");
     return [];
   }
 

@@ -2,13 +2,14 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { auth, db } from "../firebase";
-import { Article, Annotator, BiasLabel } from "../types";
+import { Article, Annotator, BiasLabel, AdminConfig } from "../types";
 import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
 import TimerRing from "../components/TimerRing";
 import { Check, Loader2, AlertCircle } from "lucide-react";
 import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
+import { getRequiredAnnotations } from "../utils/annotationConfig";
 import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 
@@ -254,6 +255,9 @@ export default function AnnotationWorkbench() {
     let txnCommitted = false;
 
     try {
+      const adminConfigSnap = await getDoc(doc(db, "admin_config", "settings"));
+      const adminConfig = adminConfigSnap.exists() ? (adminConfigSnap.data() as AdminConfig) : null;
+
       // --- 3. FIRST START THE SAVE TO DATABASE AND AWAIT IT ---
       await retryWithBackoff(async () => {
         const responseData = {
@@ -300,8 +304,9 @@ export default function AnnotationWorkbench() {
           const articleData = articleSnap.data() as Article;
           const oldStatus = articleData.status;
           const newCount = (articleData.annotation_count || 0) + 1;
+          const requiredAnnotations = getRequiredAnnotations(articleData, adminConfig);
           let newStatus = oldStatus;
-          if (newCount >= 10) newStatus = "complete";
+          if (newCount >= requiredAnnotations) newStatus = "complete";
           else if (newCount > 0) newStatus = "partial";
 
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);

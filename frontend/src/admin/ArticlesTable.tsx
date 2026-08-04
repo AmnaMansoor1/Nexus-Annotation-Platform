@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { collection, query, orderBy, limit, getDocs, doc, updateDoc, where, startAfter, getCountFromServer, getDoc } from "firebase/firestore";
 import { db } from "../firebase";
-import type { Article } from "../types";
+import type { Article, AdminConfig } from "../types";
+import { DEFAULT_REQUIRED_ANNOTATIONS, getRequiredAnnotations } from "../utils/annotationConfig";
 import { Search, Filter, ChevronLeft, ChevronRight, Eye, Star, MoreVertical, Loader2, ArrowRight, ArrowLeft } from "lucide-react";
 
 const PAGE_SIZE = 10;
@@ -19,13 +20,23 @@ export default function ArticlesTable() {
   const [totalCount, setTotalCount] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
+  const [defaultRequiredAnnotations, setDefaultRequiredAnnotations] = useState(DEFAULT_REQUIRED_ANNOTATIONS);
 
   // Fetch total count and unique categories once
   useEffect(() => {
     async function fetchMetadata() {
       try {
         const summaryRef = doc(db, "stats", "platform_summary");
-        const summarySnap = await getDoc(summaryRef);
+        const settingsRef = doc(db, "admin_config", "settings");
+        const [summarySnap, settingsSnap] = await Promise.all([
+          getDoc(summaryRef),
+          getDoc(settingsRef)
+        ]);
+
+        if (settingsSnap.exists()) {
+          const settings = settingsSnap.data() as AdminConfig;
+          setDefaultRequiredAnnotations(getRequiredAnnotations(null, settings));
+        }
         
         if (summarySnap.exists()) {
           const data = summarySnap.data();
@@ -228,6 +239,14 @@ export default function ArticlesTable() {
               ) : (
                 filteredArticles.map((article) => (
                   <tr key={article.article_id} className="hover:bg-slate-50/50 transition-colors group">
+                    {(() => {
+                      const requiredAnnotations = getRequiredAnnotations(article, {
+                        annotators_per_article: defaultRequiredAnnotations,
+                      });
+                      const progressPercent = Math.min(100, (article.annotation_count / requiredAnnotations) * 100);
+
+                      return (
+                        <>
                     <td className="px-8 py-5 font-mono text-xs font-black text-slate-400">{article.article_id}</td>
                     <td className="px-8 py-5">
                       <div className="max-w-xs truncate font-bold text-slate-800 group-hover:text-primary transition-colors" title={article.headline}>
@@ -239,11 +258,11 @@ export default function ArticlesTable() {
                     </td>
                     <td className="px-8 py-5">
                       <div className="flex flex-col items-center gap-2">
-                        <span className="text-sm font-black text-slate-900">{article.annotation_count}/10</span>
+                        <span className="text-sm font-black text-slate-900">{article.annotation_count}/{requiredAnnotations}</span>
                         <div className="w-16 h-1.5 bg-slate-100 rounded-full overflow-hidden shadow-inner">
                           <div 
                             className="h-full bg-primary shadow-[0_0_8px_rgba(37,99,235,0.4)] transition-all duration-700" 
-                            style={{ width: `${(article.annotation_count / 10) * 100}%` }}
+                            style={{ width: `${progressPercent}%` }}
                           />
                         </div>
                       </div>
@@ -275,6 +294,9 @@ export default function ArticlesTable() {
                         </button>
                       </div>
                     </td>
+                        </>
+                      );
+                    })()}
                   </tr>
                 ))
               )}
@@ -344,6 +366,12 @@ export default function ArticlesTable() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
+                    <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">Required Annotations</label>
+                    <p className="text-2xl font-bold mt-1 text-slate-700">
+                      {getRequiredAnnotations(selectedArticle, { annotators_per_article: defaultRequiredAnnotations })}
+                    </p>
+                  </div>
+                  <div>
                     <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">Bias Score</label>
                     <p className={`text-2xl font-bold mt-1 ${
                       (selectedArticle.bias_score || 0) > 3.5 ? "text-red-500" : 
@@ -352,7 +380,7 @@ export default function ArticlesTable() {
                       {selectedArticle.bias_score?.toFixed(2) || "N/A"}
                     </p>
                   </div>
-                  <div>
+                  <div className="col-span-2">
                     <label className="text-xs font-bold text-slate-400 uppercase tracking-widest">Fleiss' Kappa</label>
                     <p className="text-2xl font-bold mt-1 text-slate-700">
                       {selectedArticle.fleiss_kappa?.toFixed(3) || "N/A"}

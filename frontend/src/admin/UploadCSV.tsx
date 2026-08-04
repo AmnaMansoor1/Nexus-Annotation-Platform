@@ -2,8 +2,9 @@ import { useState } from "react";
 import Papa from "papaparse";
 import { collection, doc, setDoc, getDoc, writeBatch } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article } from "../types";
+import { AdminConfig, Article } from "../types";
 import { updatePlatformStats } from "../utils/stats";
+import { getRequiredAnnotations } from "../utils/annotationConfig";
 import { Upload, FileText, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
 
 export default function UploadCSV() {
@@ -44,6 +45,9 @@ export default function UploadCSV() {
     let skipped = 0;
 
     try {
+      const adminConfigSnap = await getDoc(doc(db, "admin_config", "settings"));
+      const adminConfig = adminConfigSnap.exists() ? (adminConfigSnap.data() as AdminConfig) : null;
+
       // Use batches for efficiency (Firestore limit is 500 per batch)
       const batchSize = 100;
       for (let i = 0; i < data.length; i += batchSize) {
@@ -71,29 +75,37 @@ export default function UploadCSV() {
           const docRef = doc(db, "articles", articleId);
 
           // Build article object, only include gold_expected_label if it exists
-        const article: any = {
-          article_id: articleId,
-          headline: row.headline || "",
-          display_text: row.display_text || row.full_text || row.summary || "",
-          source: row.source || "",
-          author: row.author || "",
-          date_published: row.date_published || "",
-          url: row.url || "",
-          category: row.category || "",
-          article_type: (row.article_type as any) || "News Article",
-          word_count: parseInt(row.word_count) || 0,
-          status: "pending",
-          annotation_count: 0,
-          annotated_by: [],
-          assigned_to: [],
-          assigned_count: 0,
-          bias_score: null,
-          fleiss_kappa: null,
-          is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"
-        };
-        if (row.gold_expected_label) {
-          article.gold_expected_label = row.gold_expected_label;
-        }
+          const requiredAnnotations = getRequiredAnnotations(
+            {
+              required_annotations: row.required_annotations ? parseInt(row.required_annotations, 10) : undefined,
+            },
+            adminConfig
+          );
+
+          const article: Article = {
+            article_id: articleId,
+            headline: row.headline || "",
+            display_text: row.display_text || row.full_text || row.summary || "",
+            source: row.source || "",
+            author: row.author || "",
+            date_published: row.date_published || "",
+            url: row.url || "",
+            category: row.category || "",
+            article_type: (row.article_type as any) || "News Article",
+            word_count: parseInt(row.word_count) || 0,
+            status: "pending",
+            required_annotations: requiredAnnotations,
+            annotation_count: 0,
+            annotated_by: [],
+            assigned_to: [],
+            assigned_count: 0,
+            bias_score: null,
+            fleiss_kappa: null,
+            is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"
+          };
+          if (row.gold_expected_label) {
+            article.gold_expected_label = row.gold_expected_label;
+          }
           console.log("Adding article to batch:", articleId);
           batch.set(docRef, article);
           chunkImported++;
@@ -156,7 +168,7 @@ export default function UploadCSV() {
               </div>
               <div>
                 <p className="text-xl font-black text-slate-900">Click to upload CSV</p>
-                <p className="text-slate-500 font-medium mt-1">article_id, headline, display_text, etc.</p>
+                <p className="text-slate-500 font-medium mt-1">article_id, headline, display_text, and optional required_annotations</p>
               </div>
             </div>
           </div>

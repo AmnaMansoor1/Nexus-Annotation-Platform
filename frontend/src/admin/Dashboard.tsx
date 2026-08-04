@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
 import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article, PlatformSummary, Annotator } from "../types";
+import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
+import { getRequiredAnnotations } from "../utils/annotationConfig";
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend
@@ -105,6 +106,9 @@ export default function Dashboard() {
 
       const articles = articlesSnap.docs.map(d => d.data() as Article);
       const annotators = annotatorsSnap.docs.map(d => d.data() as Annotator);
+      const settingsSnap = await getDoc(doc(db, "admin_config", "settings"));
+      const settings = settingsSnap.exists() ? (settingsSnap.data() as AdminConfig) : null;
+      const fallbackRequiredAnnotations = getRequiredAnnotations(null, settings);
 
       // 2. Calculate category distribution
       const categories = articles.reduce((acc: Record<string, number>, article) => {
@@ -125,7 +129,12 @@ export default function Dashboard() {
         totalAnnotators: annotators.length,
         completedAnnotators: completedAnnotatorCount,
         avgBiasScore: stats.avgBiasScore, // Keep current avg bias score
-        needsReview: articles.filter(a => a.status === "partial" && a.annotation_count >= 10).length,
+        needsReview: articles.filter(a => {
+          const requiredAnnotations = getRequiredAnnotations(a, {
+            annotators_per_article: fallbackRequiredAnnotations,
+          });
+          return a.status === "partial" && a.annotation_count >= requiredAnnotations;
+        }).length,
         categoryDistribution: categories
       };
 

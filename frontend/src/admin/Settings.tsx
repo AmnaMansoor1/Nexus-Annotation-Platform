@@ -2,13 +2,14 @@ import { useState, useEffect } from "react";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { AdminConfig } from "../types";
+import { DEFAULT_REQUIRED_ANNOTATIONS, normalizeRequiredAnnotations } from "../utils/annotationConfig";
 import { Save, Loader2, CheckCircle2 } from "lucide-react";
 
 export default function Settings() {
   const [config, setConfig] = useState<AdminConfig>({
     total_target: 100,
     gold_article_ids: [],
-    annotators_per_article: 10,
+    annotators_per_article: DEFAULT_REQUIRED_ANNOTATIONS,
     admin_emails: ["admin@gmail.com"]
   });
   const [goldInput, setGoldInput] = useState("");
@@ -22,9 +23,15 @@ export default function Settings() {
       const docSnap = await getDoc(doc(db, "admin_config", "settings"));
       if (docSnap.exists()) {
         const data = docSnap.data() as AdminConfig;
-        setConfig(data);
-        setGoldInput(data.gold_article_ids.join(", "));
-        setAdminEmailsInput((data.admin_emails || ["admin@gmail.com"]).join(", "));
+        const mergedConfig: AdminConfig = {
+          total_target: data.total_target || 100,
+          gold_article_ids: data.gold_article_ids || [],
+          annotators_per_article: normalizeRequiredAnnotations(data.annotators_per_article),
+          admin_emails: data.admin_emails || ["admin@gmail.com"],
+        };
+        setConfig(mergedConfig);
+        setGoldInput(mergedConfig.gold_article_ids.join(", "));
+        setAdminEmailsInput(mergedConfig.admin_emails.join(", "));
       }
       setLoading(false);
     }
@@ -80,9 +87,10 @@ export default function Settings() {
               type="number"
               className="w-full px-5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-primary/20 focus:bg-white outline-none transition-all font-bold text-slate-900"
               value={config.annotators_per_article}
-              onChange={(e) => setConfig({ ...config, annotators_per_article: parseInt(e.target.value) })}
+              min={2}
+              onChange={(e) => setConfig({ ...config, annotators_per_article: normalizeRequiredAnnotations(e.target.value) })}
             />
-            <p className="text-xs text-slate-400 font-medium italic">Number of annotations required for a 'complete' status.</p>
+            <p className="text-xs text-slate-400 font-medium italic">Default threshold for new articles. Each imported article stores its own required count.</p>
           </div>
         </div>
 

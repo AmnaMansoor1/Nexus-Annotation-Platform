@@ -1,9 +1,14 @@
 import { useState } from "react";
-import { collection, getDocsFromServer, query, orderBy } from "firebase/firestore";
+import { collection, doc, getDoc, getDocsFromServer, query, orderBy } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article } from "../types";
+import { AdminConfig, Article, BiasLabel } from "../types";
 import { downloadCSV } from "../utils/csvExport";
+import { getRequiredAnnotations } from "../utils/annotationConfig";
+import { formatBinaryBiasLabel, getMajorityBiasLabel, mapBiasLabelToBinary } from "../utils/biasLabels";
+import { calculateOverallFleissKappa } from "../utils/calculateKappa";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
+
+const TRAINING_ANNOTATOR_SLOTS = 5;
 
 export default function ExportCSV() {
   const [loading, setLoading] = useState(false);
@@ -11,20 +16,34 @@ export default function ExportCSV() {
   const handleExport = async () => {
     setLoading(true);
     try {
+      const settingsSnap = await getDoc(doc(db, "admin_config", "settings"));
+      const adminConfig = settingsSnap.exists() ? (settingsSnap.data() as AdminConfig) : null;
+
       const q = query(collection(db, "articles"), orderBy("article_id"));
       const snap = await getDocsFromServer(q);
       const articles = snap.docs.map(doc => doc.data() as Article);
 
-      const exportData = await Promise.all(articles.map(async (article) => {
+      const exportRows = await Promise.all(articles.map(async (article) => {
         const responsesSnap = await getDocsFromServer(
           collection(db, "annotations", article.article_id, "responses")
         );
         const responses = responsesSnap.docs.map(d => d.data());
+        const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
+        const counts = responses.reduce<{ neutral: number; slightly: number; highly: number }>((acc, res) => {
+          const label = res.label as BiasLabel | undefined;
+          if (label === "neutral") acc.neutral += 1;
+          if (label === "slightly_manipulative") acc.slightly += 1;
+          if (label === "highly_manipulative") acc.highly += 1;
+          return acc;
+        }, { neutral: 0, slightly: 0, highly: 0 });
+        const majorityLabel = getMajorityBiasLabel(counts);
+        const isComplete =
+          article.status === "complete" || responses.length >= requiredAnnotations;
 
-        // 1. Base article data
         const row: any = {
           article_id: article.article_id || "",
           headline: article.headline || "",
+          display_text: article.display_text || "",
           source: article.source || "",
           author: article.author || "",
           date_published: article.date_published || "",
@@ -32,30 +51,62 @@ export default function ExportCSV() {
           category: article.category || "",
           article_type: article.article_type || "",
           word_count: article.word_count || 0,
-          display_text: article.display_text || "",
-          status: article.status || "",
-          bias_score: article.bias_score || "",
-          fleiss_kappa: article.fleiss_kappa || "",
-          total_annotations: article.annotation_count || responses.length
+          label: mapBiasLabelToBinary(majorityLabel),
+          final_label: formatBinaryBiasLabel(majorityLabel),
+          bias_score: article.bias_score ?? "",
+          fleiss_kappa: article.fleiss_kappa ?? "",
         };
 
-        // 2. Pre-initialize all 10 annotator slots to ensure columns always exist in order
-        for (let i = 1; i <= 10; i++) {
-          row[`ann_${i}_student_id`] = "";
+        for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
           row[`ann_${i}_label`] = "";
         }
 
-        // 3. Fill in actual response data
         responses.forEach((res, i) => {
-          if (i < 10) {
+          if (i < TRAINING_ANNOTATOR_SLOTS) {
             const slot = i + 1;
-            row[`ann_${slot}_student_id`] = res.annotator_email || "unknown";
             row[`ann_${slot}_label`] = res.label || "";
           }
         });
 
-        return row;
+        return {
+          row,
+          counts,
+          requiredAnnotations,
+          isComplete,
+        };
       }));
+
+      const allArticlesComplete =
+        exportRows.length > 0 && exportRows.every((entry) => entry.isComplete);
+      const completedCounts = exportRows
+        .filter((entry) => entry.isComplete && entry.requiredAnnotations === TRAINING_ANNOTATOR_SLOTS)
+        .map((entry) => entry.counts);
+      const exportData = exportRows.map((entry) => entry.row);
+
+      if (allArticlesComplete && completedCounts.length === exportRows.length) {
+        const overallKappaRow: Record<string, string | number> = {
+          article_id: "OVERALL_DATASET_KAPPA",
+          headline: "",
+          display_text: "Dataset-wide Fleiss' kappa across all completed articles",
+          source: "",
+          author: "",
+          date_published: "",
+          url: "",
+          category: "",
+          article_type: "",
+          word_count: "",
+          label: "",
+          final_label: "",
+          bias_score: "",
+          fleiss_kappa: calculateOverallFleissKappa(completedCounts),
+        };
+
+        for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
+          overallKappaRow[`ann_${i}_label`] = "";
+        }
+
+        exportData.push(overallKappaRow);
+      }
 
       downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split('T')[0]}.csv`);
     } catch (err) {
@@ -80,8 +131,8 @@ export default function ExportCSV() {
           <div className="space-y-2">
             <h3 className="text-xl font-bold text-slate-800">Full Dataset (CSV)</h3>
             <p className="text-slate-500 text-sm leading-relaxed">
-              Export all articles including their original metadata, processed scores (Bias Score, Fleiss' Kappa), 
-              and individual labels from up to 10 annotators per article.
+              Export article metadata, article text, five annotator labels, binary labels,
+              agreement scores, and a final overall-kappa summary row when all articles are complete.
             </p>
           </div>
           <button

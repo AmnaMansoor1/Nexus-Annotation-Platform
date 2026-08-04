@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { calculateFleissKappa } from './calculateKappa'
+import { calculateFleissKappa, calculateOverallFleissKappa } from './calculateKappa'
 
 describe('calculateFleissKappa', () => {
   test('returns 1 when all annotators agree', () => {
@@ -21,6 +21,28 @@ describe('calculateFleissKappa', () => {
 
   test('returns 0 when there are fewer than 2 annotations', () => {
     const result = calculateFleissKappa({ neutral: 1, slightly: 0, highly: 0 })
+    expect(result).toBe(0)
+  })
+})
+
+describe('calculateOverallFleissKappa', () => {
+  test('returns 1 when every completed article has perfect agreement', () => {
+    const result = calculateOverallFleissKappa([
+      { neutral: 5, slightly: 0, highly: 0 },
+      { neutral: 0, slightly: 5, highly: 0 },
+      { neutral: 0, slightly: 0, highly: 5 },
+    ])
+
+    expect(result).toBe(1)
+  })
+
+  test('returns 0 when articles do not share the same annotator count', () => {
+    const result = calculateOverallFleissKappa([
+      { neutral: 5, slightly: 0, highly: 0 },
+      { neutral: 4, slightly: 1, highly: 0 },
+      { neutral: 3, slightly: 0, highly: 0 },
+    ])
+
     expect(result).toBe(0)
   })
 })
