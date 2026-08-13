@@ -4,7 +4,8 @@ import { db } from "../firebase";
 import { Annotator, Article, BiasLabel } from "../types";
 import { downloadCSV } from "../utils/csvExport";
 import { formatBinaryBiasLabel, getMajorityBiasLabel, mapBiasLabelToBinary } from "../utils/biasLabels";
-import { calculateOverallFleissKappa } from "../utils/calculateKappa";
+import { calculateBiasScore } from "../utils/calculateBiasScore";
+import { calculateFleissKappa, calculateOverallFleissKappa } from "../utils/calculateKappa";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
 
 const TRAINING_ANNOTATOR_SLOTS = 5;
@@ -66,6 +67,17 @@ export default function ExportCSV() {
         }, { neutral: 0, slightly: 0, highly: 0 });
         const majorityLabel = getMajorityBiasLabel(counts);
 
+        // Prefer values stored on the article (written on 5th annotation),
+        // fall back to recalculation from responses in case of legacy data.
+        const finalStoredLabel = article.final_label ?? majorityLabel;
+        const storedLabel = article.label !== null && article.label !== undefined ? article.label : mapBiasLabelToBinary(majorityLabel);
+        const storedBiasScore = article.bias_score !== null && article.bias_score !== undefined
+          ? article.bias_score
+          : (isComplete ? calculateBiasScore(counts) : "");
+        const storedFleissKappa = article.fleiss_kappa !== null && article.fleiss_kappa !== undefined
+          ? article.fleiss_kappa
+          : (isComplete ? calculateFleissKappa(counts) : "");
+
         const row: any = {
           article_id: article.article_id || "",
           headline: article.headline || "",
@@ -77,20 +89,24 @@ export default function ExportCSV() {
           category: article.category || "",
           article_type: article.article_type || "",
           word_count: article.word_count || 0,
-          label: isComplete ? mapBiasLabelToBinary(majorityLabel) : "",
-          final_label: isComplete ? formatBinaryBiasLabel(majorityLabel) : "",
-          bias_score: isComplete ? (article.bias_score ?? "") : "",
-          fleiss_kappa: isComplete ? (article.fleiss_kappa ?? "") : "",
+          label: isComplete ? storedLabel : "",
+          final_label: isComplete ? formatBinaryBiasLabel(finalStoredLabel) : "",
+          majority_vote_label: isComplete ? (finalStoredLabel || "") : "",
+          bias_score: isComplete ? storedBiasScore : "",
+          fleiss_kappa: isComplete ? storedFleissKappa : "",
         };
 
         for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
           row[`ann_${i}_student_id`] = "";
+          row[`ann_${i}_email`] = "";
           row[`ann_${i}_label`] = "";
         }
 
         annotationSlots.forEach((res, i) => {
           const slot = i + 1;
-          row[`ann_${slot}_student_id`] = resolveStudentId(res.annotator_email as string | undefined, studentIdByEmail);
+          const annotatorEmail = res.annotator_email as string | undefined;
+          row[`ann_${slot}_student_id`] = resolveStudentId(annotatorEmail, studentIdByEmail);
+          row[`ann_${slot}_email`] = annotatorEmail || "";
           row[`ann_${slot}_label`] = (res.label as string) || "";
         });
 
@@ -101,18 +117,15 @@ export default function ExportCSV() {
         };
       }));
 
-      const allArticlesComplete =
-        exportRows.length > 0 && exportRows.every((entry) => entry.isComplete);
-      const completedCounts = exportRows
-        .filter((entry) => entry.isComplete)
-        .map((entry) => entry.counts);
-      const exportData = exportRows.map((entry) => entry.row);
+      const completedEntries = exportRows.filter((entry) => entry.isComplete);
+      const completedCounts = completedEntries.map((entry) => entry.counts);
+      const exportData = completedEntries.map((entry) => entry.row);
 
-      if (allArticlesComplete && completedCounts.length === exportRows.length) {
+      if (completedEntries.length > 0) {
         const overallKappaRow: Record<string, string | number> = {
           article_id: "OVERALL_DATASET_KAPPA",
           headline: "",
-          display_text: "Dataset-wide Fleiss' kappa across all completed articles",
+          display_text: `Dataset-wide Fleiss' kappa across ${completedEntries.length} completed articles (5 annotations each)`,
           source: "",
           author: "",
           date_published: "",
@@ -122,12 +135,14 @@ export default function ExportCSV() {
           word_count: "",
           label: "",
           final_label: "",
+          majority_vote_label: "",
           bias_score: "",
           fleiss_kappa: calculateOverallFleissKappa(completedCounts),
         };
 
         for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
           overallKappaRow[`ann_${i}_student_id`] = "";
+          overallKappaRow[`ann_${i}_email`] = "";
           overallKappaRow[`ann_${i}_label`] = "";
         }
 
@@ -155,10 +170,11 @@ export default function ExportCSV() {
             <Table size={32} />
           </div>
           <div className="space-y-2">
-            <h3 className="text-xl font-bold text-slate-800">Full Dataset (CSV)</h3>
+            <h3 className="text-xl font-bold text-slate-800">Completed Annotations Dataset (CSV)</h3>
             <p className="text-slate-500 text-sm leading-relaxed">
-              Export article metadata, article text, five annotator IDs and labels, binary labels,
-              and agreement scores only after the full 5 annotations are complete, plus a final overall-kappa summary row.
+              Export only articles with a full 5 annotations each. Includes article metadata, article text,
+              per-annotator student IDs, emails and labels, binary ML label, human-readable final label,
+              and agreement scores, plus a final overall Fleiss' kappa summary row.
             </p>
           </div>
           <button

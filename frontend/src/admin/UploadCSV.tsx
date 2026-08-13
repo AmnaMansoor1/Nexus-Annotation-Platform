@@ -101,6 +101,8 @@ export default function UploadCSV() {
             assigned_count: 0,
             bias_score: null,
             fleiss_kappa: null,
+            label: null,
+            final_label: null,
             is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"
           };
           if (row.gold_expected_label) {

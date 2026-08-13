@@ -9,6 +9,7 @@ import TimerRing from "../components/TimerRing";
 import { Check, Loader2, AlertCircle } from "lucide-react";
 import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
+import { getMajorityBiasLabel, mapBiasLabelToBinary } from "../utils/biasLabels";
 import { getRequiredAnnotations } from "../utils/annotationConfig";
 import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
@@ -369,7 +370,14 @@ export default function AnnotationWorkbench() {
               };
               const bias_score = calculateBiasScore(counts);
               const fleiss_kappa = calculateFleissKappa(counts);
-              await updateDoc(articleRef, { bias_score, fleiss_kappa });
+              const final_label = getMajorityBiasLabel(counts);
+              const binaryLabel = mapBiasLabelToBinary(final_label);
+              await updateDoc(articleRef, {
+                bias_score,
+                fleiss_kappa,
+                final_label,
+                label: binaryLabel === "" ? null : binaryLabel
+              });
               
               const q = query(collection(db, "articles"), where("status", "==", "complete"));
               const snap = await getDocs(q);

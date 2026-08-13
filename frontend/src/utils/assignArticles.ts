@@ -10,18 +10,15 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   console.log("[assignArticlesForAnnotator] Starting for email:", email);
   await randomDelay(100, 500);
 
-  let goldIds: string[] = [];
   let adminConfig: AdminConfig | null = null;
   try {
     console.log("[assignArticlesForAnnotator] Fetching admin_config/settings");
     const adminDoc = await getDoc(doc(db, "admin_config", "settings"));
     if (adminDoc.exists()) {
       adminConfig = adminDoc.data() as AdminConfig;
-      goldIds = adminConfig.gold_article_ids || [];
-      console.log("[assignArticlesForAnnotator] Gold article IDs from config:", goldIds);
     }
   } catch (err) {
-    console.warn("[assignArticlesForAnnotator] Could not load admin settings, proceeding without gold standards.", err);
+    console.warn("[assignArticlesForAnnotator] Could not load admin settings, proceeding with defaults.", err);
   }
 
   const articlesRef = collection(db, "articles");
@@ -53,9 +50,8 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
         const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
         const notFull = article.assigned_count < requiredAnnotations;
         const notAssigned = !article.assigned_to.includes(email);
-        const notGold = !article.is_gold_standard;
-        const ok = okStatus && notFull && notAssigned && notGold;
-        console.log("[assignArticlesForAnnotator] Article", article.article_id, "status=", article.status, "count=", article.assigned_count, "required=", requiredAnnotations, "assigned_to_me=", article.assigned_to.includes(email), "gold=", article.is_gold_standard, "=> ELIGIBLE:", ok);
+        const ok = okStatus && notFull && notAssigned;
+        console.log("[assignArticlesForAnnotator] Article", article.article_id, "status=", article.status, "count=", article.assigned_count, "required=", requiredAnnotations, "assigned_to_me=", article.assigned_to.includes(email), "=> ELIGIBLE:", ok);
         return ok;
       });
     console.log("[assignArticlesForAnnotator] Strategy 1 eligible articles:", eligibleArticles.length);
@@ -87,7 +83,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
         })
         .filter(article => {
           const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
-          return article.assigned_count < requiredAnnotations && !article.assigned_to.includes(email) && !article.is_gold_standard;
+          return article.assigned_count < requiredAnnotations && !article.assigned_to.includes(email);
         });
       console.log("[assignArticlesForAnnotator] Strategy 2 eligible articles:", eligibleArticles.length);
     } catch (err2) {
@@ -95,25 +91,26 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
     }
   }
 
-  // 3. Randomly select
+  // 3. SEQUENTIAL selection — sort by article_id so ALL annotators start from
+  //    the lowest IDs first. Once articles 1..20 each reach 5 annotations they
+  //    drop from the eligible pool, so annotator 6+ automatically moves to 21+.
   console.log("[assignArticlesForAnnotator] Total eligible articles found:", eligibleArticles.length);
   if (eligibleArticles.length === 0) {
     console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND. Check: 1) Do articles exist? 2) Do they have status=pending/partial? 3) assigned_count<required_annotations? 4) Not already assigned to this user?");
     return [];
   }
 
-  const shuffled = eligibleArticles.sort(() => 0.5 - Math.random());
-  const selectedArticles = shuffled.slice(0, 18);
+  const sorted = [...eligibleArticles].sort((a, b) => {
+    const numA = parseFloat(a.article_id);
+    const numB = parseFloat(b.article_id);
+    if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
+    return a.article_id.localeCompare(b.article_id);
+  });
+  const selectedArticles = sorted.slice(0, 20);
   const selectedIds = selectedArticles.map(a => a.article_id);
-  console.log("[assignArticlesForAnnotator] Selected regular article IDs:", selectedIds);
+  console.log("[assignArticlesForAnnotator] Selected article IDs (sequential, 20):", selectedIds);
 
-  let selectedGold: string[] = [];
-  if (goldIds.length > 0) {
-    selectedGold = goldIds.sort(() => 0.5 - Math.random()).slice(0, 2);
-    console.log("[assignArticlesForAnnotator] Selected gold article IDs:", selectedGold);
-  }
-
-  const finalAssignment = Array.from(new Set([...selectedIds, ...selectedGold]));
+  const finalAssignment = [...selectedIds];
   console.log("[assignArticlesForAnnotator] Final assignment (", finalAssignment.length, "articles):", finalAssignment);
 
   // 5. Update articles assignments — use setDoc with merge:true (NOT update) to ensure writes
@@ -154,7 +151,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       // Fallback: try individual transactions one by one with setDoc merge + increment
       let successCount = 0;
       const successfulIds: string[] = [];
-      for (const articleId of selectedIds.slice(0, 10)) {
+      for (const articleId of selectedIds) {
         try {
           const articleRef = doc(db, "articles", articleId);
           await runTransaction(db, async (tx) => {
@@ -174,10 +171,9 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
           console.warn("[assignArticlesForAnnotator] Single-article write failed for", articleId, ":", perr);
         }
       }
-      console.log("[assignArticlesForAnnotator] Fallback individually wrote", successCount, "/", selectedIds.slice(0, 10).length, "articles");
-      const fallbackAssignment = Array.from(new Set([...successfulIds, ...selectedGold]));
-      console.log("[assignArticlesForAnnotator] Returning fallback assignment:", fallbackAssignment);
-      return fallbackAssignment;
+      console.log("[assignArticlesForAnnotator] Fallback individually wrote", successCount, "/", selectedIds.length, "articles");
+      console.log("[assignArticlesForAnnotator] Returning fallback assignment:", successfulIds);
+      return successfulIds;
     }
   }
 
