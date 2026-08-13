@@ -51,11 +51,22 @@ export default function ExportCSV() {
         annotatorsSnap.docs.map(doc => doc.data() as Annotator)
       );
 
+      const validAnnotatorEmails = new Set(
+        annotatorsSnap.docs
+          .map(doc => (doc.data() as Annotator).email?.toLowerCase().trim())
+          .filter(Boolean) as string[]
+      );
+
       const exportRows = await Promise.all(articles.map(async (article) => {
         const responsesSnap = await getDocsFromServer(
           collection(db, "annotations", article.article_id, "responses")
         );
-        const responses = sortResponsesByTimestamp(responsesSnap.docs.map(d => d.data()));
+        const allResponses = sortResponsesByTimestamp(responsesSnap.docs.map(d => d.data()));
+        const responses = allResponses.filter(res => {
+          const email = (res.annotator_email as string | undefined)?.toLowerCase().trim();
+          if (!email) return false;
+          return validAnnotatorEmails.has(email);
+        });
         const annotationSlots = responses.slice(0, TRAINING_ANNOTATOR_SLOTS);
         const isComplete = annotationSlots.length >= TRAINING_ANNOTATOR_SLOTS;
         const counts = annotationSlots.reduce<{ neutral: number; slightly: number; highly: number }>((acc, res) => {
@@ -98,7 +109,6 @@ export default function ExportCSV() {
 
         for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
           row[`ann_${i}_student_id`] = "";
-          row[`ann_${i}_email`] = "";
           row[`ann_${i}_label`] = "";
         }
 
@@ -106,7 +116,6 @@ export default function ExportCSV() {
           const slot = i + 1;
           const annotatorEmail = res.annotator_email as string | undefined;
           row[`ann_${slot}_student_id`] = resolveStudentId(annotatorEmail, studentIdByEmail);
-          row[`ann_${slot}_email`] = annotatorEmail || "";
           row[`ann_${slot}_label`] = (res.label as string) || "";
         });
 
@@ -144,7 +153,6 @@ export default function ExportCSV() {
 
         for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
           overallKappaRow[`ann_${i}_student_id`] = "";
-          overallKappaRow[`ann_${i}_email`] = "";
           overallKappaRow[`ann_${i}_label`] = "";
         }
 

@@ -109,6 +109,9 @@ export default function AnnotationWorkbench() {
 
   // Track last loaded article to prevent unnecessary reloads
   const lastLoadedArticleIdRef = useRef<string | null>(null);
+  // When TRUE, the background fire-and-forget IIFE must NOT overwrite
+  // completedArticles / completedCount state (avoids 19/20 race on submit-20).
+  const postVerifiedGuardRef = useRef(false);
   
   // Sync our local assignedArticlesState with the one from useArticleAssignment
   useEffect(() => {
@@ -354,11 +357,21 @@ export default function AnnotationWorkbench() {
 
         (async () => {
           try {
-            const annotatorRefresh = await getDoc(annotatorRef);
-            if (annotatorRefresh.exists()) {
-              const newData = annotatorRefresh.data() as Annotator;
-              setCompletedArticles(newData.completed_articles || []);
-              setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
+            // ---- State-write guard -------------------------------------------------
+            // If the post-transaction verification step below has already finished
+            // (postVerifiedGuardRef === true) we must not overwrite completed state
+            // with a potentially stale getDoc() cache read. Without this guard, the
+            // UI & admin dashboard can display 19/20 after the 20th annotation was
+            // actually saved to Firestore.
+            const shouldWriteState = !postVerifiedGuardRef.current;
+
+            if (shouldWriteState) {
+              const annotatorRefresh = await getDoc(annotatorRef);
+              if (annotatorRefresh.exists()) {
+                const newData = annotatorRefresh.data() as Annotator;
+                setCompletedArticles(newData.completed_articles || []);
+                setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
+              }
             }
             if (statusChangedTo === "complete") {
               const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
@@ -427,10 +440,6 @@ export default function AnnotationWorkbench() {
           completedCountFromServer = data.completed_articles?.length ?? newCompletedArticles.length;
           latestAssignedArticles = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : latestAssignedArticles;
           latestCompletedArticles = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : latestCompletedArticles;
-          // Refresh local state with server truth immediately.
-          setAssignedArticlesState(latestAssignedArticles);
-          setCompletedArticles(latestCompletedArticles);
-          setCompletedCount(Math.min(latestCompletedArticles.length, 20));
         } else {
           completedCountFromServer = newCompletedArticles.length;
         }
@@ -438,6 +447,43 @@ export default function AnnotationWorkbench() {
         console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to optimistic state:", readErr);
         completedCountFromServer = newCompletedArticles.length;
       }
+
+      // ---- 5b. STRONG SERVER VERIFICATION on potential finish line ---------
+      // If the refreshed annotator shows 19 or 20 completed, we MUST do a
+      // fresh server read (bypass cache) and re-check until we can confirm
+      // the just-saved article is present in completed_articles. Otherwise
+      // we risk premature "Mission Complete" with the admin still on 19/20.
+      postVerifiedGuardRef.current = true; // Lock the background IIFE out
+
+      if (latestCompletedArticles.length >= 19 && !latestCompletedArticles.includes(articleId)) {
+        console.warn("[AnnotationWorkbench] Potential off-by-one detected: article not yet in completed_articles. Running forced server re-fetch...");
+        const annotatorRef2 = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise(r => setTimeout(r, 400));
+          try {
+            const reSnap = await getDoc(annotatorRef2); // post-tx read
+            if (reSnap.exists()) {
+              const reData = reSnap.data() as Annotator;
+              const reCompleted = Array.isArray(reData.completed_articles)
+                ? reData.completed_articles.filter(Boolean) : [];
+              latestCompletedArticles = reCompleted;
+              latestAssignedArticles = Array.isArray(reData.assigned_articles)
+                ? reData.assigned_articles.filter(Boolean) : latestAssignedArticles;
+              completedCountFromServer = reCompleted.length;
+              latestAnnotator = reData;
+              console.log(`[AnnotationWorkbench] Re-fetch attempt ${attempt + 1}: completed count = ${reCompleted.length}, contains current article? ${reCompleted.includes(articleId)}`);
+              if (reCompleted.includes(articleId)) break;
+            }
+          } catch (e) {
+            console.warn(`[AnnotationWorkbench] Re-fetch attempt ${attempt + 1} failed:`, e);
+          }
+        }
+      }
+
+      // Apply final server truth to local state AFTER strong verification.
+      setAssignedArticlesState(latestAssignedArticles);
+      setCompletedArticles(latestCompletedArticles);
+      setCompletedCount(Math.min(latestCompletedArticles.length, 20));
       
       // Find next pending index using the LATEST data
       let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);

@@ -91,24 +91,70 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
     }
   }
 
-  // 3. SEQUENTIAL selection — sort by article_id so ALL annotators start from
-  //    the lowest IDs first. Once articles 1..20 each reach 5 annotations they
-  //    drop from the eligible pool, so annotator 6+ automatically moves to 21+.
+  // 3. STRICT BATCH FILLING — sort ALL articles by article_id. Group into batches
+  //    of 20. Find the FIRST batch that still has incomplete articles (any
+  //    article with assigned_count < required). Only assign articles from THAT
+  //    batch. Never skip to a later batch until the current batch is 100% full.
   console.log("[assignArticlesForAnnotator] Total eligible articles found:", eligibleArticles.length);
   if (eligibleArticles.length === 0) {
     console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND. Check: 1) Do articles exist? 2) Do they have status=pending/partial? 3) assigned_count<required_annotations? 4) Not already assigned to this user?");
     return [];
   }
 
+  // Sort eligible by numeric article_id ascending
   const sorted = [...eligibleArticles].sort((a, b) => {
     const numA = parseFloat(a.article_id);
     const numB = parseFloat(b.article_id);
     if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
     return a.article_id.localeCompare(b.article_id);
   });
-  const selectedArticles = sorted.slice(0, 20);
+
+  const BATCH_SIZE = 20;
+
+  // Determine batch boundaries using each article's numeric id:
+  //   batch_idx = floor((numeric_id - 1) / BATCH_SIZE)
+  // So ids 1..20 → batch 0, ids 21..40 → batch 1, etc.
+  // If id is non-numeric, fall back to positional order in the sorted list.
+  const articleWithBatch = sorted.map((article, pos) => {
+    const numId = parseFloat(article.article_id);
+    let batchIdx = 0;
+    if (!isNaN(numId) && numId > 0) {
+      batchIdx = Math.floor((numId - 1) / BATCH_SIZE);
+    } else {
+      batchIdx = Math.floor(pos / BATCH_SIZE);
+    }
+    return { article, batchIdx };
+  });
+
+  // Group eligible articles by batch
+  const byBatch = new Map<number, { article: Article; batchIdx: number }[]>();
+  for (const item of articleWithBatch) {
+    if (!byBatch.has(item.batchIdx)) byBatch.set(item.batchIdx, []);
+    byBatch.get(item.batchIdx)!.push(item);
+  }
+
+  // Find the EARLIEST (lowest-index) batch that still has eligible articles.
+  // Because articles are sorted globally by id, any batch that still needs
+  // annotators will appear earlier than later batches — and we must fill it
+  // completely before moving on.
+  const sortedBatchIndices = Array.from(byBatch.keys()).sort((a, b) => a - b);
+  const activeBatchIdx = sortedBatchIndices[0];
+  const activeBatchItems = byBatch.get(activeBatchIdx) || [];
+  const idRangeStart = activeBatchIdx * BATCH_SIZE + 1;
+  const idRangeEnd = (activeBatchIdx + 1) * BATCH_SIZE;
+  console.log(
+    `[assignArticlesForAnnotator] STRICT BATCH MODE — Active batch #${activeBatchIdx + 1} (ids ${idRangeStart}-${idRangeEnd}).`,
+    "Eligible in this batch:",
+    activeBatchItems.length,
+    "Later batches skipped until this batch is 100% full."
+  );
+
+  const selectedArticles = activeBatchItems.map(x => x.article).slice(0, BATCH_SIZE);
   const selectedIds = selectedArticles.map(a => a.article_id);
-  console.log("[assignArticlesForAnnotator] Selected article IDs (sequential, 20):", selectedIds);
+  console.log(
+    `[assignArticlesForAnnotator] Selected ${selectedIds.length} article IDs from active batch #${activeBatchIdx + 1}:`,
+    selectedIds
+  );
 
   const finalAssignment = [...selectedIds];
   console.log("[assignArticlesForAnnotator] Final assignment (", finalAssignment.length, "articles):", finalAssignment);
