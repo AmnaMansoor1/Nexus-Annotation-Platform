@@ -119,7 +119,9 @@ export default function ExportCSV() {
 
       const completedEntries = exportRows.filter((entry) => entry.isComplete);
       const completedCounts = completedEntries.map((entry) => entry.counts);
-      const exportData = completedEntries.map((entry) => entry.row);
+      // Export ALL articles (like the previous version). 
+      // Incomplete articles show blank label/metrics so you can see in-progress data too.
+      const exportData = exportRows.map((entry) => entry.row);
 
       if (completedEntries.length > 0) {
         const overallKappaRow: Record<string, string | number> = {
