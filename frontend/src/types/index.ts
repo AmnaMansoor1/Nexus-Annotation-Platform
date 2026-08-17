@@ -4,6 +4,7 @@ export type ArticleStatus = "pending" | "partial" | "complete";
 
 export interface Article {
   article_id: string;
+  sequence_number?: number;
   headline: string;
   display_text: string;
   source: string;
@@ -66,6 +67,7 @@ export interface PlatformSummary {
   totalAnnotators: number;
   completedAnnotators: number;
   avgBiasScore: number;
+  totalBiasScoreSum: number;
   needsReview: number;
   categoryDistribution?: Record<string, number>;
 }

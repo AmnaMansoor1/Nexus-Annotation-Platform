@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { collection, onSnapshot, doc, updateDoc, getDoc, getDocs, setDoc } from "firebase/firestore";
+import { useState, useEffect, useCallback } from "react";
+import { collection, doc, updateDoc, getDoc, getDocs } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator } from "../types";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
@@ -8,23 +8,24 @@ import { User, Mail, Hash, CheckCircle, Clock, ShieldAlert, Ban, Loader2, Refres
 export default function AnnotatorsTable() {
   const [annotators, setAnnotators] = useState<Annotator[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const loadAnnotators = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const snap = await getDocs(collection(db, "annotators"));
+      setAnnotators(snap.docs.map(d => d.data() as Annotator));
+    } catch (error) {
+      console.error("Error loading annotators:", error);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
-    // Listen for real-time updates to annotators collection only
-    const unsubscribe = onSnapshot(
-      collection(db, "annotators"),
-      (snapshot) => {
-        setAnnotators(snapshot.docs.map(doc => doc.data() as Annotator));
-        setLoading(false);
-      },
-      (error) => {
-        console.error("Error loading annotators:", error);
-        setLoading(false);
-      }
-    );
-
-    return () => unsubscribe();
-  }, []);
+    loadAnnotators();
+  }, [loadAnnotators]);
 
   const toggleDeactivate = async (annotator: Annotator) => {
     try {
@@ -92,9 +93,19 @@ export default function AnnotatorsTable() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold text-slate-80">Annotator Reliability</h2>
-        <p className="text-slate-50">Track student progress and performance on gold standard checks</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-80">Annotator Reliability</h2>
+          <p className="text-slate-50">Track student progress and performance on gold standard checks</p>
+        </div>
+        <button
+          onClick={loadAnnotators}
+          disabled={refreshing || loading}
+          className="flex items-center gap-2 bg-white px-4 py-2 rounded-xl border border-slate-200 text-slate-600 font-bold text-xs hover:bg-slate-50 transition-all shadow-sm disabled:opacity-50"
+        >
+          <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
+          {refreshing ? "Refreshing..." : "Refresh"}
+        </button>
       </div>
 
       <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
@@ -121,7 +132,6 @@ export default function AnnotatorsTable() {
                 annotators.map((ann) => {
                   const completedCount = ann.completed_articles?.length || 0;
                   const progress = (completedCount / 20) * 100;
-                  const isTrulyDone = completedCount >= 20;
 
                   return (
                     <tr key={ann.email} className={`hover:bg-slate-50/50 transition-colors group ${ann.deactivated ? "opacity-50" : ""}`}>
@@ -146,7 +156,7 @@ export default function AnnotatorsTable() {
                           <span className="text-sm font-bold text-slate-700">{completedCount}/20</span>
                           <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                             <div 
-                              className={`h-full transition-all duration-500 ${isTrulyDone ? "bg-green-500" : "bg-primary"}`}
+                              className={`h-full transition-all duration-500 ${ann.completed ? "bg-green-500" : "bg-primary"}`}
                               style={{ width: `${progress}%` }}
                             />
                           </div>
@@ -157,7 +167,7 @@ export default function AnnotatorsTable() {
                           <span className="px-3 py-1 rounded-full bg-red-100 text-red-700 text-[10px] font-bold uppercase tracking-wider border border-red-200">
                             Deactivated
                           </span>
-                        ) : isTrulyDone ? (
+                        ) : ann.completed ? (
                           <span className="px-3 py-1 rounded-full bg-green-100 text-green-700 text-[10px] font-bold uppercase tracking-wider border border-green-200">
                             Completed
                           </span>

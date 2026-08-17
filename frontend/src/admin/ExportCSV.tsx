@@ -1,40 +1,9 @@
 import { useState } from "react";
-import { collection, getDocsFromServer, query, orderBy } from "firebase/firestore";
+import { collection, getDocs, query, orderBy } from "firebase/firestore";
 import { db } from "../firebase";
-import { Annotator, Article, BiasLabel } from "../types";
+import { Article } from "../types";
 import { downloadCSV } from "../utils/csvExport";
-import { formatBinaryBiasLabel, getMajorityBiasLabel, mapBiasLabelToBinary } from "../utils/biasLabels";
-import { calculateBiasScore } from "../utils/calculateBiasScore";
-import { calculateFleissKappa, calculateOverallFleissKappa } from "../utils/calculateKappa";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
-
-const TRAINING_ANNOTATOR_SLOTS = 5;
-
-function sortResponsesByTimestamp(responses: Record<string, unknown>[]) {
-  return [...responses].sort((a, b) => {
-    const aTime = (a.timestamp as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0;
-    const bTime = (b.timestamp as { toMillis?: () => number } | undefined)?.toMillis?.() ?? 0;
-    return aTime - bTime;
-  });
-}
-
-function buildStudentIdLookup(annotators: Annotator[]): Map<string, string> {
-  const lookup = new Map<string, string>();
-  for (const annotator of annotators) {
-    const email = annotator.email?.toLowerCase().trim();
-    if (!email) continue;
-    lookup.set(email, annotator.registration_code || annotator.email);
-  }
-  return lookup;
-}
-
-function resolveStudentId(
-  annotatorEmail: string | undefined,
-  studentIdByEmail: Map<string, string>
-): string {
-  if (!annotatorEmail) return "";
-  return studentIdByEmail.get(annotatorEmail.toLowerCase().trim()) || annotatorEmail;
-}
 
 export default function ExportCSV() {
   const [loading, setLoading] = useState(false);
@@ -42,122 +11,50 @@ export default function ExportCSV() {
   const handleExport = async () => {
     setLoading(true);
     try {
-      const [articlesSnap, annotatorsSnap] = await Promise.all([
-        getDocsFromServer(query(collection(db, "articles"), orderBy("article_id"))),
-        getDocsFromServer(collection(db, "annotators")),
-      ]);
-      const articles = articlesSnap.docs.map(doc => doc.data() as Article);
-      const studentIdByEmail = buildStudentIdLookup(
-        annotatorsSnap.docs.map(doc => doc.data() as Annotator)
-      );
+      const q = query(collection(db, "articles"), orderBy("sequence_number"));
+      const snap = await getDocs(q);
+      const articles = snap.docs.map(doc => doc.data() as Article);
 
-      const validAnnotatorEmails = new Set(
-        annotatorsSnap.docs
-          .map(doc => (doc.data() as Annotator).email?.toLowerCase().trim())
-          .filter(Boolean) as string[]
-      );
+      const exportData = await Promise.all(articles.map(async (article) => {
+        const responsesSnap = await getDocs(collection(db, "annotations", article.article_id, "responses"));
+        const responses = responsesSnap.docs.map(d => d.data());
 
-      const exportRows = await Promise.all(articles.map(async (article) => {
-        const responsesSnap = await getDocsFromServer(
-          collection(db, "annotations", article.article_id, "responses")
-        );
-        const allResponses = sortResponsesByTimestamp(responsesSnap.docs.map(d => d.data()));
-        const responses = allResponses.filter(res => {
-          const email = (res.annotator_email as string | undefined)?.toLowerCase().trim();
-          if (!email) return false;
-          return validAnnotatorEmails.has(email);
-        });
-        const annotationSlots = responses.slice(0, TRAINING_ANNOTATOR_SLOTS);
-        const isComplete = annotationSlots.length >= TRAINING_ANNOTATOR_SLOTS;
-        const counts = annotationSlots.reduce<{ neutral: number; slightly: number; highly: number }>((acc, res) => {
-          const label = res.label as BiasLabel | undefined;
-          if (label === "neutral") acc.neutral += 1;
-          if (label === "slightly_manipulative") acc.slightly += 1;
-          if (label === "highly_manipulative") acc.highly += 1;
-          return acc;
-        }, { neutral: 0, slightly: 0, highly: 0 });
-        const majorityLabel = getMajorityBiasLabel(counts);
+        const row: any = {};
+        if (typeof (article as any).sequence_number === "number") {
+          row.sequence_number = (article as any).sequence_number;
+        } else {
+          row.sequence_number = "";
+        }
+        row.article_id = article.article_id || "";
+        row.headline = article.headline || "";
+        row.source = article.source || "";
+        row.author = article.author || "";
+        row.date_published = article.date_published || "";
+        row.url = article.url || "";
+        row.category = article.category || "";
+        row.article_type = article.article_type || "";
+        row.word_count = article.word_count || 0;
+        row.display_text = article.display_text || "";
+        row.status = article.status || "";
+        row.bias_score = article.bias_score || "";
+        row.fleiss_kappa = article.fleiss_kappa || "";
+        row.total_annotations = article.annotation_count || responses.length;
 
-        // Prefer values stored on the article (written on 5th annotation),
-        // fall back to recalculation from responses in case of legacy data.
-        const finalStoredLabel = article.final_label ?? majorityLabel;
-        const storedLabel = article.label !== null && article.label !== undefined ? article.label : mapBiasLabelToBinary(majorityLabel);
-        const storedBiasScore = article.bias_score !== null && article.bias_score !== undefined
-          ? article.bias_score
-          : (isComplete ? calculateBiasScore(counts) : "");
-        const storedFleissKappa = article.fleiss_kappa !== null && article.fleiss_kappa !== undefined
-          ? article.fleiss_kappa
-          : (isComplete ? calculateFleissKappa(counts) : "");
-
-        const row: any = {
-          article_id: article.article_id || "",
-          headline: article.headline || "",
-          display_text: article.display_text || "",
-          source: article.source || "",
-          author: article.author || "",
-          date_published: article.date_published || "",
-          url: article.url || "",
-          category: article.category || "",
-          article_type: article.article_type || "",
-          word_count: article.word_count || 0,
-          label: isComplete ? storedLabel : "",
-          final_label: isComplete ? formatBinaryBiasLabel(finalStoredLabel) : "",
-          majority_vote_label: isComplete ? (finalStoredLabel || "") : "",
-          bias_score: isComplete ? storedBiasScore : "",
-          fleiss_kappa: isComplete ? storedFleissKappa : "",
-        };
-
-        for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
+        for (let i = 1; i <= 10; i++) {
           row[`ann_${i}_student_id`] = "";
           row[`ann_${i}_label`] = "";
         }
 
-        annotationSlots.forEach((res, i) => {
-          const slot = i + 1;
-          const annotatorEmail = res.annotator_email as string | undefined;
-          row[`ann_${slot}_student_id`] = resolveStudentId(annotatorEmail, studentIdByEmail);
-          row[`ann_${slot}_label`] = (res.label as string) || "";
+        responses.forEach((res, i) => {
+          if (i < 10) {
+            const slot = i + 1;
+            row[`ann_${slot}_student_id`] = res.annotator_email || "unknown";
+            row[`ann_${slot}_label`] = res.label || "";
+          }
         });
 
-        return {
-          row,
-          counts,
-          isComplete,
-        };
+        return row;
       }));
-
-      const completedEntries = exportRows.filter((entry) => entry.isComplete);
-      const completedCounts = completedEntries.map((entry) => entry.counts);
-      // Export ALL articles (like the previous version). 
-      // Incomplete articles show blank label/metrics so you can see in-progress data too.
-      const exportData = exportRows.map((entry) => entry.row);
-
-      if (completedEntries.length > 0) {
-        const overallKappaRow: Record<string, string | number> = {
-          article_id: "OVERALL_DATASET_KAPPA",
-          headline: "",
-          display_text: `Dataset-wide Fleiss' kappa across ${completedEntries.length} completed articles (5 annotations each)`,
-          source: "",
-          author: "",
-          date_published: "",
-          url: "",
-          category: "",
-          article_type: "",
-          word_count: "",
-          label: "",
-          final_label: "",
-          majority_vote_label: "",
-          bias_score: "",
-          fleiss_kappa: calculateOverallFleissKappa(completedCounts),
-        };
-
-        for (let i = 1; i <= TRAINING_ANNOTATOR_SLOTS; i++) {
-          overallKappaRow[`ann_${i}_student_id`] = "";
-          overallKappaRow[`ann_${i}_label`] = "";
-        }
-
-        exportData.push(overallKappaRow);
-      }
 
       downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split('T')[0]}.csv`);
     } catch (err) {
@@ -180,11 +77,10 @@ export default function ExportCSV() {
             <Table size={32} />
           </div>
           <div className="space-y-2">
-            <h3 className="text-xl font-bold text-slate-800">Completed Annotations Dataset (CSV)</h3>
+            <h3 className="text-xl font-bold text-slate-800">Full Dataset (CSV)</h3>
             <p className="text-slate-500 text-sm leading-relaxed">
-              Export only articles with a full 5 annotations each. Includes article metadata, article text,
-              per-annotator student IDs, emails and labels, binary ML label, human-readable final label,
-              and agreement scores, plus a final overall Fleiss' kappa summary row.
+              Export all articles including their original metadata, processed scores (Bias Score, Fleiss' Kappa), 
+              and individual labels from up to 10 annotators per article.
             </p>
           </div>
           <button

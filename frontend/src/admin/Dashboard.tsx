@@ -28,6 +28,7 @@ export default function Dashboard() {
     totalAnnotators: 0,
     completedAnnotators: 0,
     avgBiasScore: 0,
+    totalBiasScoreSum: 0,
     needsReview: 0
   });
 
@@ -121,14 +122,23 @@ export default function Dashboard() {
       const completedAnnotatorCount = annotators.filter(a =>
         Array.isArray(a.completed_articles) && a.completed_articles.length >= 20
       ).length;
+      const completedArticlesArr = articles.filter(a => a.status === "complete");
+      const totalBiasScoreSum = completedArticlesArr.reduce((sum, a) => {
+        const v = typeof a.bias_score === "number" && Number.isFinite(a.bias_score) ? a.bias_score : 0;
+        return sum + v;
+      }, 0);
+      const avgBiasScore = completedArticlesArr.length > 0
+        ? Math.round((totalBiasScoreSum / completedArticlesArr.length) * 100) / 100
+        : 0;
       const newSummary: PlatformSummary = {
         totalArticles: articles.length,
-        completedArticles: articles.filter(a => a.status === "complete").length,
+        completedArticles: completedArticlesArr.length,
         inProgressArticles: articles.filter(a => a.status === "partial").length,
         pendingArticles: articles.filter(a => a.status === "pending").length,
         totalAnnotators: annotators.length,
         completedAnnotators: completedAnnotatorCount,
-        avgBiasScore: stats.avgBiasScore, // Keep current avg bias score
+        avgBiasScore,
+        totalBiasScoreSum,
         needsReview: articles.filter(a => {
           const requiredAnnotations = getRequiredAnnotations(a, {
             annotators_per_article: fallbackRequiredAnnotations,

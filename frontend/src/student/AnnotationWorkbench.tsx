@@ -2,16 +2,14 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { auth, db } from "../firebase";
-import { Article, Annotator, BiasLabel, AdminConfig } from "../types";
+import { Article, Annotator, BiasLabel } from "../types";
 import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
 import TimerRing from "../components/TimerRing";
 import { Check, Loader2, AlertCircle } from "lucide-react";
 import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
-import { getMajorityBiasLabel, mapBiasLabelToBinary } from "../utils/biasLabels";
-import { getRequiredAnnotations } from "../utils/annotationConfig";
-import { updatePlatformStats, syncAverageBiasScore } from "../utils/stats";
+import { syncBiasScoreAndStatsAtomically } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 
 // Helper to retry async operations with exponential backoff (no generics to avoid errors)
@@ -88,30 +86,8 @@ export default function AnnotationWorkbench() {
     setTimerExpired(true);
   }, []);
 
-  // Watchdog: if > (duration + 2s grace) has elapsed since startTime and timerExpired is
-  // still false for the CURRENT article, force-set it. This guarantees Submit button
-  // enables even if TimerRing's StrictMode double-fire / interval leak / race condition
-  // on Article-2 transition dropped the onComplete callback.
-  useEffect(() => {
-    if (!startTime || timerExpired) return;
-    const MAX_WAIT_MS = (10 + 2) * 1000;
-    const elapsed = Date.now() - startTime;
-    const waitMs = Math.max(0, MAX_WAIT_MS - elapsed);
-    const t = setTimeout(() => {
-      setTimerExpired((prev) => {
-        if (prev) return prev;
-        console.warn("[AnnotationWorkbench] Watchdog forcing timerExpired=true (TimerRing may have missed onComplete)");
-        return true;
-      });
-    }, waitMs);
-    return () => clearTimeout(t);
-  }, [startTime, timerExpired, currentArticle]);
-
   // Track last loaded article to prevent unnecessary reloads
   const lastLoadedArticleIdRef = useRef<string | null>(null);
-  // When TRUE, the background fire-and-forget IIFE must NOT overwrite
-  // completedArticles / completedCount state (avoids 19/20 race on submit-20).
-  const postVerifiedGuardRef = useRef(false);
   
   // Sync our local assignedArticlesState with the one from useArticleAssignment
   useEffect(() => {
@@ -213,8 +189,8 @@ export default function AnnotationWorkbench() {
           
           if (article) {
             setCurrentArticle(article);
-            setTimerExpired(false);
             setStartTime(Date.now());
+            setTimerExpired(false);
             setLabel(null);
             
             // Preload the next article right away!
@@ -259,9 +235,6 @@ export default function AnnotationWorkbench() {
     let txnCommitted = false;
 
     try {
-      const adminConfigSnap = await getDoc(doc(db, "admin_config", "settings"));
-      const adminConfig = adminConfigSnap.exists() ? (adminConfigSnap.data() as AdminConfig) : null;
-
       // --- 3. FIRST START THE SAVE TO DATABASE AND AWAIT IT ---
       await retryWithBackoff(async () => {
         const responseData = {
@@ -308,19 +281,13 @@ export default function AnnotationWorkbench() {
           const articleData = articleSnap.data() as Article;
           const oldStatus = articleData.status;
           const newCount = (articleData.annotation_count || 0) + 1;
-          const requiredAnnotations = getRequiredAnnotations(articleData, adminConfig);
           let newStatus = oldStatus;
-          if (newCount >= requiredAnnotations) newStatus = "complete";
+          if (newCount >= 5) newStatus = "complete";
           else if (newCount > 0) newStatus = "partial";
 
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);
           if (!annotatorSnap.exists()) return;
           const annotatorData = annotatorSnap.data() as Annotator;
-          const serverCompletedIds = Array.isArray(annotatorData.completed_articles)
-            ? annotatorData.completed_articles.filter((id: string) => id && id !== articleId)
-            : [];
-          const serverCountBefore = serverCompletedIds.length;
-          const newTotal = serverCountBefore + 1;
 
           transaction.update(articleRef, {
             annotation_count: increment(1),
@@ -338,41 +305,27 @@ export default function AnnotationWorkbench() {
           };
           if (savedCurrentArticle.is_gold_standard && savedCurrentArticle.gold_expected_label) {
             const wasCorrect = savedLabel === savedCurrentArticle.gold_expected_label;
-            const newTotalGold = (annotatorData.gold_total_count || 0) + 1;
+            const newTotal = (annotatorData.gold_total_count || 0) + 1;
             const newCorrect = (annotatorData.gold_correct_count || 0) + (wasCorrect ? 1 : 0);
-            annotatorUpdates.gold_total_count = newTotalGold;
+            annotatorUpdates.gold_total_count = newTotal;
             annotatorUpdates.gold_correct_count = newCorrect;
-            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotalGold) * 100);
+            annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
             annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
           }
-          const wasCompletedBefore = !!annotatorData.completed && serverCountBefore >= 20;
-          const isCompletedNow = newTotal >= 20;
-          annotatorUpdates.completed = isCompletedNow;
+          const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
+          if (totalCompleted >= 20) annotatorUpdates.completed = true;
           transaction.update(annotatorRef, annotatorUpdates);
-
-          // Track whether this submit caused annotator to cross the 20/20 finish line
-          // for later stats update (outside tx)
-          (window as any).__nexus_justFinishedAnnotator = !wasCompletedBefore && isCompletedNow;
         });
 
         (async () => {
           try {
-            // ---- State-write guard -------------------------------------------------
-            // If the post-transaction verification step below has already finished
-            // (postVerifiedGuardRef === true) we must not overwrite completed state
-            // with a potentially stale getDoc() cache read. Without this guard, the
-            // UI & admin dashboard can display 19/20 after the 20th annotation was
-            // actually saved to Firestore.
-            const shouldWriteState = !postVerifiedGuardRef.current;
-
-            if (shouldWriteState) {
-              const annotatorRefresh = await getDoc(annotatorRef);
-              if (annotatorRefresh.exists()) {
-                const newData = annotatorRefresh.data() as Annotator;
-                setCompletedArticles(newData.completed_articles || []);
-                setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
-              }
+            const annotatorRefresh = await getDoc(annotatorRef);
+            if (annotatorRefresh.exists()) {
+              const newData = annotatorRefresh.data() as Annotator;
+              setCompletedArticles(newData.completed_articles || []);
+              setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
             }
+            let finalBiasScore = 0;
             if (statusChangedTo === "complete") {
               const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
               const responses = responsesSnap.docs.map(d => d.data());
@@ -381,29 +334,18 @@ export default function AnnotationWorkbench() {
                 slightly: responses.filter(r => r.label === "slightly_manipulative").length,
                 highly: responses.filter(r => r.label === "highly_manipulative").length
               };
-              const bias_score = calculateBiasScore(counts);
+              finalBiasScore = calculateBiasScore(counts);
               const fleiss_kappa = calculateFleissKappa(counts);
-              const final_label = getMajorityBiasLabel(counts);
-              const binaryLabel = mapBiasLabelToBinary(final_label);
-              await updateDoc(articleRef, {
-                bias_score,
-                fleiss_kappa,
-                final_label,
-                label: binaryLabel === "" ? null : binaryLabel
-              });
-              
-              const q = query(collection(db, "articles"), where("status", "==", "complete"));
-              const snap = await getDocs(q);
-              await syncAverageBiasScore(bias_score, snap.size);
+              await updateDoc(articleRef, { bias_score: finalBiasScore, fleiss_kappa });
             }
             if (statusChangedTo) {
-              const statsUpdate: any = {};
-              const oldStatus = savedCurrentArticle.status;
-              if (oldStatus === "pending") statsUpdate.pendingArticles = -1;
-              if (oldStatus === "partial") statsUpdate.inProgressArticles = -1;
-              if (statusChangedTo === "partial") statsUpdate.inProgressArticles = 1;
-              if (statusChangedTo === "complete") statsUpdate.completedArticles = 1;
-              await updatePlatformStats(statsUpdate);
+              const prev = savedCurrentArticle.status === "pending" || savedCurrentArticle.status === "partial"
+                ? savedCurrentArticle.status
+                : undefined;
+              const next = statusChangedTo === "partial" || statusChangedTo === "complete"
+                ? statusChangedTo
+                : null;
+              await syncBiasScoreAndStatsAtomically(finalBiasScore, prev, next);
             }
           } catch (e) {
             console.warn("Background tasks failed:", e);
@@ -440,6 +382,10 @@ export default function AnnotationWorkbench() {
           completedCountFromServer = data.completed_articles?.length ?? newCompletedArticles.length;
           latestAssignedArticles = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : latestAssignedArticles;
           latestCompletedArticles = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : latestCompletedArticles;
+          // Refresh local state with server truth immediately.
+          setAssignedArticlesState(latestAssignedArticles);
+          setCompletedArticles(latestCompletedArticles);
+          setCompletedCount(Math.min(latestCompletedArticles.length, 20));
         } else {
           completedCountFromServer = newCompletedArticles.length;
         }
@@ -447,65 +393,12 @@ export default function AnnotationWorkbench() {
         console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to optimistic state:", readErr);
         completedCountFromServer = newCompletedArticles.length;
       }
-
-      // ---- 5b. STRONG SERVER VERIFICATION on potential finish line ---------
-      // If the refreshed annotator shows 19 or 20 completed, we MUST do a
-      // fresh server read (bypass cache) and re-check until we can confirm
-      // the just-saved article is present in completed_articles. Otherwise
-      // we risk premature "Mission Complete" with the admin still on 19/20.
-      postVerifiedGuardRef.current = true; // Lock the background IIFE out
-
-      if (latestCompletedArticles.length >= 19 && !latestCompletedArticles.includes(articleId)) {
-        console.warn("[AnnotationWorkbench] Potential off-by-one detected: article not yet in completed_articles. Running forced server re-fetch...");
-        const annotatorRef2 = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
-        for (let attempt = 0; attempt < 3; attempt++) {
-          await new Promise(r => setTimeout(r, 400));
-          try {
-            const reSnap = await getDoc(annotatorRef2); // post-tx read
-            if (reSnap.exists()) {
-              const reData = reSnap.data() as Annotator;
-              const reCompleted = Array.isArray(reData.completed_articles)
-                ? reData.completed_articles.filter(Boolean) : [];
-              latestCompletedArticles = reCompleted;
-              latestAssignedArticles = Array.isArray(reData.assigned_articles)
-                ? reData.assigned_articles.filter(Boolean) : latestAssignedArticles;
-              completedCountFromServer = reCompleted.length;
-              latestAnnotator = reData;
-              console.log(`[AnnotationWorkbench] Re-fetch attempt ${attempt + 1}: completed count = ${reCompleted.length}, contains current article? ${reCompleted.includes(articleId)}`);
-              if (reCompleted.includes(articleId)) break;
-            }
-          } catch (e) {
-            console.warn(`[AnnotationWorkbench] Re-fetch attempt ${attempt + 1} failed:`, e);
-          }
-        }
-      }
-
-      // Apply final server truth to local state AFTER strong verification.
-      setAssignedArticlesState(latestAssignedArticles);
-      setCompletedArticles(latestCompletedArticles);
-      setCompletedCount(Math.min(latestCompletedArticles.length, 20));
       
       // Find next pending index using the LATEST data
       let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
 
-      // ---- CRITICAL: Decide done-state ONLY from server-TRUTH counts. ----
-      // We ALREADY refreshed latestCompletedArticles from the annotator doc
-      // (the one just updated by the transaction). This avoids navigating to
-      // /done prematurely when the optimistic local state was off-by-one AND
-      // avoids 19/20 display bug on the admin dashboard because the annotator
-      // doc (and `completed` boolean) are guaranteed 20 IDs before we leave.
-      const serverDone = latestCompletedArticles.length >= 20;
-
-      // Update completedAnnotators platform stat IFF this submit was the
-      // one that crossed the finish line (freshly completed annotator).
-      if (serverDone && (window as any).__nexus_justFinishedAnnotator) {
-        try { await updatePlatformStats({ completedAnnotators: 1 }); }
-        catch (e) { console.warn("Could not bump completedAnnotators stat:", e); }
-        try { delete (window as any).__nexus_justFinishedAnnotator; } catch {}
-      }
-
       // --- 6. If completed count reached 20, go straight to the done screen.
-      if (serverDone) {
+      if (latestCompletedArticles.length >= 20) {
         setSubmitting(false);
         navigate("/done");
         return;
@@ -545,8 +438,8 @@ export default function AnnotationWorkbench() {
         if (newNextArticle) {
           setCurrentIndex(nextPendingIndex);
           setCurrentArticle(newNextArticle);
-          setTimerExpired(false);
           setStartTime(Date.now());
+          setTimerExpired(false);
           setLabel(null);
           setNextArticle(null); // Clear stale next article
           // Preload next one in the BACKGROUND (no await, faster UI).
