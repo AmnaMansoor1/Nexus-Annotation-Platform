@@ -5,17 +5,7 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "status", "order": "ASCENDING" },
-        { "fieldPath": "assigned_count", "order": "ASCENDING" },
-        { "fieldPath": "article_id", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "articles",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "status", "order": "ASCENDING" },
-        { "fieldPath": "assigned_count", "order": "ASCENDING" },
-        { "fieldPath": "date_published", "order": "ASCENDING" }
+        { "fieldPath": "sequence_number", "order": "ASCENDING" }
       ]
     }
   ],

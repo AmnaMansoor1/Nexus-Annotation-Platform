@@ -63,9 +63,12 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
   const [error, setError] = useState<string | null>(null);
 
   const loadAssignment = useCallback(async () => {
-    console.log("[useArticleAssignment] Starting loadAssignment for email:", email);
+    const TS = () => `[${new Date().toISOString()}]`;
+    const invId = String(Math.random()).slice(2, 8);
+    console.log(`${TS()} [A-EVIDENCE-c] loadAssignment START [invocation=${invId}] for email=${email}. (This matches either: AnnotationWorkbench.handleSubmit direct await, OR useArticleAssignment useEffect trigger.) Current loading flag BEFORE setLoading(true): loading=`, loading, `email null?`, !email);
+    console.log(`${TS()} [A-EVIDENCE-c] [inv=${invId}] FINAL setLoading(false) will appear as log line [inv=${invId}] FINALLY setLoading(false) exit. If you never see that line, this invocation hung.`);
     if (!email) {
-      console.log("[useArticleAssignment] No email provided");
+      console.log(`${TS()} [A-EVIDENCE-c] [inv=${invId}] EXIT early: no email. setLoading(false).`);
       setLoading(false);
       return;
     }
@@ -212,12 +215,14 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
       setError("Failed to assign articles: " + (err instanceof Error ? err.message : String(err)));
     } finally {
       setLoading(false);
+      console.log(`${TS()} [A-EVIDENCE-c] [inv=${invId}] FINALLY setLoading(false) exit. useArticleAssignment loadAssignment DONE OK.`);
       console.log("[useArticleAssignment] Finished loadAssignment");
     }
   }, [email]);
 
   useEffect(() => {
-    console.log("[useArticleAssignment] useEffect triggered with email=", email, "refreshTrigger=", refreshTrigger);
+    const TS = () => `[${new Date().toISOString()}]`;
+    console.log(`${TS()} [A-EVIDENCE-c] useArticleAssignment TRIGGERED → email=${email}, refreshTrigger=${refreshTrigger}. loadAssignment() called HERE (invocation #1 of any double-invocation when AnnotationWorkbench.handleSubmit also calls it directly).`);
     loadAssignment();
   }, [email, refreshTrigger, loadAssignment]);
 

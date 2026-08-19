@@ -1,39 +1,51 @@
 # Firestore Index Recommendations
 
-To ensure optimal performance for your annotation platform, create the following composite indexes in your Firebase Console:
+To ensure optimal performance for your annotation platform, the following composite index must exist in your Firebase Console.
 
-## 1. Article Eligibility Query (Main)
+## ✅ DEPLOYED INDEX (Strategy A — Sequential Eligibility)
 - **Collection**: `articles`
-- **Fields**:
+- **Fields** (in this exact order):
   1. `status` (Ascending)
-  2. `assigned_count` (Ascending)
-  3. `article_id` (Ascending)
+  2. `sequence_number` (Ascending)
 - **Query Scope**: Collection
+- **Purpose**: Powers Strategy A assignment query:
+  ```
+  where("status", "in", ["pending", "partial"])
+  orderBy("sequence_number", "asc")
+  limit(100)
+  ```
+- **Cost Impact (with this index active)**: ~100 reads per first-time student assignment, vs ~500 reads per assignment via Strategy B fallback (client-side filter on 500 documents). ~5× cheaper per new student.
 
-## 2. Article Eligibility Query (Secondary)
-- **Collection**: `articles`
-- **Fields**:
-  1. `status` (Ascending)
-  2. `assigned_count` (Ascending)
-  3. `date_published` (Ascending)
-- **Query Scope**: Collection
+## Verify Index Exists
+Run this command and confirm it matches exactly (note: `__name__ ASC` is auto-appended by Firestore, do NOT add it manually):
+```bash
+firebase firestore:indexes
+```
 
-## 3. Status-based Article Query
-- **Collection**: `articles`
-- **Fields**:
-  1. `status` (Ascending)
-- **Query Scope**: Collection (single-field index is auto-created)
+Expected output:
+```json
+{
+  "indexes": [
+    {
+      "collectionGroup": "articles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "sequence_number", "order": "ASCENDING" },
+        { "fieldPath": "__name__", "order": "ASCENDING" }
+      ],
+      "density": "SPARSE_ALL"
+    }
+  ],
+  "fieldOverrides": []
+}
+```
 
-## How to Create Indexes:
-1. Go to the [Firebase Console](https://console.firebase.google.com)
-2. Select your project
-3. Go to **Firestore Database** > **Indexes**
-4. Click **Add Index**
-5. For each recommendation above:
-   - Select the collection
-   - Add the fields in order
-   - Set the scope to "Collection"
-6. Click **Create**
+## How to Deploy (if missing)
+The local `firestore.indexes.json` in this repo matches the spec above. To deploy it:
+```bash
+firebase deploy --only firestore:indexes
+```
 
 ## Expected Concurrency:
 Your platform should handle **500+ concurrent annotators** comfortably with these optimizations:
@@ -42,3 +54,4 @@ Your platform should handle **500+ concurrent annotators** comfortably with thes
 - We've added jitter to avoid thundering herd
 - We use batched writes for better throughput
 - Optimistic UI updates improve perceived performance
+- LocalStorage assignment caching avoids ~600 redundant reads per student session
