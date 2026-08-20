@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc } from "firebase/firestore";
+import { useState, useEffect, useCallback } from "react";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
 import { getRequiredAnnotations } from "../utils/annotationConfig";
@@ -42,55 +42,55 @@ export default function Dashboard() {
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadDashboardData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      console.log("Loading dashboard data from summary...");
-      
-      const summaryRef = doc(db, "stats", "platform_summary");
-      const summarySnap = await getDoc(summaryRef);
-      
-      if (!summarySnap.exists()) {
-        throw new Error("Stats summary not found. Please click 'Sync Statistics' below to initialize.");
-      }
-
-      const data = summarySnap.data() as PlatformSummary;
-      
-      // Auto-fix: If we detect an impossible state (Total is 0 but In Progress is not),
-      // or if totalArticles is missing, trigger a silent sync or alert.
-      if ((!data.totalArticles || data.totalArticles === 0) && (data.inProgressArticles > 0 || data.completedArticles > 0)) {
-        console.warn("Impossible stats detected. Summary document is out of sync.");
-        // We don't auto-sync here to avoid infinite loops/heavy reads on every load,
-        // but we'll show a warning to the admin.
-      }
-
-      setStats(data);
-      
-      setStatusData([
-        { name: "Completed", value: data.completedArticles || 0, color: "#16a34a" },
-        { name: "In Progress", value: data.inProgressArticles || 0, color: "#eab308" },
-        { name: "Pending", value: data.pendingArticles || 0, color: "#94a3b8" }
-      ]);
-      
-      if (data.categoryDistribution) {
-        setCategoryData(Object.entries(data.categoryDistribution)
-          .map(([name, value]) => ({ name, value }))
-          .sort((a, b) => b.value - a.value)
-        );
-      }
-      
-    } catch (err: any) {
-      console.error("Dashboard data load error:", err);
-      setError(err.message || "Failed to load dashboard data.");
-    } finally {
-      setLoading(false);
+  const applyStatsData = useCallback((data: PlatformSummary) => {
+    if ((!data.totalArticles || data.totalArticles === 0) && (data.inProgressArticles > 0 || data.completedArticles > 0)) {
+      console.warn("Impossible stats detected. Summary document is out of sync.");
     }
-  };
+    setStats(data);
+    setStatusData([
+      { name: "Completed", value: data.completedArticles || 0, color: "#16a34a" },
+      { name: "In Progress", value: data.inProgressArticles || 0, color: "#eab308" },
+      { name: "Pending", value: data.pendingArticles || 0, color: "#94a3b8" }
+    ]);
+    if (data.categoryDistribution) {
+      setCategoryData(Object.entries(data.categoryDistribution)
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value)
+      );
+    }
+  }, []);
 
   useEffect(() => {
-    loadDashboardData();
-  }, []);
+    setLoading(true);
+    setError(null);
+    let didInitialLoad = false;
+
+    const summaryRef = doc(db, "stats", "platform_summary");
+    const unsubscribe = onSnapshot(summaryRef, (snap) => {
+      try {
+        if (!snap.exists()) {
+          throw new Error("Stats summary not found. Please click 'Sync Statistics' below to initialize.");
+        }
+        const data = snap.data() as PlatformSummary;
+        applyStatsData(data);
+        setError(null);
+      } catch (err: any) {
+        console.error("Dashboard data load error:", err);
+        setError(err.message || "Failed to load dashboard data.");
+      } finally {
+        if (!didInitialLoad) {
+          didInitialLoad = true;
+          setLoading(false);
+        }
+      }
+    }, (err) => {
+      console.error("Dashboard snapshot error:", err);
+      setError(err.message || "Failed to connect to dashboard stream.");
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [applyStatsData]);
 
   const handleSyncStats = async () => {
     if (!window.confirm("This will perform a full scan of your database to recalculate all statistics. Continue?")) return;
