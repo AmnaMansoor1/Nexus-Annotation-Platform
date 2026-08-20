@@ -1,10 +1,36 @@
 import { useState } from "react";
 import { collection, getDocs, query, orderBy } from "firebase/firestore";
 import { db } from "../firebase";
-import { Article } from "../types";
+import { Article, BiasLabel } from "../types";
 import { downloadCSV } from "../utils/csvExport";
 import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
+
+export function majorityLabelFromLabels(labels: BiasLabel[]): { label: BiasLabel | null; numeric: number | null } {
+  if (!Array.isArray(labels) || labels.length < DEFAULT_REQUIRED_ANNOTATIONS) {
+    return { label: null, numeric: null };
+  }
+  const counts = {
+    neutral: 0,
+    slightly_manipulative: 0,
+    highly_manipulative: 0,
+  };
+  for (const l of labels) {
+    if (l === "neutral") counts.neutral++;
+    else if (l === "slightly_manipulative") counts.slightly_manipulative++;
+    else if (l === "highly_manipulative") counts.highly_manipulative++;
+  }
+  const entries = (Object.entries(counts) as Array<[BiasLabel, number]>);
+  entries.sort((a, b) => b[1] - a[1]);
+  const [topLabel, topCount] = entries[0];
+  if (topCount === 0) return { label: null, numeric: null };
+  const [secondLabel, secondCount] = entries[1];
+  if (topCount === secondCount) {
+    return { label: null, numeric: null };
+  }
+  const numeric = topLabel === "neutral" ? 0 : topLabel === "slightly_manipulative" ? 1 : 2;
+  return { label: topLabel, numeric };
+}
 
 export default function ExportCSV() {
   const [loading, setLoading] = useState(false);
@@ -73,15 +99,51 @@ export default function ExportCSV() {
         row.word_count = article.word_count || 0;
         row.display_text = article.display_text || "";
         row.status = article.status || "";
-        row.bias_score = article.bias_score || "";
-        row.fleiss_kappa = article.fleiss_kappa || "";
-        // Use the FILTERED response count (after deleting annotators) as the
-        // canonical total. This matches the slot values so totals stay consistent
-        // and the exported dataset accurately reflects only current annotators.
+
+        if (article.label === 0 || article.label === 1) {
+          row.ml_label = article.label;
+        } else {
+          row.ml_label = "";
+        }
+
+        row.human_label = article.final_label || "";
+        if (article.final_label === "neutral") {
+          row.human_label_numeric = 0;
+        } else if (article.final_label === "slightly_manipulative") {
+          row.human_label_numeric = 1;
+        } else if (article.final_label === "highly_manipulative") {
+          row.human_label_numeric = 2;
+        } else {
+          row.human_label_numeric = "";
+        }
+
+        const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
+        if (article.status === "complete"
+          && typeof article.annotation_count === "number"
+          && article.annotation_count >= REQUIRED) {
+          row.bias_score = article.bias_score ?? "";
+          row.fleiss_kappa = article.fleiss_kappa ?? "";
+        } else {
+          row.bias_score = "";
+          row.fleiss_kappa = "";
+        }
+
         row.total_annotations = responses.length;
 
-        // Exactly ANNOTATOR_COLUMNS slots (default 5 per locked spec).
-        // No extra empty columns — consistent with the "exactly N annotators per article" requirement.
+        const responseLabels = responses.map((r: any) => r.label).filter(Boolean) as BiasLabel[];
+        const majority = majorityLabelFromLabels(responseLabels);
+        if (article.final_label) {
+          row.human_label = article.final_label;
+          row.human_label_numeric = article.final_label === "neutral" ? 0
+            : article.final_label === "slightly_manipulative" ? 1 : 2;
+        } else if (majority.label && majority.numeric !== null) {
+          row.human_label = majority.label;
+          row.human_label_numeric = majority.numeric;
+        } else {
+          row.human_label = "";
+          row.human_label_numeric = "";
+        }
+
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
           row[`ann_${i}_student_id`] = "";
           row[`ann_${i}_label`] = "";

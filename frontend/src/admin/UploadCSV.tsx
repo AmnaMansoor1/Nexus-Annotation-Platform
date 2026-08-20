@@ -82,6 +82,17 @@ export default function UploadCSV() {
             adminConfig
           );
 
+          let mlLabel: 0 | 1 | null = null;
+          if (row.label === 0 || row.label === "0") mlLabel = 0;
+          else if (row.label === 1 || row.label === "1") mlLabel = 1;
+          else if (row.ml_label === 0 || row.ml_label === "0") mlLabel = 0;
+          else if (row.ml_label === 1 || row.ml_label === "1") mlLabel = 1;
+
+          let humanFinal: any = null;
+          if (row.final_label === "neutral" || row.final_label === "slightly_manipulative" || row.final_label === "highly_manipulative") {
+            humanFinal = row.final_label;
+          }
+
           const article: Article = {
             article_id: articleId,
             headline: row.headline || "",
@@ -101,8 +112,8 @@ export default function UploadCSV() {
             assigned_count: 0,
             bias_score: null,
             fleiss_kappa: null,
-            label: null,
-            final_label: null,
+            label: mlLabel,
+            final_label: humanFinal,
             is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"
           };
           if (row.gold_expected_label) {

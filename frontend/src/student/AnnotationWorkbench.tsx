@@ -355,7 +355,17 @@ export default function AnnotationWorkbench() {
               };
               finalBiasScore = calculateBiasScore(counts);
               const fleiss_kappa = calculateFleissKappa(counts);
-              await updateDoc(articleRef, { bias_score: finalBiasScore, fleiss_kappa });
+
+              const entries = (Object.entries(counts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
+              entries.sort((a, b) => b[1] - a[1]);
+              const [topLabel, topCount] = entries[0];
+              const [_secondLabel, secondCount] = entries[1];
+              let finalLabel: any = null;
+              if (topCount > 0 && topCount !== secondCount) {
+                finalLabel = topLabel;
+              }
+
+              await updateDoc(articleRef, { bias_score: finalBiasScore, fleiss_kappa, final_label: finalLabel });
             }
             if (statusChangedTo) {
               const prev = savedCurrentArticle.status === "pending" || savedCurrentArticle.status === "partial"

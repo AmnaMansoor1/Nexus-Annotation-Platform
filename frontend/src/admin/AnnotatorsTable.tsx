@@ -68,9 +68,9 @@ export default function AnnotatorsTable() {
       `⚠️  PERMANENTLY DELETE annotator: ${email}\n\n` +
       `This will:\n` +
       `  • Delete their annotator profile\n` +
-      `  • REMOVE ALL ${completedCount} of their annotations\n` +
-      `  • Decrement annotation_count on every affected article\n` +
-      `  • Recompute status, bias_score, and fleiss_kappa for every affected article\n` +
+      `  • REMOVE ALL ${completedCount} of their annotations AND free up their assigned slots\n` +
+      `  • Decrement annotation_count + assigned_count on every affected article\n` +
+      `  • Recompute status; bias_score/fleiss_kappa recalculated ONLY when exactly 5 labels remain\n` +
       `  • Update ALL dashboard counters (annotator count, status buckets, bias sum/avg)\n\n` +
       `THIS CANNOT BE UNDONE. Type DELETE in all caps to confirm.`;
     const userInput = prompt(msg);
@@ -108,6 +108,8 @@ export default function AnnotatorsTable() {
 
       const BATCH_SIZE = 8;
 
+      const REQUIRED_ANNOTATIONS = 5;
+
       const processArticle = async (articleId: string): Promise<{ ok: boolean }> => {
         try {
           let localBecameIncomplete = false;
@@ -119,6 +121,7 @@ export default function AnnotatorsTable() {
           let oldStatus: "pending" | "partial" | "complete" = "pending";
           let newStatus: "pending" | "partial" | "complete" = "pending";
           let articleChanged = false;
+          let shouldRecomputeScores = false;
 
           await runTransaction(db, async (tx) => {
             const articleRef = doc(db, "articles", articleId);
@@ -135,10 +138,14 @@ export default function AnnotatorsTable() {
             oldStatus = (article.status || "pending") as "pending" | "partial" | "complete";
             const oldCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
             const oldAnnotatedBy = Array.isArray(article.annotated_by) ? article.annotated_by : [];
+            const oldAssignedTo = Array.isArray(article.assigned_to) ? article.assigned_to : [];
+            const oldAssignedCount = typeof article.assigned_count === "number" ? article.assigned_count : 0;
+
             const hadThisAnnotatorCounted = oldAnnotatedBy.includes(email);
+            const wasThisAnnotatorAssigned = oldAssignedTo.includes(email);
             const responseExisted = responseSnap.exists();
 
-            if (!hadThisAnnotatorCounted && !responseExisted) {
+            if (!hadThisAnnotatorCounted && !responseExisted && !wasThisAnnotatorAssigned) {
               return;
             }
 
@@ -150,8 +157,12 @@ export default function AnnotatorsTable() {
               : [...oldAnnotatedBy];
             const newCount = hadThisAnnotatorCounted ? Math.max(0, oldCount - 1) : oldCount;
 
-            const REQUIRED = 5;
-            if (newCount >= REQUIRED) newStatus = "complete";
+            const newAssignedTo = wasThisAnnotatorAssigned
+              ? oldAssignedTo.filter((e) => String(e).toLowerCase() !== email)
+              : [...oldAssignedTo];
+            const newAssignedCount = wasThisAnnotatorAssigned ? Math.max(0, oldAssignedCount - 1) : oldAssignedCount;
+
+            if (newCount >= REQUIRED_ANNOTATIONS) newStatus = "complete";
             else if (newCount > 0) newStatus = "partial";
             else newStatus = "pending";
 
@@ -167,17 +178,22 @@ export default function AnnotatorsTable() {
             const updates: any = {
               annotation_count: newCount,
               annotated_by: newAnnotatedBy,
+              assigned_to: newAssignedTo,
+              assigned_count: newAssignedCount,
               status: newStatus,
             };
 
-            if (newCount < 2) {
+            if (newCount < REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
+              updates.final_label = null;
               if (article.bias_score !== null) localBiasCleared = true;
-            } else if (localBecameIncomplete || (hadThisAnnotatorCounted && newCount >= 2)) {
+            } else if (newCount === REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
+              updates.final_label = null;
               if (article.bias_score !== null) localBiasRecomputed = true;
+              shouldRecomputeScores = true;
             }
 
             tx.update(articleRef, updates);
@@ -212,7 +228,7 @@ export default function AnnotatorsTable() {
           const articleSnap2 = await getDoc(doc(db, "articles", articleId));
           if (articleSnap2.exists()) {
             const art = articleSnap2.data() as Article;
-            if (art.bias_score === null && art.annotation_count >= 2) {
+            if (art.bias_score === null && art.annotation_count === REQUIRED_ANNOTATIONS) {
               const remainingResp = await getDocs(collection(db, "annotations", articleId, "responses"));
               const labels = remainingResp.docs.map((d) => (d.data() as any).label as string).filter(Boolean);
               const counts = {
@@ -222,9 +238,20 @@ export default function AnnotatorsTable() {
               };
               const newScore = calculateBiasScore(counts);
               const newKappa = calculateFleissKappa(counts);
+
+              const entries = (Object.entries(counts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
+              entries.sort((a, b) => b[1] - a[1]);
+              const [topLabel, topCount] = entries[0];
+              const [_secondLabel, secondCount] = entries[1];
+              let finalLabel: any = null;
+              if (topCount > 0 && topCount !== secondCount) {
+                finalLabel = topLabel;
+              }
+
               await updateDoc(doc(db, "articles", articleId), {
                 bias_score: newScore,
                 fleiss_kappa: newKappa,
+                final_label: finalLabel,
               });
             }
           }
@@ -279,17 +306,21 @@ export default function AnnotatorsTable() {
         articleBiasScoreRecomputed,
       });
 
+      const partialToPending = Math.max(0, articleBecameIncomplete - articleBecamePartial - articleBecamePending);
       let summary =
         `✅ Deleted ${email} successfully.\n\n` +
         `  Articles touched: ${processed}\n` +
         `  Status transitions:\n` +
         `    complete → partial: ${articleBecamePartial}\n` +
         `    complete → pending: ${articleBecamePending}\n` +
-        `    partial → pending: ${articleBecameIncomplete - articleBecamePartial - articleBecamePending >= 0 ? articleBecameIncomplete - articleBecamePartial - articleBecamePending : 0}\n` +
-        `  Articles whose bias score was cleared (fewer than 2 remain): ${articleBiasScoreCleared}\n` +
-        `  Articles whose bias score was recomputed: ${articleBiasScoreRecomputed}\n` +
+        `    partial → pending: ${partialToPending}\n` +
+        `  Assignment slots freed (assigned_count decremented + email removed from assigned_to).\n` +
+        `  Bias/Fleiss scores cleared (${articleBiasScoreCleared} articles now have < 5 valid labels).\n` +
+        `  Bias/Fleiss recomputed over exactly 5 remaining labels: ${articleBiasScoreRecomputed}\n` +
         `  Dashboard counters updated (annotator count, status buckets, bias sum/avg).\n` +
-        `  Dashboard page will refresh automatically via real-time listener.`;
+        `  Dashboard page will refresh automatically via real-time listener.\n\n` +
+        `  ➜ Next new annotator will pick up articles starting from the lowest sequence_number\n` +
+        `    whose assigned_count has dropped below 5 (fixes the "starts at 40-60" issue).`;
       if (errors.length > 0) {
         summary += `\n\n⚠️  Errors (${errors.length} articles):\n` + errors.slice(0, 10).join("\n");
         if (errors.length > 10) summary += `\n… +${errors.length - 10} more`;
