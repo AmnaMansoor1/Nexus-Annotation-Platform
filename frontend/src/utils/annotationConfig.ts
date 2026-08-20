@@ -14,11 +14,19 @@ export function getRequiredAnnotations(
   article?: Partial<Article> | null,
   adminConfig?: Partial<AdminConfig> | null
 ): number {
-  if (article && article.required_annotations != null) {
+  if (
+    article != null &&
+    Object.prototype.hasOwnProperty.call(article, "required_annotations") &&
+    article.required_annotations != null
+  ) {
     return normalizeRequiredAnnotations(article.required_annotations);
   }
 
-  if (adminConfig && adminConfig.annotators_per_article != null) {
+  if (
+    adminConfig != null &&
+    Object.prototype.hasOwnProperty.call(adminConfig, "annotators_per_article") &&
+    adminConfig.annotators_per_article != null
+  ) {
     return normalizeRequiredAnnotations(adminConfig.annotators_per_article);
   }
 

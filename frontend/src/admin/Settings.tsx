@@ -40,12 +40,43 @@ export default function Settings() {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    const apa = config.annotators_per_article;
+    const apaNumeric = Number(apa);
+    if (
+      !Number.isFinite(apaNumeric) ||
+      !Number.isInteger(apaNumeric) ||
+      apaNumeric < 2 ||
+      apaNumeric > 10
+    ) {
+      alert(
+        "Invalid 'Annotators Per Article' value. Must be an integer between 2 and 10 inclusive. Value was: " +
+          String(apa)
+      );
+      return;
+    }
+
+    const tt = config.total_target;
+    const ttNumeric = Number(tt);
+    if (!Number.isFinite(ttNumeric) || !Number.isInteger(ttNumeric) || ttNumeric < 1) {
+      alert(
+        "Invalid 'Total Annotation Target' value. Must be a positive integer. Value was: " + String(tt)
+      );
+      return;
+    }
+
     setSaving(true);
     setSuccess(false);
 
     const goldIds = goldInput.split(",").map(id => id.trim()).filter(id => id !== "");
     const adminEmails = adminEmailsInput.split(",").map(email => email.trim().toLowerCase()).filter(email => email !== "");
-    const newConfig = { ...config, gold_article_ids: goldIds, admin_emails: adminEmails };
+    const newConfig: AdminConfig = {
+      ...config,
+      annotators_per_article: apaNumeric,
+      total_target: ttNumeric,
+      gold_article_ids: goldIds,
+      admin_emails: adminEmails,
+    };
 
     try {
       await setDoc(doc(db, "admin_config", "settings"), newConfig);
@@ -88,9 +119,10 @@ export default function Settings() {
               className="w-full px-5 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:ring-2 focus:ring-primary/20 focus:bg-white outline-none transition-all font-bold text-slate-900"
               value={config.annotators_per_article}
               min={2}
+              max={10}
               onChange={(e) => setConfig({ ...config, annotators_per_article: normalizeRequiredAnnotations(e.target.value) })}
             />
-            <p className="text-xs text-slate-400 font-medium italic">Default threshold for new articles. Each imported article stores its own required count.</p>
+            <p className="text-xs text-slate-400 font-medium italic">Default threshold for new articles. Valid range: 2–10. Each imported article stores its own required count.</p>
           </div>
         </div>
 

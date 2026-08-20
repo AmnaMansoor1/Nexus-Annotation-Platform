@@ -11,6 +11,7 @@ import { calculateFleissKappa } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { syncBiasScoreAndStatsAtomically } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
+import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
 
 // Helper to retry async operations with exponential backoff (no generics to avoid errors)
 const retryWithBackoff = async (
@@ -88,23 +89,35 @@ export default function AnnotationWorkbench() {
 
   // Track last loaded article to prevent unnecessary reloads
   const lastLoadedArticleIdRef = useRef<string | null>(null);
-  
+  // Guard to prevent concurrent loadArticle() invocations (fixes hangs)
+  const loadArticleRunningRef = useRef<boolean>(false);
+  // Stable ref for articles cache so callbacks don't churn on cache updates
+  const articlesCacheRef = useRef<Map<string, Article>>(new Map());
+  const setArticlesCacheSync = (updater: (prev: Map<string, Article>) => Map<string, Article>) => {
+    setArticlesCache(prev => {
+      const next = updater(prev);
+      articlesCacheRef.current = next;
+      return next;
+    });
+  };
+
   // Sync our local assignedArticlesState with the one from useArticleAssignment
+  // Always sync — even empty arrays — so switching users on same browser clears stale state.
   useEffect(() => {
-    if (assignedArticles.length > 0) {
-      setAssignedArticlesState(assignedArticles);
-    }
+    setAssignedArticlesState(assignedArticles);
   }, [assignedArticles]);
 
   // Load article from cache or Firestore
+  // Uses articlesCacheRef for lookups (stable) instead of articlesCache state (churns deps).
+  // Prevents infinite useEffect re-triggering when cache updates during loadArticle().
   const loadArticleFromCacheOrDB = useCallback(async (articleId: string): Promise<Article | null> => {
-    if (articlesCache.has(articleId)) {
-      return articlesCache.get(articleId) as Article;
+    if (articlesCacheRef.current.has(articleId)) {
+      return articlesCacheRef.current.get(articleId) as Article;
     }
     const articleDoc = await getDoc(doc(db, "articles", articleId));
     if (articleDoc.exists()) {
       const article = articleDoc.data() as Article;
-      setArticlesCache(prev => {
+      setArticlesCacheSync(prev => {
         const newCache = new Map(prev);
         newCache.set(articleId, article);
         return newCache;
@@ -112,7 +125,7 @@ export default function AnnotationWorkbench() {
       return article;
     }
     return null;
-  }, [articlesCache]);
+  }, []);
 
   // Preload next article
   const preloadNextArticle = useCallback(async (nextIndex: number): Promise<void> => {
@@ -156,12 +169,13 @@ export default function AnnotationWorkbench() {
 
   // Load current article based on assigned pool and local completed state
   useEffect(() => {
-    const TS = () => `[${new Date().toISOString()}]`;
-    console.log(`${TS()} [A-EVIDENCE-b] useEffect TRIGGERED → deps changed. assignedArticlesState.len=${assignedArticlesState.length}, completedArticles.len=${completedArticles.length}, assignmentLoading=${assignmentLoading}, currentArticle?.id=${currentArticle?.article_id || "(none)"}, lastLoadedRef=${lastLoadedArticleIdRef.current || "(empty)"}`);
     async function loadArticle() {
-      console.log(`${TS()} [A-EVIDENCE-b] loadArticle() ENTERED`);
+      if (loadArticleRunningRef.current) {
+        return;
+      }
+      loadArticleRunningRef.current = true;
+      try {
       if (assignedArticlesState.length === 0) {
-        console.log(`${TS()} [A-EVIDENCE-b] loadArticle() EXIT early → assignedArticlesState empty. assignmentLoading=${assignmentLoading}. setLoading(false).`);
         if (!assignmentLoading) setLoading(false);
         return;
       }
@@ -169,12 +183,9 @@ export default function AnnotationWorkbench() {
       const firstPendingIndex = assignedArticlesState.findIndex(id => !completedArticles.includes(id));
       
       if (firstPendingIndex === -1) {
-        // Don't navigate to /done unless we actually have 20 completed!
         if (!assignmentLoading && completedArticles.length >= 20) {
-          console.log(`${TS()} [A-EVIDENCE-b] loadArticle() EXIT → all done, navigate("/done")`);
           navigate("/done");
         } else if (!assignmentLoading) {
-          console.log(`${TS()} [A-EVIDENCE-b] loadArticle() EXIT → firstPendingIndex=-1, completed<20. setLoading(false).`);
           setLoading(false);
         }
         return;
@@ -183,36 +194,32 @@ export default function AnnotationWorkbench() {
       try {
         setCurrentIndex(firstPendingIndex);
         const articleId = assignedArticlesState[firstPendingIndex];
-        console.log(`${TS()} [A-EVIDENCE-b] loadArticle() candidate → firstPendingIndex=${firstPendingIndex}, articleId=${articleId}. Guard: lastLoadedRef===articleId? ${lastLoadedArticleIdRef.current === articleId}`);
         
-        // Only reset label and reload if we're getting a NEW article!
         if (articleId !== lastLoadedArticleIdRef.current) {
           lastLoadedArticleIdRef.current = articleId;
-          console.log(`${TS()} [A-EVIDENCE-b] loadArticle() GUARD PASSED → will load NEW article from Firestore/cache: ${articleId}. SET lastLoadedRef=${articleId}.`);
           
           const article = await loadArticleFromCacheOrDB(articleId);
           
           if (article) {
-            console.log(`${TS()} [A-EVIDENCE-b] loadArticle() ARTICLE LOADED OK → ${articleId}. Now setCurrentArticle + setStartTime + setLabel(null) + preloadNext index=${firstPendingIndex + 1}`);
             setCurrentArticle(article);
             setStartTime(Date.now());
             setTimerExpired(false);
             setLabel(null);
             
-            // Preload the next article right away!
             await preloadNextArticle(firstPendingIndex + 1);
-            console.log(`${TS()} [A-EVIDENCE-b] loadArticle() preloadNextArticle done → final setLoading(false) about to fire in finally{}`);
           } else {
-            console.warn(`${TS()} [A-EVIDENCE-b] loadArticle() loadArticleFromCacheOrDB(${articleId}) RETURNED NULL/UNDEFINED! Article may not exist in Firestore.`);
+            console.warn(`[AnnotationWorkbench] loadArticleFromCacheOrDB(${articleId}) returned null/undefined — article may not exist in Firestore.`);
           }
         } else {
-          console.log(`${TS()} [A-EVIDENCE-b] loadArticle() GUARD SKIPPED → lastLoadedRef already matches ${articleId}. NO-OP. setLoading(false).`);
           setLoading(false);
         }
       } catch (err) {
         console.error("Error loading article:", err);
       } finally {
         setLoading(false);
+      }
+      } finally {
+        loadArticleRunningRef.current = false;
       }
     }
 
@@ -294,7 +301,7 @@ export default function AnnotationWorkbench() {
           const oldStatus = articleData.status;
           const newCount = (articleData.annotation_count || 0) + 1;
           let newStatus = oldStatus;
-          if (newCount >= 5) newStatus = "complete";
+          if (newCount >= DEFAULT_REQUIRED_ANNOTATIONS) newStatus = "complete";
           else if (newCount > 0) newStatus = "partial";
 
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);
@@ -418,12 +425,8 @@ export default function AnnotationWorkbench() {
 
       // If we still don't have a next article, and haven't reached 20 completed, try to load more!
       if (nextPendingIndex === -1 && latestCompletedArticles.length < 20) {
-        const TS_ = () => `[${new Date().toISOString()}]`;
-        console.log(`${TS_()} [A-EVIDENCE-c] HANDLE-SUBMIT LOAD-MORE BRANCH → nextPendingIndex=-1, completed=${latestCompletedArticles.length}. Step 1: setAssignmentRefresh(prev + 1). Step 2: await loadAssignment(). [PATH: AnnotationWorkbench.tsx ~L421]`);
         setAssignmentRefresh(prev => prev + 1);
-        console.log(`${TS_()} [A-EVIDENCE-c] setAssignmentRefresh() FLUSHED → about to AWAIT loadAssignment() directly (this is DOUBLE-INVOCATION #2: the useEffect in useArticleAssignment.ts will fire separately because refreshTrigger changed).`);
         await loadAssignment();
-        console.log(`${TS_()} [A-EVIDENCE-c] await loadAssignment() → PROMISE RESOLVED. assignmentLoading is currently=${assignmentLoading}. Now re-reading annotator doc.`);
         
         // Get the VERY latest data after loadAssignment completes
         const afterLoadAnnotatorDoc = await safeGetDoc(doc(db, "annotators", sanitizeEmailForDocId(userEmail)));
@@ -447,25 +450,20 @@ export default function AnnotationWorkbench() {
       setSubmitting(false);
 
       if (nextPendingIndex !== -1) {
-        const TS_a = () => `[${new Date().toISOString()}]`;
-        console.log(`${TS_a()} [A-EVIDENCE-a] HANDLE-SUBMIT INLINE NEXT-ARTICLE LOAD → nextPendingIndex=${nextPendingIndex}, nextArticleId=${latestAssignedArticles[nextPendingIndex]}. (This is the INLINE path ~L446. The useEffect loadArticle() will ALSO run again because setCompletedArticles was called at L387, updating the effect's dependency array. EXPECT DUPLICATE A-EVIDENCE-b logs after this.)`);
-        console.log(`${TS_a()} [A-EVIDENCE-a] ⚠️  LAST-LOADED REF STATE before inline load: lastLoadedArticleIdRef.current=${lastLoadedArticleIdRef.current}. Guard says loadArticle() will do work ONLY IF this ref !== ${latestAssignedArticles[nextPendingIndex]}. If they MATCH after inline load, useEffect loadArticle() will be a NO-OP but its finally block still sets loading=false.`);
         // Load the next article directly from latestAssignedArticles
         const nextArticleId = latestAssignedArticles[nextPendingIndex];
         const newNextArticle = await loadArticleFromCacheOrDB(nextArticleId);
         if (newNextArticle) {
-          console.log(`${TS_a()} [A-EVIDENCE-a] INLINE LOAD: loadArticleFromCacheOrDB(${nextArticleId}) SUCCEEDED. Calling: setCurrentIndex, setCurrentArticle, setStartTime, setTimerExpired, setLabel(null), setNextArticle(null). → THESE STATE SETS WILL RE-TRIGGER THE LOADARTICLE USEEFFECT.`);
           setCurrentIndex(nextPendingIndex);
           setCurrentArticle(newNextArticle);
           setStartTime(Date.now());
           setTimerExpired(false);
           setLabel(null);
           setNextArticle(null); // Clear stale next article
-          console.log(`${TS_a()} [A-EVIDENCE-a] INLINE LOAD: state writes done. Background preloadNextArticle(${nextPendingIndex + 1}) next. At this point: submitting=false was set above. loading spinner should NOT be visible. If hangs after this log: it's because useEffect re-runs and never reaches its finally{setLoading(false)}.`);
           // Preload next one in the BACKGROUND (no await, faster UI).
           preloadNextArticle(nextPendingIndex + 1).catch(() => {});
         } else {
-          console.warn(`${TS_a()} [A-EVIDENCE-a] INLINE LOAD FAILED: loadArticleFromCacheOrDB(${nextArticleId}) returned NULL. Check Firestore/console for permission errors.`);
+          console.warn(`[AnnotationWorkbench] handleSubmit inline load failed: loadArticleFromCacheOrDB(${nextArticleId}) returned null. Check Firestore/console for permission errors.`);
           // If we still don't have 20 completed, don't navigate away yet!
           if (latestCompletedArticles.length < 20) {
             console.warn("[AnnotationWorkbench] Next article not found, but we haven't completed 20 yet—waiting for more articles!");

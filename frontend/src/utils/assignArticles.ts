@@ -25,8 +25,8 @@ export function isEligible(article: Article, email: string, requiredAnnotations:
   const okStatus = article.status === "pending" || article.status === "partial";
   if (!okStatus) return { ok: false, reason: `status=${article.status}` };
 
-  if (article.annotation_count >= 5 && article.status !== "complete") {
-    return { ok: false, reason: `consistency-err: status=${article.status} but annotation_count=${article.annotation_count}>=5` };
+  if (article.annotation_count >= requiredAnnotations && article.status !== "complete") {
+    return { ok: false, reason: `consistency-err: status=${article.status} but annotation_count=${article.annotation_count}>=${requiredAnnotations}` };
   }
   if (article.status === "partial" && article.annotation_count === 0) {
     return { ok: false, reason: `consistency-err: status=partial but annotation_count=0` };
