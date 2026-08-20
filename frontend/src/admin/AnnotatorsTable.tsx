@@ -64,11 +64,18 @@ export default function AnnotatorsTable() {
       ? annotator.completed_articles.length
       : 0;
 
+    const assignedOnlyLocal = Array.isArray(annotator.assigned_articles)
+      ? annotator.assigned_articles.filter(Boolean).length
+      : 0;
+    const completedLocal = Array.isArray(annotator.completed_articles)
+      ? annotator.completed_articles.filter(Boolean).length
+      : 0;
+
     const msg =
       `⚠️  PERMANENTLY DELETE annotator: ${email}\n\n` +
       `This will:\n` +
       `  • Delete their annotator profile\n` +
-      `  • REMOVE ALL ${completedCount} of their annotations AND free up their assigned slots\n` +
+      `  • Free ${completedLocal} completed annotations + ${assignedOnlyLocal - completedLocal >= 0 ? (assignedOnlyLocal - completedLocal) : 0} assigned-but-unfinished slots\n` +
       `  • Decrement annotation_count + assigned_count on every affected article\n` +
       `  • Recompute status; bias_score/fleiss_kappa recalculated ONLY when exactly 5 labels remain\n` +
       `  • Update ALL dashboard counters (annotator count, status buckets, bias sum/avg)\n\n` +
@@ -93,11 +100,18 @@ export default function AnnotatorsTable() {
       const annotatorRef = doc(db, "annotators", docId);
       const statsRef = doc(db, "stats", "platform_summary");
 
-      const articleIdsFromAnnotator = Array.isArray(annotator.completed_articles)
+      const completedArticleIds = Array.isArray(annotator.completed_articles)
         ? [...new Set(annotator.completed_articles.filter(Boolean))]
         : [];
+      const assignedArticleIds = Array.isArray(annotator.assigned_articles)
+        ? [...new Set(annotator.assigned_articles.filter(Boolean))]
+        : [];
+      const articleIdsFromAnnotator = [...new Set([...completedArticleIds, ...assignedArticleIds])];
 
-      console.log(`[HardDelete:${email}] Articles listed in completed_articles:`, articleIdsFromAnnotator.length);
+      const completedCount = completedArticleIds.length;
+      const assignedOnlyCount = articleIdsFromAnnotator.length - completedCount;
+
+      console.log(`[HardDelete:${email}] Articles to process: ${articleIdsFromAnnotator.length} (completed=${completedCount}, assigned-only=${assignedOnlyCount})`);
 
       const errors: string[] = [];
       let articleBecameIncomplete = 0;

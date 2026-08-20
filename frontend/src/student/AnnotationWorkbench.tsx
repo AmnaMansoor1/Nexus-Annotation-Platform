@@ -338,12 +338,6 @@ export default function AnnotationWorkbench() {
 
         (async () => {
           try {
-            const annotatorRefresh = await getDoc(annotatorRef);
-            if (annotatorRefresh.exists()) {
-              const newData = annotatorRefresh.data() as Annotator;
-              setCompletedArticles(newData.completed_articles || []);
-              setCompletedCount(Math.min(newData.completed_articles?.length || 0, 20));
-            }
             let finalBiasScore = 0;
             if (statusChangedTo === "complete") {
               const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
@@ -445,51 +439,43 @@ export default function AnnotationWorkbench() {
           latestAssignedArticles = afterLoadData.assigned_articles || [];
           latestCompletedArticles = afterLoadData.completed_articles || [];
           
-          // Update our state with this new data
-          setAssignedArticlesState(latestAssignedArticles);
-          setCompletedArticles(latestCompletedArticles);
-          setCompletedCount(latestCompletedArticles.length);
-          
           // Check again for a next pending index
           nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
         }
       }
-      
-      // Unblock the submit button BEFORE awaiting next-article loads, so the
-      // button is definitely enabled if anything goes slowly below.
-      setSubmitting(false);
 
-      if (nextPendingIndex !== -1) {
-        // Load the next article directly from latestAssignedArticles
-        const nextArticleId = latestAssignedArticles[nextPendingIndex];
-        const newNextArticle = await loadArticleFromCacheOrDB(nextArticleId);
-        if (newNextArticle) {
-          setCurrentIndex(nextPendingIndex);
-          setCurrentArticle(newNextArticle);
-          setStartTime(Date.now());
-          setTimerExpired(false);
-          setLabel(null);
-          setNextArticle(null); // Clear stale next article
-          // Preload next one in the BACKGROUND (no await, faster UI).
-          preloadNextArticle(nextPendingIndex + 1).catch(() => {});
-        } else {
-          console.warn(`[AnnotationWorkbench] handleSubmit inline load failed: loadArticleFromCacheOrDB(${nextArticleId}) returned null. Check Firestore/console for permission errors.`);
-          // If we still don't have 20 completed, don't navigate away yet!
-          if (latestCompletedArticles.length < 20) {
-            console.warn("[AnnotationWorkbench] Next article not found, but we haven't completed 20 yet—waiting for more articles!");
-            alert("Waiting for more articles to be assigned. Please refresh the page or try again later.");
-          } else {
-            navigate("/done");
-          }
-        }
-      } else {
-        // Only navigate to /done if we have completed 20 articles!
+      // ── SINGLE SOURCE OF TRUTH: ONE consolidated state update. ──
+      // NEVER call setCurrentIndex / setCurrentArticle from handleSubmit.
+      // The useEffect (lines ~171–229) owns ALL article transitions:
+      //   • It reads assignedArticlesState + completedArticles (which we set here)
+      //   • Uses loadArticleRunningRef guard against concurrent execution
+      //   • Uses lastLoadedArticleIdRef to skip re-loads of the same article
+      //   • Resets startTime / timerExpired / label correctly
+      //   • Preloads the FOLLOWING article after advancing
+      // This eliminates the race where BOTH handleSubmit + useEffect wrote
+      // setCurrentArticle(article2) concurrently (causing TimerRing remount loop
+      // + label reset mid-user-interaction = UI freeze on 2nd article).
+      setAssignedArticlesState(latestAssignedArticles);
+      setCompletedArticles(latestCompletedArticles);
+      setCompletedCount(Math.min(latestCompletedArticles.length, 20));
+
+      if (nextPendingIndex === -1) {
+        setSubmitting(false);
         if (latestCompletedArticles.length >= 20) {
           navigate("/done");
         } else {
           console.warn("[AnnotationWorkbench] No next article, but we haven't completed 20 yet—waiting!");
           alert("You've annotated all available articles! Please check back later for more to reach your 20-article target.");
         }
+      } else {
+        // Submitting ends NOW. The useEffect will take it from here.
+        // Invalidate lastLoadedArticleIdRef so the useEffect RE-LOADS the next
+        // article (finds it via findIndex on latestAssignedArticles / latestCompletedArticles
+        // which we just wrote above) instead of short-circuiting on a stale id.
+        // Setting to null forces the load guard (line: articleId !== lastLoadedRef)
+        // to pass the very next time useEffect runs.
+        lastLoadedArticleIdRef.current = null;
+        setSubmitting(false);
       }
 
     } catch (err: any) {

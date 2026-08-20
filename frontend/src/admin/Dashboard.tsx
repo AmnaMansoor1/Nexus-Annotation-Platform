@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot } from "firebase/firestore";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch } from "firebase/firestore";
+import Papa from "papaparse";
 import { db } from "../firebase";
 import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
 import { getRequiredAnnotations } from "../utils/annotationConfig";
@@ -16,7 +17,8 @@ import {
   Activity,
   Loader2,
   RefreshCw,
-  ShieldAlert
+  ShieldAlert,
+  ListOrdered
 } from "lucide-react";
 
 export default function Dashboard() {
@@ -40,7 +42,101 @@ export default function Dashboard() {
   ]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [repairingSeq, setRepairingSeq] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const seqCsvInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleRepairSequenceNumbers = () => {
+    seqCsvInputRef.current?.click();
+  };
+
+  const onSeqCsvSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!window.confirm(
+      "This will REWRITE sequence_number on ALL 1493 articles using the ORDER in your CSV file.\n\n" +
+      "• Row 1 (after header) → sequence_number = 1\n" +
+      "• Row 2 → sequence_number = 2, ...\n" +
+      "• Last row → sequence_number = 1493\n\n" +
+      "This fixes the bug where articles were assigned NON-sequentially (lexicographic by article_id) instead of in CSV order.\n" +
+      "Required annotator slots are preserved. Only sequence_number is changed.\n\n" +
+      "Only click OK if this is the SAME CSV used to seed the dataset (annotation_dataset_v6.csv).\n\n" +
+      "Proceed?"
+    )) {
+      e.target.value = "";
+      return;
+    }
+
+    setRepairingSeq(true);
+    try {
+      const text = await file.text();
+      const parseResult = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parseResult.errors.length > 0) {
+        throw new Error(`CSV parse error: ${parseResult.errors[0].message}`);
+      }
+      const rows = parseResult.data as Array<{ article_id: string }>;
+      if (!rows[0] || !rows[0].article_id) {
+        throw new Error("CSV missing 'article_id' column in first data row.");
+      }
+      console.log(`[RepairSeq] Parsed ${rows.length} rows from CSV. Building sequence_number map...`);
+
+      // Build Map<article_id, sequence_number (1-based)>
+      const seqByArticleId = new Map<string, number>();
+      let duplicateCount = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const id = rows[i].article_id;
+        if (!id) continue;
+        if (seqByArticleId.has(id)) duplicateCount++;
+        seqByArticleId.set(id, i + 1);
+      }
+      console.log(`[RepairSeq] Map size: ${seqByArticleId.size}. Duplicates found: ${duplicateCount}`);
+
+      // Fetch ALL articles from Firestore
+      const allArticlesSnap = await getDocs(collection(db, "articles"));
+      const totalArticles = allArticlesSnap.size;
+      console.log(`[RepairSeq] Articles in Firestore: ${totalArticles}. Starting batch writes (500/batch)...`);
+
+      const MAX_BATCH = 500;
+      let batch = writeBatch(db);
+      let batchCount = 0;
+      let updatedCount = 0;
+      let missingFromCsv = 0;
+      let unchangedCount = 0;
+
+      for (const docSnap of allArticlesSnap.docs) {
+        const existingSeq = docSnap.get("sequence_number");
+        const newSeq = seqByArticleId.get(docSnap.id);
+        if (newSeq === undefined) { missingFromCsv++; continue; }
+        if (existingSeq === newSeq) { unchangedCount++; continue; }
+        batch.set(doc(db, "articles", docSnap.id), { sequence_number: newSeq }, { merge: true });
+        batchCount++;
+        updatedCount++;
+        if (batchCount >= MAX_BATCH) {
+          await batch.commit();
+          batch = writeBatch(db);
+          batchCount = 0;
+        }
+      }
+      if (batchCount > 0) await batch.commit();
+
+      console.log(`[RepairSeq] DONE. Updated: ${updatedCount}, unchanged: ${unchangedCount}, missing-in-CSV: ${missingFromCsv}`);
+      alert(
+        `✅ sequence_number repair complete.\n\n` +
+        `Articles updated: ${updatedCount}\n` +
+        `Already correct (no-op): ${unchangedCount}\n` +
+        `Missing-in-CSV (skipped): ${missingFromCsv}\n\n` +
+        `CSV first article → seq=1 (${seqByArticleId.size > 0 ? (rows[0].article_id ?? '?') : '?'}).\n` +
+        `CSV last article → seq=${rows.length} (${rows[rows.length-1]?.article_id ?? '?'}).\n\n` +
+        "Next new annotator will receive articles strictly by sequence_number 1, 2, 3,... until each article has 5 annotators, then moves to seq 21, 22, 23,..."
+      );
+    } catch (err: any) {
+      console.error("[RepairSeq] Failed:", err);
+      alert("Failed to repair sequence numbers: " + (err?.message ?? String(err)));
+    } finally {
+      setRepairingSeq(false);
+      if (e.target) e.target.value = "";
+    }
+  };
 
   const applyStatsData = useCallback((data: PlatformSummary) => {
     if ((!data.totalArticles || data.totalArticles === 0) && (data.inProgressArticles > 0 || data.completedArticles > 0)) {
@@ -93,23 +189,128 @@ export default function Dashboard() {
   }, [applyStatsData]);
 
   const handleSyncStats = async () => {
-    if (!window.confirm("This will perform a full scan of your database to recalculate all statistics. Continue?")) return;
-    
+    if (!window.confirm(
+      "This will perform a full database consistency repair and statistics sync.\n\n" +
+      "STEP 1 — Article-Level Repair:\n" +
+      "  • Remove deleted/unknown annotators from every article's assigned_to/annotated_by\n" +
+      "  • Rebuild assigned_count/annotation_count to match ONLY live annotators\n" +
+      "  • Recalculate status (pending/partial/complete) and clear bias_score when count drops\n\n" +
+      "STEP 2 — Rebuild Platform Summary (stats/platform_summary)\n\n" +
+      "This is required after annotator deletions and fixes the 'new users get articles starting at seq 40+' bug.\n\n" +
+      "Continue?"
+    )) return;
+
     setSyncing(true);
     try {
-      console.log("Starting full statistics sync...");
-      
+      console.log("Starting full statistics sync with article consistency repair...");
+
       // 1. Fetch ALL articles and annotators (Note: Use pagination for > 10,000)
       const [articlesSnap, annotatorsSnap] = await Promise.all([
         getDocs(collection(db, "articles")),
         getDocs(collection(db, "annotators"))
       ]);
 
-      const articles = articlesSnap.docs.map(d => d.data() as Article);
-      const annotators = annotatorsSnap.docs.map(d => d.data() as Annotator);
+      const liveAnnotatorEmails = new Set<string>();
+      const annotators: Annotator[] = [];
+      annotatorsSnap.forEach(d => {
+        const a = d.data() as Annotator;
+        annotators.push(a);
+        if (typeof a.email === "string") liveAnnotatorEmails.add(a.email.toLowerCase().trim());
+      });
+      console.log(`[SyncStats] Live annotators found: ${liveAnnotatorEmails.size}. Any article reference to other emails will be repaired.`);
+
       const settingsSnap = await getDoc(doc(db, "admin_config", "settings"));
       const settings = settingsSnap.exists() ? (settingsSnap.data() as AdminConfig) : null;
       const fallbackRequiredAnnotations = getRequiredAnnotations(null, settings);
+
+      // ─────────────────────────────────────────────────────────────
+      // STEP 1 — REPAIR EVERY ARTICLE against live annotators
+      //
+      // Rebuilds assigned_to, assigned_count, annotated_by, annotation_count,
+      // status, bias_score, fleiss_kappa, final_label by considering only
+      // emails whose /annotators doc still EXISTS.
+      // ─────────────────────────────────────────────────────────────
+      let repairedCount = 0;
+      let freedSlotsTotal = 0;
+      const articleDocs = articlesSnap.docs;
+
+      const MAX_BATCH = 500;
+      let batch = writeBatch(db);
+      let batchCount = 0;
+
+      const repairedArticles: Article[] = [];
+
+      for (const docSnap of articleDocs) {
+        const article = docSnap.data() as Article;
+        const requiredAnnotations = getRequiredAnnotations(article, settings);
+
+        const oldAssignedTo = Array.isArray(article.assigned_to) ? article.assigned_to : [];
+        const oldAnnotatedBy = Array.isArray(article.annotated_by) ? article.annotated_by : [];
+        const oldAssignedCount = typeof article.assigned_count === "number" ? article.assigned_count : 0;
+        const oldAnnotationCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
+
+        const newAssignedTo = oldAssignedTo.filter(e =>
+          typeof e === "string" && liveAnnotatorEmails.has(e.toLowerCase().trim())
+        );
+        const newAnnotatedBy = oldAnnotatedBy.filter(e =>
+          typeof e === "string" && liveAnnotatorEmails.has(e.toLowerCase().trim())
+        );
+        const newAssignedCount = newAssignedTo.length;
+        const newAnnotationCount = newAnnotatedBy.length;
+
+        const slotDelta = (oldAssignedCount - newAssignedCount) + (oldAnnotationCount - newAnnotationCount);
+        let needsRepair =
+          oldAssignedCount !== newAssignedCount ||
+          oldAnnotationCount !== newAnnotationCount ||
+          oldAssignedTo.length !== newAssignedTo.length ||
+          oldAnnotatedBy.length !== newAnnotatedBy.length;
+
+        let newStatus: Article["status"] = article.status;
+        if (newAnnotationCount >= requiredAnnotations) newStatus = "complete";
+        else if (newAnnotationCount > 0) newStatus = "partial";
+        else newStatus = "pending";
+
+        if (newStatus !== article.status) needsRepair = true;
+
+        const updates: any = {
+          assigned_to: newAssignedTo,
+          assigned_count: newAssignedCount,
+          annotated_by: newAnnotatedBy,
+          annotation_count: newAnnotationCount,
+          status: newStatus,
+        };
+
+        if (newAnnotationCount < requiredAnnotations) {
+          if (article.bias_score !== null) { updates.bias_score = null; needsRepair = true; }
+          if (article.fleiss_kappa !== null) { updates.fleiss_kappa = null; needsRepair = true; }
+          if (article.final_label !== null) { updates.final_label = null; needsRepair = true; }
+        }
+
+        const repaired: Article = {
+          ...article,
+          ...updates,
+        };
+        repairedArticles.push(repaired);
+
+        if (needsRepair) {
+          repairedCount++;
+          freedSlotsTotal += Math.max(0, slotDelta);
+          if (batchCount >= MAX_BATCH - 10) {
+            await batch.commit();
+            batch = writeBatch(db);
+            batchCount = 0;
+          }
+          batch.set(doc(db, "articles", docSnap.id), updates, { merge: true });
+          batchCount++;
+        }
+      }
+
+      if (batchCount > 0) {
+        await batch.commit();
+      }
+      console.log(`[SyncStats] Article-level repair complete. Repaired: ${repairedCount} articles. Assignment/annotation slots freed: ~${freedSlotsTotal}.`);
+
+      const articles = repairedArticles;
 
       // 2. Calculate category distribution
       const categories = articles.reduce((acc: Record<string, number>, article) => {
@@ -148,9 +349,9 @@ export default function Dashboard() {
         categoryDistribution: categories
       };
 
-      // 4. Update Firestore
+      // 4. Update Firestore summary
       await setDoc(doc(db, "stats", "platform_summary"), newSummary);
-      
+
       // 5. Update local state
       setStats(newSummary);
       setStatusData([
@@ -163,7 +364,13 @@ export default function Dashboard() {
         .sort((a, b) => b.value - a.value)
       );
 
-      alert("Statistics synchronized successfully!");
+      alert(
+        `✅ Consistency Repair & Sync Complete.\n\n` +
+        `Articles repaired: ${repairedCount}\n` +
+        `Assignment slots freed: ${freedSlotsTotal}\n` +
+        `Next new annotator will receive articles starting from the LOWEST sequence_number.\n\n` +
+        `Summary: ${newSummary.pendingArticles} pending / ${newSummary.inProgressArticles} partial / ${newSummary.completedArticles} complete.`
+      );
     } catch (err) {
       console.error("Sync error:", err);
       alert("Failed to sync statistics: " + err);
@@ -207,6 +414,14 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-4">
           <button
+            onClick={handleRepairSequenceNumbers}
+            disabled={repairingSeq || syncing}
+            className="flex items-center gap-2 bg-white px-4 py-2 rounded-xl border border-amber-200 text-amber-700 font-bold text-xs hover:bg-amber-50 transition-all shadow-sm disabled:opacity-50"
+          >
+            <ListOrdered size={14} className={repairingSeq ? "animate-spin" : ""} />
+            {repairingSeq ? "Repairing Seq..." : "Repair Seq (1-1493)"}
+          </button>
+          <button
             onClick={handleSyncStats}
             disabled={syncing}
             className="flex items-center gap-2 bg-white px-4 py-2 rounded-xl border border-slate-200 text-slate-600 font-bold text-xs hover:bg-slate-50 transition-all shadow-sm disabled:opacity-50"
@@ -214,6 +429,13 @@ export default function Dashboard() {
             <RefreshCw size={14} className={syncing ? "animate-spin" : ""} />
             {syncing ? "Syncing..." : "Sync Statistics"}
           </button>
+          <input
+            ref={seqCsvInputRef}
+            type="file"
+            accept=".csv"
+            onChange={onSeqCsvSelected}
+            className="hidden"
+          />
           <div className="flex items-center gap-3 bg-white px-5 py-2.5 rounded-xl border border-slate-100 shadow-sm">
             <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
             <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">System Live</span>

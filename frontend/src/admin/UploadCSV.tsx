@@ -65,7 +65,8 @@ export default function UploadCSV() {
           return { row, exists: docSnap.exists() };
         }));
 
-        for (const { row, exists } of existenceChecks) {
+        for (let chunkIdx = 0; chunkIdx < existenceChecks.length; chunkIdx++) {
+          const { row, exists } = existenceChecks[chunkIdx];
           if (exists) {
             skipped++;
             continue;
@@ -73,6 +74,11 @@ export default function UploadCSV() {
 
           const articleId = row.article_id;
           const docRef = doc(db, "articles", articleId);
+          // Global CSV row index (0-based) → sequence_number (1-based).
+          // This GUARANTEES sequence_number order == CSV row order, so
+          // ART7014F5A8 (row 0 in data) → seq=1, next article seq=2, ...
+          const globalRowIndex = i + chunkIdx;
+          const sequenceNumber = globalRowIndex + 1;
 
           // Build article object, only include gold_expected_label if it exists
           const requiredAnnotations = getRequiredAnnotations(
@@ -104,6 +110,7 @@ export default function UploadCSV() {
             category: row.category || "",
             article_type: (row.article_type as any) || "News Article",
             word_count: parseInt(row.word_count) || 0,
+            sequence_number: sequenceNumber,
             status: "pending",
             required_annotations: requiredAnnotations,
             annotation_count: 0,

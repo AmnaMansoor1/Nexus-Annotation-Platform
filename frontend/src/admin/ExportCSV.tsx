@@ -101,20 +101,9 @@ export default function ExportCSV() {
         row.status = article.status || "";
 
         if (article.label === 0 || article.label === 1) {
-          row.ml_label = article.label;
+          row.label = article.label;
         } else {
-          row.ml_label = "";
-        }
-
-        row.human_label = article.final_label || "";
-        if (article.final_label === "neutral") {
-          row.human_label_numeric = 0;
-        } else if (article.final_label === "slightly_manipulative") {
-          row.human_label_numeric = 1;
-        } else if (article.final_label === "highly_manipulative") {
-          row.human_label_numeric = 2;
-        } else {
-          row.human_label_numeric = "";
+          row.label = "";
         }
 
         const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
@@ -134,14 +123,10 @@ export default function ExportCSV() {
         const majority = majorityLabelFromLabels(responseLabels);
         if (article.final_label) {
           row.human_label = article.final_label;
-          row.human_label_numeric = article.final_label === "neutral" ? 0
-            : article.final_label === "slightly_manipulative" ? 1 : 2;
         } else if (majority.label && majority.numeric !== null) {
           row.human_label = majority.label;
-          row.human_label_numeric = majority.numeric;
         } else {
           row.human_label = "";
-          row.human_label_numeric = "";
         }
 
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {

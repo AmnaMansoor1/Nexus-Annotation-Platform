@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator } from "../types";
@@ -61,12 +61,19 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
   const [assignedArticles, setAssignedArticles] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const loadAssignmentRunningRef = useRef(false);
 
   const loadAssignment = useCallback(async () => {
     if (!email) {
       setLoading(false);
       return;
     }
+
+    if (loadAssignmentRunningRef.current) {
+      console.log("[useArticleAssignment] Re-entrancy guard: loadAssignment already in progress. Skipping this call.");
+      return;
+    }
+    loadAssignmentRunningRef.current = true;
 
     try {
       setLoading(true);
@@ -209,6 +216,7 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
       console.error("[useArticleAssignment] UNEXPECTED TOP-LEVEL ERROR:", err);
       setError("Failed to assign articles: " + (err instanceof Error ? err.message : String(err)));
     } finally {
+      loadAssignmentRunningRef.current = false;
       setLoading(false);
       console.log("[useArticleAssignment] Finished loadAssignment");
     }
