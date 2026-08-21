@@ -211,13 +211,26 @@ export default function Dashboard() {
       ]);
 
       const liveAnnotatorEmails = new Set<string>();
+      const articlesByAssignee = new Map<string, Set<string>>();
       const annotators: Annotator[] = [];
       annotatorsSnap.forEach(d => {
         const a = d.data() as Annotator;
         annotators.push(a);
-        if (typeof a.email === "string") liveAnnotatorEmails.add(a.email.toLowerCase().trim());
+        const email = typeof a.email === "string" ? a.email.toLowerCase().trim() : "";
+        if (!email) return;
+        liveAnnotatorEmails.add(email);
+        const assigned = Array.isArray(a.assigned_articles) ? a.assigned_articles : [];
+        for (const articleId of assigned) {
+          if (!articleId) continue;
+          if (!articlesByAssignee.has(articleId)) articlesByAssignee.set(articleId, new Set());
+          articlesByAssignee.get(articleId)!.add(email);
+        }
       });
-      console.log(`[SyncStats] Live annotators found: ${liveAnnotatorEmails.size}. Any article reference to other emails will be repaired.`);
+      console.log(
+        `[SyncStats] Live annotators found: ${liveAnnotatorEmails.size}.`,
+        `Truth map: ${articlesByAssignee.size} articles with slots.`,
+        `Any reference outside the truth map (ghost assignees) will be repaired.`
+      );
 
       const settingsSnap = await getDoc(doc(db, "admin_config", "settings"));
       const settings = settingsSnap.exists() ? (settingsSnap.data() as AdminConfig) : null;
@@ -249,12 +262,24 @@ export default function Dashboard() {
         const oldAssignedCount = typeof article.assigned_count === "number" ? article.assigned_count : 0;
         const oldAnnotationCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
 
-        const newAssignedTo = oldAssignedTo.filter(e =>
-          typeof e === "string" && liveAnnotatorEmails.has(e.toLowerCase().trim())
-        );
-        const newAnnotatedBy = oldAnnotatedBy.filter(e =>
-          typeof e === "string" && liveAnnotatorEmails.has(e.toLowerCase().trim())
-        );
+        const truthAssignees = articlesByAssignee.get(docSnap.id) ?? new Set<string>();
+        function uniqueEmails(emails: string[], predicate?: (e: string) => boolean): string[] {
+          const seen = new Set<string>();
+          const out: string[] = [];
+          for (const raw of emails) {
+            const n = (raw || "").toLowerCase().trim();
+            if (!n || seen.has(n)) continue;
+            if (predicate && !predicate(n)) continue;
+            seen.add(n);
+            out.push(n);
+          }
+          return out;
+        }
+
+        const newAssignedTo = truthAssignees.size > 0
+          ? uniqueEmails([...truthAssignees])
+          : uniqueEmails(oldAssignedTo, (e) => liveAnnotatorEmails.has(e));
+        const newAnnotatedBy = uniqueEmails(oldAnnotatedBy, (e) => liveAnnotatorEmails.has(e));
         const newAssignedCount = newAssignedTo.length;
         const newAnnotationCount = newAnnotatedBy.length;
 

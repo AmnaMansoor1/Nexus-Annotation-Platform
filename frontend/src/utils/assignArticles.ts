@@ -2,6 +2,7 @@ import { collection, query, where, getDocs, doc, getDoc, limit, orderBy, runTran
 import { db } from "../firebase";
 import { Article, AdminConfig } from "../types";
 import { getRequiredAnnotations } from "./annotationConfig";
+import { fetchAnnotatorContext, healArticles, AnnotatorContext } from "./reconcileArticle";
 
 const randomDelay = (min: number = 100, max: number = 1000) =>
   new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
@@ -92,6 +93,28 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
 
   const articlesRef = collection(db, "articles");
   let eligibleArticles: Article[] = [];
+  const allHealedById = new Map<string, Article>();
+  const emailNorm = email.toLowerCase().trim();
+
+  let annotatorCtx: AnnotatorContext;
+  try {
+    annotatorCtx = await fetchAnnotatorContext();
+    console.log("[assignArticlesForAnnotator] Live annotators for self-heal:", annotatorCtx.liveEmails.size,
+      "Truth-assignees populated for", annotatorCtx.articlesByAssignee.size, "articles.");
+  } catch (err) {
+    console.warn("[assignArticlesForAnnotator] Could not load live annotators; skipping self-heal.", err);
+    annotatorCtx = { liveEmails: new Set(), articlesByAssignee: new Map() };
+  }
+
+  async function healDocSnaps(
+    docs: Array<{ id: string; data: () => Record<string, unknown> }>
+  ): Promise<Article[]> {
+    const raws = docs.map((d) => ({
+      ...(d.data() as Partial<Article>),
+      article_id: (d.data().article_id as string) || d.id,
+    }));
+    return healArticles(raws, annotatorCtx, adminConfig);
+  }
 
   // ─────────────────────────────────────────────────────────────────
   // STRATEGY A (PRIMARY) — uses composite index:
@@ -111,10 +134,11 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
     const strategyASnap = await getDocs(strategyAQ);
     console.log("[assignArticlesForAnnotator] Strategy A returned", strategyASnap.size, "docs");
 
+    const healedBatch = await healDocSnaps(strategyASnap.docs);
+    for (const a of healedBatch) allHealedById.set(a.article_id, a);
     const inconsistencies: string[] = [];
     const candidates: Article[] = [];
-    for (const docSnap of strategyASnap.docs) {
-      const article = normalizeArticle(docSnap.data());
+    for (const article of healedBatch) {
       const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
       const check = isEligible(article, email, requiredAnnotations);
       if (!check.ok) {
@@ -149,13 +173,13 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       const fallbackSnap = await getDocs(fallbackQ);
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
 
+      const healedFallback = await healDocSnaps(fallbackSnap.docs);
+      for (const a of healedFallback) allHealedById.set(a.article_id, a);
       const alreadySeen = new Set(eligibleArticles.map(a => a.article_id));
       const inconsistencies: string[] = [];
-      for (const docSnap of fallbackSnap.docs) {
+      for (const article of healedFallback) {
         if (eligibleArticles.length >= 20) break;
-        const data = docSnap.data();
-        if (alreadySeen.has(data.article_id)) continue;
-        const article = normalizeArticle(data);
+        if (alreadySeen.has(article.article_id)) continue;
         const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
         const check = isEligible(article, email, requiredAnnotations);
         if (!check.ok) {
@@ -178,29 +202,88 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   }
 
   console.log("[assignArticlesForAnnotator] Total eligible articles found:", eligibleArticles.length);
-  if (eligibleArticles.length === 0) {
-    console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND. Check: 1) Do articles exist? 2) Do they have status=pending/partial? 3) assigned_count<required_annotations? 4) Not already assigned to this user?");
+
+  const alreadyMineFromHealed = [...allHealedById.values()]
+    .filter((a) =>
+      (a.assigned_to || []).some((e) => typeof e === "string" && e.toLowerCase().trim() === emailNorm)
+    );
+
+  const alreadyMineFromTruthIds = annotatorCtx.articlesByAssignee.size > 0
+    ? [ ...annotatorCtx.articlesByAssignee.entries() ]
+        .filter(([, emails]) => emails.has(emailNorm))
+        .map(([articleId]) => articleId)
+    : [];
+
+  const alreadyMineFromTruth: Article[] = [];
+  if (alreadyMineFromTruthIds.length > 0) {
+    const missing = alreadyMineFromTruthIds.filter((id) => !allHealedById.has(id));
+    if (missing.length > 0) {
+      try {
+        const snaps = await Promise.all(missing.map((id) => getDoc(doc(db, "articles", id))));
+        for (const snap of snaps) {
+          if (snap.exists()) {
+            const raw = { ...(snap.data() as Partial<Article>), article_id: snap.id };
+            const healedArr = annotatorCtx.liveEmails.size > 0 || annotatorCtx.articlesByAssignee.size > 0
+              ? await healArticles([raw], annotatorCtx, adminConfig)
+              : [normalizeArticle(raw)];
+            const healed = healedArr[0];
+            allHealedById.set(healed.article_id, healed);
+          }
+        }
+      } catch (e) {
+        console.warn("[assignArticlesForAnnotator] Could not fetch already-articles:", e);
+      }
+    }
+    for (const id of alreadyMineFromTruthIds) {
+      const a = allHealedById.get(id);
+      if (a) alreadyMineFromTruth.push(a);
+    }
+  }
+
+  const alreadyMineMap = new Map<string, Article>();
+  for (const a of alreadyMineFromHealed) alreadyMineMap.set(a.article_id, a);
+  for (const a of alreadyMineFromTruth) alreadyMineMap.set(a.article_id, a);
+
+  const alreadyMineArticles = [ ...alreadyMineMap.values() ]
+    .sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
+
+  const alreadyMineIds = alreadyMineArticles.map((a) => a.article_id);
+  const alreadyMineSet = new Set(alreadyMineIds);
+
+  eligibleArticles.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
+  const newSlotsNeeded = Math.max(0, 20 - alreadyMineIds.length);
+  const newToAssign = eligibleArticles
+    .filter((a) => !alreadyMineSet.has(a.article_id))
+    .slice(0, newSlotsNeeded);
+
+  const selectedArticles = [...alreadyMineArticles, ...newToAssign].slice(0, 20);
+  const selectedIds = selectedArticles.map((a) => a.article_id);
+  const idsNeedingWrite = newToAssign.map((a) => a.article_id);
+
+  if (selectedIds.length === 0) {
+    console.warn("[assignArticlesForAnnotator] ❌ NO ELIGIBLE ARTICLES FOUND.");
     return [];
   }
 
-  eligibleArticles.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
-  const selectedArticles = eligibleArticles.slice(0, 20);
-  const selectedIds = selectedArticles.map(a => a.article_id);
-  console.log("[assignArticlesForAnnotator] Selected article IDs (sequential by sequence_number,", selectedIds.length, "):", selectedIds.map((id, i) => `${id}#seq=${(selectedArticles[i] as any).sequence_number}`).join(", "));
+  console.log(
+    "[assignArticlesForAnnotator] Selected (sequential by sequence_number):",
+    selectedIds.map((id, i) => `${id}#seq=${(selectedArticles[i] as any).sequence_number}`).join(", ")
+  );
+  if (alreadyMineIds.length > 0) {
+    console.log("[assignArticlesForAnnotator] Already assigned to user (kept):", alreadyMineIds.length);
+  }
 
   const finalAssignment = [...selectedIds];
-  console.log("[assignArticlesForAnnotator] Final assignment (", finalAssignment.length, "articles):", finalAssignment);
 
-  if (selectedIds.length > 0) {
+  if (idsNeedingWrite.length > 0) {
     try {
-      console.log("[assignArticlesForAnnotator] Starting article assignment writes for", selectedIds.length, "articles");
+      console.log("[assignArticlesForAnnotator] Writing", idsNeedingWrite.length, "new assignment slot(s)");
       const batch = writeBatch(db);
       let batchCount = 0;
       const MAX_BATCH_SIZE = 500;
 
-      for (const articleId of selectedIds) {
+      for (const articleId of idsNeedingWrite) {
         if (batchCount >= MAX_BATCH_SIZE - 10) {
-          console.log("[assignArticlesForAnnotator] Committing intermediate batch with", batchCount, "writes");
           await batch.commit();
           batchCount = 0;
         }
@@ -213,15 +296,14 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       }
 
       if (batchCount > 0) {
-        console.log("[assignArticlesForAnnotator] Committing final batch with", batchCount, "writes");
         await batch.commit();
         console.log("[assignArticlesForAnnotator] ✅ Batch write SUCCESSFUL!");
       }
     } catch (e) {
       console.error("[assignArticlesForAnnotator] ❌ Batch write FAILED:", e);
       let successCount = 0;
-      const successfulIds: string[] = [];
-      for (const articleId of selectedIds) {
+      const successfulIds: string[] = [...alreadyMineIds];
+      for (const articleId of idsNeedingWrite) {
         try {
           const articleRef = doc(db, "articles", articleId);
           await runTransaction(db, async (tx) => {
@@ -241,9 +323,8 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
           console.warn("[assignArticlesForAnnotator] Single-article write failed for", articleId, ":", perr);
         }
       }
-      console.log("[assignArticlesForAnnotator] Fallback individually wrote", successCount, "/", selectedIds.length, "articles");
-      console.log("[assignArticlesForAnnotator] Returning fallback assignment:", successfulIds);
-      return successfulIds;
+      console.log("[assignArticlesForAnnotator] Fallback wrote", successCount, "new slot(s)");
+      return successfulIds.slice(0, 20);
     }
   }
 

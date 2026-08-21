@@ -1,11 +1,30 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc, collection, getDocs, limit, orderBy, query, where, writeBatch } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator } from "../types";
 import { assignArticlesForAnnotator } from "../utils/assignArticles";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
+import { fetchAnnotatorContext, healArticles } from "../utils/reconcileArticle";
 
-const CACHE_KEY_PREFIX = "nexus_assignment_cache_v1_";
+const CACHE_KEY_PREFIX = "nexus_assignment_cache_v2_";
+const LEGACY_CACHE_KEY_PREFIX = "nexus_assignment_cache_v1_";
+
+function clearLegacyCache(email: string): void {
+  try {
+    localStorage.removeItem(LEGACY_CACHE_KEY_PREFIX + sanitizeEmailForDocId(email));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function clearAssignmentCache(email: string): void {
+  try {
+    localStorage.removeItem(getCacheKey(email));
+    clearLegacyCache(email);
+  } catch {
+    /* ignore */
+  }
+}
 
 interface AssignmentCache {
   email: string;
@@ -57,6 +76,121 @@ function arraysEqualAsSets(a: string[], b: string[]): boolean {
   return true;
 }
 
+/**
+ * Lightweight self-heal for annotators who already have ≥20 assigned articles.
+ *
+ * Strategy A/B query is normally skipped in the ≥20 branch, which means
+ * article-level ghost assigned_to/assigned_count never get repaired. This
+ * function runs a cheap self-heal on the first 150 candidate articles so
+ * counts stay healthy even without running the full assignment select.
+ *
+ * Also guarantees the annotator doc's assigned_articles[] is the SINGLE
+ * source of truth — if it holds article IDs that are missing from article
+ * assigned_to, those are re-added to the articles (prevents drift when
+ * article writes fail mid-flight). Returns the deduplicated, authoritative
+ * assigned list derived from annotatorContext truth plus annotator-doc
+ * entries (merged, deduped).
+ */
+async function lightSelfHeal(
+  email: string,
+  assignedArticles: string[],
+  completedArticles: string[]
+): Promise<{ assigned: string[]; repaired: boolean }> {
+  const emailNorm = email.toLowerCase().trim();
+  let annotatorCtx;
+  try {
+    annotatorCtx = await fetchAnnotatorContext();
+  } catch {
+    return {
+      assigned: [...new Set(assignedArticles.filter(Boolean))],
+      repaired: false,
+    };
+  }
+
+  let repaired = false;
+  try {
+    const strategyAQ = query(
+      collection(db, "articles"),
+      where("status", "in", ["pending", "partial"]),
+      orderBy("sequence_number", "asc"),
+      limit(150)
+    );
+    const snap = await getDocs(strategyAQ);
+    const raws = snap.docs.map((d) => ({
+      ...(d.data() as any),
+      article_id: d.id,
+    }));
+    const preRepair = raws.filter(r => {
+      const ac = typeof r.assigned_count === "number" ? r.assigned_count : 0;
+      const at = Array.isArray(r.assigned_to) ? r.assigned_to : [];
+      return ac !== at.length;
+    }).length;
+    await healArticles(raws, annotatorCtx, undefined);
+    const postRepair = raws.length - preRepair;
+    if (postRepair > 0) repaired = true;
+  } catch (e) {
+    try {
+      const fbQ = query(collection(db, "articles"), orderBy("sequence_number", "asc"), limit(300));
+      const fbSnap = await getDocs(fbQ);
+      const raws = fbSnap.docs.map((d) => ({ ...(d.data() as any), article_id: d.id }));
+      await healArticles(raws, annotatorCtx, undefined);
+      repaired = true;
+    } catch (_) { /* ignore */ }
+  }
+
+  const truths = annotatorCtx.articlesByAssignee;
+  const dedupedAssigned = [...new Set(assignedArticles.filter(Boolean))];
+
+  const missingSyncIds: string[] = [];
+  for (const id of dedupedAssigned) {
+    if (!id) continue;
+    const truthEmails = truths.get(id);
+    const inAnnotatorTruth = truthEmails && truthEmails.has(emailNorm);
+    if (!inAnnotatorTruth) {
+      missingSyncIds.push(id);
+    }
+  }
+  void completedArticles;
+
+  if (missingSyncIds.length > 0) {
+    try {
+      const docs = await Promise.all(
+        missingSyncIds.map((id) => getDoc(doc(db, "articles", id)))
+      );
+      const syncBatch = writeBatch(db);
+      let batched = 0;
+      for (let i = 0; i < docs.length; i++) {
+        const snap = docs[i];
+        const id = missingSyncIds[i];
+        if (!snap.exists()) continue;
+        const data = snap.data() as any;
+        const currentAssignedTo = Array.isArray(data.assigned_to) ? data.assigned_to : [];
+        const currentCount = typeof data.assigned_count === "number" ? data.assigned_count : 0;
+        const hasEmail = currentAssignedTo.some(
+          (e: any) => typeof e === "string" && e.toLowerCase().trim() === emailNorm
+        );
+        if (!hasEmail) {
+          const next = Array.from(new Set([...currentAssignedTo, email])).filter(Boolean);
+          syncBatch.set(doc(db, "articles", id), {
+            assigned_to: next,
+            assigned_count: Math.max(currentCount + 1, next.length),
+          }, { merge: true });
+          batched++;
+        }
+      }
+      if (batched > 0) {
+        await syncBatch.commit();
+        repaired = true;
+        console.log(`[lightSelfHeal] Re-synced ${batched} article reverse-index slots for annotator ${emailNorm}.`);
+      }
+    } catch (syncErr) {
+      console.warn("[lightSelfHeal] Reverse-index sync pass failed:", syncErr);
+    }
+  }
+
+  return { assigned: dedupedAssigned, repaired };
+}
+
 export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
   const [assignedArticles, setAssignedArticles] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,6 +239,7 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
       let completed: string[] = [];
 
       if (annotatorDoc.exists()) {
+        clearLegacyCache(email);
         const data = annotatorDoc.data() as Annotator;
         currentAssignment = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : [];
         completed = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : [];
@@ -114,18 +249,25 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
         });
 
         const cache = readCache(email);
-        if (cache) {
+        if (cache && currentAssignment.length >= 20) {
           const assignedMatch = arraysEqualAsSets(cache.assigned_articles, currentAssignment);
           const completedMatch = arraysEqualAsSets(cache.completed_articles, completed);
           if (assignedMatch && completedMatch && currentAssignment.length > 0) {
-            console.log(`[useArticleAssignment] CACHE HIT. assigned=${currentAssignment.length}, completed=${completed.length}. Skipping Strategy A/B query. READS SAVED: ~100 (Strategy A) + up to 500 (Strategy B fallback) = 600 reads avoided.`);
+            console.log(`[useArticleAssignment] CACHE HIT (≥20 branch). assigned=${currentAssignment.length}. Running lightSelfHeal to keep counts healthy while returning authoritative list.`);
+            try {
+              void lightSelfHeal(email, currentAssignment, completed);
+            } catch (_) { /* fire-and-forget */ }
             setAssignedArticles(currentAssignment);
             setLoading(false);
             return;
           }
-          console.log(`[useArticleAssignment] CACHE MISS (assignedMatch=${assignedMatch}, completedMatch=${completedMatch}). Running assignment query.`);
-        } else {
-          console.log("[useArticleAssignment] No cache found. Running assignment query.");
+          console.log(`[useArticleAssignment] CACHE MISS ≥20 branch (assignedMatch=${assignedMatch}, completedMatch=${completedMatch}). Will NOT skip — running lightSelfHeal + returning server list.`);
+        } else if (cache && currentAssignment.length < 20) {
+          const assignedMatch = arraysEqualAsSets(cache.assigned_articles, currentAssignment);
+          const completedMatch = arraysEqualAsSets(cache.completed_articles, completed);
+          if (assignedMatch && completedMatch && currentAssignment.length > 0) {
+            console.log(`[useArticleAssignment] CACHE HIT (<20 branch) but assigned < 20 — WILL IGNORE CACHE and run assignment query to fetch remaining articles. READS SAVED on subsequent login after 20 reached.`);
+          }
         }
       } else {
         console.warn("[useArticleAssignment] Annotator doc MISSING. Creating now for:", email);
@@ -167,17 +309,8 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
         console.log("[useArticleAssignment] assignArticlesForAnnotator returned:", moreArticles.length, "articles:", moreArticles);
 
         if (moreArticles.length > 0) {
-          const assignedSet = new Set(currentAssignment);
-          const completedSet = new Set(completed);
-          const trulyNew: string[] = [];
-          for (const id of moreArticles) {
-            if (id && !assignedSet.has(id) && !completedSet.has(id)) {
-              trulyNew.push(id);
-              assignedSet.add(id);
-            }
-          }
-          const mergedAssignment = [...currentAssignment, ...trulyNew].slice(0, 20);
-          console.log("[useArticleAssignment] Truly new articles:", trulyNew.length, ". Merged assignment (", mergedAssignment.length, "):", mergedAssignment);
+          const mergedAssignment = moreArticles.slice(0, 20);
+          console.log("[useArticleAssignment] Authoritative assignment (", mergedAssignment.length, "):", mergedAssignment);
 
           const assignmentChanged = mergedAssignment.length !== currentAssignment.length
             || mergedAssignment.some((v, i) => v !== currentAssignment[i]);
@@ -207,7 +340,10 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
           }
         }
       } else {
-        console.log("[useArticleAssignment] Already have", currentAssignment.length, "articles (>= 20). Not fetching more.");
+        console.log("[useArticleAssignment] Already have", currentAssignment.length, "articles (>= 20). Light self-heal kicked off; returning server-authoritative list.");
+        try {
+          void lightSelfHeal(email, currentAssignment, completed);
+        } catch (_) { /* fire-and-forget */ }
         setAssignedArticles(currentAssignment);
         writeCache(email, currentAssignment, completed);
       }
