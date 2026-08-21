@@ -267,7 +267,6 @@ export default function AnnotationWorkbench() {
         const responseRef = doc(db, "annotations", articleId, "responses", sanitizeEmailForDocId(userEmail));
         const articleRef = doc(db, "articles", articleId);
         const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
-        let statusChangedTo: string | null = null;
 
         // Utility: wrap transaction.get() so PERMISSION_DENIED on a doc that
         // doesn't exist yet (e.g. a brand-new response doc) is treated as a
@@ -291,6 +290,10 @@ export default function AnnotationWorkbench() {
           }
         };
 
+        let finalBiasScoreForStats = 0;
+        let prevStatusForStats: "pending" | "partial" | undefined;
+        let nextStatusForStats: "partial" | "complete" | null = null;
+
         await runTransaction(db, async (transaction) => {
           const responseSnap = await txGetSafe(transaction, responseRef);
           if (responseSnap.exists()) return;
@@ -298,25 +301,86 @@ export default function AnnotationWorkbench() {
           const articleSnap = await txGetSafe(transaction, articleRef);
           if (!articleSnap.exists()) return;
           const articleData = articleSnap.data() as Article;
-          const oldStatus = articleData.status;
-          const newCount = (articleData.annotation_count || 0) + 1;
-          let newStatus = oldStatus;
-          if (newCount >= DEFAULT_REQUIRED_ANNOTATIONS) newStatus = "complete";
-          else if (newCount > 0) newStatus = "partial";
+
+          // Authoritative distinct annotator list from article.annotated_by (sorted, deduped, live-normalised)
+          const emailNorm = userEmail.toLowerCase().trim();
+          const priorAnnotated = Array.isArray(articleData.annotated_by) ? articleData.annotated_by : [];
+          const priorAnnotatorsNormalised = priorAnnotated
+            .map((e) => typeof e === "string" ? e.toLowerCase().trim() : "")
+            .filter((e) => !!e);
+          const priorDistinctAnnotatorSet = new Set(priorAnnotatorsNormalised);
+          const priorDistinctCount = priorDistinctAnnotatorSet.size;
+
+          // Guard: student has already submitted?
+          if (priorDistinctAnnotatorSet.has(emailNorm)) return;
+
+          // Guard: article already has 5 distinct submissions?
+          const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
+          if (priorDistinctCount >= REQUIRED) return;
 
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);
           if (!annotatorSnap.exists()) return;
           const annotatorData = annotatorSnap.data() as Annotator;
 
-          transaction.update(articleRef, {
-            annotation_count: increment(1),
-            annotated_by: arrayUnion(userEmail),
-            status: newStatus
-          });
+          // Single authoritative next state
+          const newAnnotatedBy = Array.from(new Set([...priorAnnotated.map((e: any) => typeof e === "string" ? e.toLowerCase().trim() : "").filter(Boolean), emailNorm]));
+          const newAnnotationCount = newAnnotatedBy.length;
+          let newStatus: Article["status"] = articleData.status;
+          if (newAnnotationCount >= REQUIRED) newStatus = "complete";
+          else if (newAnnotationCount > 0) newStatus = "partial";
+          else newStatus = "pending";
+
+          const articleUpdates: any = {
+            annotation_count: newAnnotationCount,
+            annotated_by: newAnnotatedBy,
+            status: newStatus,
+          };
+
+          // When reaching exactly 5 DISTINCT annotators → compute everything atomically
+          // in the SAME transaction so bias/kappa/final_label can never be missing on completion
+          let completionCounts: { neutral: number; slightly: number; highly: number } | null = null;
+          if (newStatus === "complete" && newAnnotationCount >= REQUIRED) {
+            const responsesSnap = await txGetSafe(transaction, collection(db, "annotations", articleId, "responses"));
+            const priorResponses: any[] = [];
+            try {
+              if (responsesSnap && typeof responsesSnap.docs === "object" && Array.isArray(responsesSnap.docs)) {
+                for (const d of responsesSnap.docs) priorResponses.push(d.data());
+              }
+            } catch { /* safe — no responses */ }
+            const allCounts = { neutral: 0, slightly: 0, highly: 0 };
+            for (const r of priorResponses) {
+              if (r.label === "neutral") allCounts.neutral++;
+              else if (r.label === "slightly_manipulative") allCounts.slightly++;
+              else if (r.label === "highly_manipulative") allCounts.highly++;
+            }
+            if (savedLabel === "neutral") allCounts.neutral++;
+            else if (savedLabel === "slightly_manipulative") allCounts.slightly++;
+            else if (savedLabel === "highly_manipulative") allCounts.highly++;
+
+            const biasScore = calculateBiasScore(allCounts);
+            const kappa = calculateFleissKappa(allCounts);
+
+            const entries = (Object.entries(allCounts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
+            entries.sort((a, b) => b[1] - a[1]);
+            const [topLabel, topCount] = entries[0];
+            const [_secondLabel, secondCount] = entries[1];
+            const finalLabelVal = (topCount > 0 && topCount !== secondCount) ? topLabel : null;
+
+            articleUpdates.bias_score = biasScore;
+            articleUpdates.fleiss_kappa = kappa;
+            articleUpdates.final_label = finalLabelVal;
+            completionCounts = allCounts;
+            finalBiasScoreForStats = biasScore;
+          }
+
+          transaction.set(articleRef, articleUpdates, { merge: true });
           transaction.set(responseRef, responseData);
 
-          if (newStatus !== oldStatus) {
-            statusChangedTo = newStatus;
+          if (articleData.status !== newStatus) {
+            prevStatusForStats = articleData.status === "pending" || articleData.status === "partial"
+              ? articleData.status
+              : undefined;
+            nextStatusForStats = newStatus === "partial" || newStatus === "complete" ? newStatus : null;
           }
 
           const annotatorUpdates: any = {
@@ -333,47 +397,18 @@ export default function AnnotationWorkbench() {
           }
           const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
           if (totalCompleted >= 20) annotatorUpdates.completed = true;
-          transaction.update(annotatorRef, annotatorUpdates);
+          transaction.set(annotatorRef, annotatorUpdates, { merge: true });
+
+          void completionCounts;
         });
 
-        (async () => {
+        if (nextStatusForStats) {
           try {
-            let finalBiasScore = 0;
-            if (statusChangedTo === "complete") {
-              const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
-              const responses = responsesSnap.docs.map(d => d.data());
-              const counts = {
-                neutral: responses.filter(r => r.label === "neutral").length,
-                slightly: responses.filter(r => r.label === "slightly_manipulative").length,
-                highly: responses.filter(r => r.label === "highly_manipulative").length
-              };
-              finalBiasScore = calculateBiasScore(counts);
-              const fleiss_kappa = calculateFleissKappa(counts);
-
-              const entries = (Object.entries(counts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
-              entries.sort((a, b) => b[1] - a[1]);
-              const [topLabel, topCount] = entries[0];
-              const [_secondLabel, secondCount] = entries[1];
-              let finalLabel: any = null;
-              if (topCount > 0 && topCount !== secondCount) {
-                finalLabel = topLabel;
-              }
-
-              await updateDoc(articleRef, { bias_score: finalBiasScore, fleiss_kappa, final_label: finalLabel });
-            }
-            if (statusChangedTo) {
-              const prev = savedCurrentArticle.status === "pending" || savedCurrentArticle.status === "partial"
-                ? savedCurrentArticle.status
-                : undefined;
-              const next = statusChangedTo === "partial" || statusChangedTo === "complete"
-                ? statusChangedTo
-                : null;
-              await syncBiasScoreAndStatsAtomically(finalBiasScore, prev, next);
-            }
+            await syncBiasScoreAndStatsAtomically(finalBiasScoreForStats, prevStatusForStats, nextStatusForStats);
           } catch (e) {
-            console.warn("Background tasks failed:", e);
+            console.warn("Stats sync post-transaction failed:", e);
           }
-        })();
+        }
       }, 3, 500);
 
       // --- 4. Transaction was atomic — if we reached here, the save is DONE.
