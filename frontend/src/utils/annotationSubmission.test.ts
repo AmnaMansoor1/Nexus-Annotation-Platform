@@ -77,11 +77,20 @@ function submitAnnotation(
     }
     next.bias_score = calculateBiasScore(counts);
     next.fleiss_kappa = calculateFleissKappa(counts);
-    const entries = (Object.entries(counts) as Array<[BiasLabel, number]>);
+    // Map count-object keys to canonical BiasLabel enum values (mirrors the
+    // runtime fix in AnnotationWorkbench.tsx). The counts dict uses short
+    // keys ("slightly", "highly") but final_label must use the full enum.
+    const keyToLabel: Record<string, BiasLabel | null> = {
+      neutral: "neutral",
+      slightly: "slightly_manipulative",
+      highly: "highly_manipulative",
+    };
+    const entries = Object.entries(counts) as Array<[string, number]>;
     entries.sort((a, b) => b[1] - a[1]);
-    const [topLabel, topCount] = entries[0];
+    const [topKey, topCount] = entries[0];
     const [_snd, secondCount] = entries[1];
-    next.final_label = topCount > 0 && topCount !== secondCount ? topLabel : null;
+    const topLabel = keyToLabel[topKey] ?? null;
+    next.final_label = topCount > 0 && topCount !== secondCount && topLabel !== null ? topLabel : null;
     justCompleted = true;
   }
   return { next, responseWritten: true, justCompleted, doubleSubmitBlocked: false, fullBlocked: false };
@@ -215,5 +224,36 @@ describe("Issue-1 submission transaction rules", () => {
     expect(secondRun.status).toBe("complete");
     expect(secondRun.annotation_count).toBe(5);
     expect(c2.length).toBe(0);
+  });
+
+  test("TEST-6 slightly_manipulative majority → final_label MUST be canonical 'slightly_manipulative' (not short 'slightly') — validates Issue-1 enum fix", () => {
+    const { s } = submitN(makeEmpty(), [
+      { email: "a@x.com", label: "slightly_manipulative" },
+      { email: "b@x.com", label: "slightly_manipulative" },
+      { email: "c@x.com", label: "slightly_manipulative" },
+      { email: "d@x.com", label: "neutral" },
+      { email: "e@x.com", label: "highly_manipulative" },
+    ]);
+    expect(s.status).toBe("complete");
+    expect(s.annotation_count).toBe(5);
+    expect(s.final_label).toBe("slightly_manipulative");
+    expect(LABELS.includes(s.final_label!)).toBe(true);
+    expect(s.bias_score).toBe(calculateBiasScore({ neutral: 1, slightly: 3, highly: 1 }));
+    expect(s.fleiss_kappa).toBe(calculateFleissKappa({ neutral: 1, slightly: 3, highly: 1 }));
+  });
+
+  test("TEST-7 highly_manipulative majority → final_label MUST be canonical 'highly_manipulative' (not short 'highly') — validates Issue-1 enum fix", () => {
+    const { s } = submitN(makeEmpty(), [
+      { email: "a@x.com", label: "highly_manipulative" },
+      { email: "b@x.com", label: "highly_manipulative" },
+      { email: "c@x.com", label: "highly_manipulative" },
+      { email: "d@x.com", label: "neutral" },
+      { email: "e@x.com", label: "slightly_manipulative" },
+    ]);
+    expect(s.status).toBe("complete");
+    expect(s.annotation_count).toBe(5);
+    expect(s.final_label).toBe("highly_manipulative");
+    expect(LABELS.includes(s.final_label!)).toBe(true);
+    expect(s.bias_score).toBe(calculateBiasScore({ neutral: 1, slightly: 1, highly: 3 }));
   });
 });

@@ -294,12 +294,30 @@ export default function AnnotationWorkbench() {
         let prevStatusForStats: "pending" | "partial" | undefined;
         let nextStatusForStats: "partial" | "complete" | null = null;
 
+        // ── DIAG: Lift computed values OUT of runTransaction closure so the
+        // post-commit read-back block (which runs AFTER runTransaction resolves)
+        // can compare the read-back Firestore value to what we computed INSIDE
+        // the atomic transaction. Previously `completionCounts` was declared
+        // inside the callback and was undefined outside → diagnostic printed
+        // MATCH_*: undefined every single run.
+        let lastTxCompletionCounts: { neutral: number; slightly: number; highly: number } | null = null;
+        let lastTxBiasScore: number | null = null;
+        let lastTxKappa: number | null = null;
+        let lastTxFinalLabel: BiasLabel | null = null;
+        let scoreBranchEntered = false;
+
         await runTransaction(db, async (transaction) => {
           const responseSnap = await txGetSafe(transaction, responseRef);
-          if (responseSnap.exists()) return;
+          if (responseSnap.exists()) {
+            console.debug(`[DIAG-Issue1] article=${articleId} idempotency-guard: response doc exists → bail.`);
+            return;
+          }
 
           const articleSnap = await txGetSafe(transaction, articleRef);
-          if (!articleSnap.exists()) return;
+          if (!articleSnap.exists()) {
+            console.debug(`[DIAG-Issue1] article=${articleId} article doc MISSING → bail.`);
+            return;
+          }
           const articleData = articleSnap.data() as Article;
 
           // Authoritative distinct annotator list from article.annotated_by (sorted, deduped, live-normalised)
@@ -311,15 +329,34 @@ export default function AnnotationWorkbench() {
           const priorDistinctAnnotatorSet = new Set(priorAnnotatorsNormalised);
           const priorDistinctCount = priorDistinctAnnotatorSet.size;
 
+          console.debug(`[DIAG-Issue1] article=${articleId} submitter=${emailNorm}`, {
+            priorDistinctCount,
+            priorAnnotated_by: priorAnnotated,
+            article_annotation_count: articleData.annotation_count,
+            article_status_before: articleData.status,
+            article_bias_before: articleData.bias_score,
+            article_kappa_before: articleData.fleiss_kappa,
+            article_finalLabel_before: articleData.final_label,
+          });
+
           // Guard: student has already submitted?
-          if (priorDistinctAnnotatorSet.has(emailNorm)) return;
+          if (priorDistinctAnnotatorSet.has(emailNorm)) {
+            console.debug(`[DIAG-Issue1] article=${articleId} already-in-annotated_by guard → bail.`);
+            return;
+          }
 
           // Guard: article already has 5 distinct submissions?
           const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
-          if (priorDistinctCount >= REQUIRED) return;
+          if (priorDistinctCount >= REQUIRED) {
+            console.debug(`[DIAG-Issue1] article=${articleId} priorDistinctCount=${priorDistinctCount}>=${REQUIRED} → bail (full).`);
+            return;
+          }
 
           const annotatorSnap = await txGetSafe(transaction, annotatorRef);
-          if (!annotatorSnap.exists()) return;
+          if (!annotatorSnap.exists()) {
+            console.debug(`[DIAG-Issue1] article=${articleId} annotator doc MISSING → bail.`);
+            return;
+          }
           const annotatorData = annotatorSnap.data() as Annotator;
 
           // Single authoritative next state
@@ -330,6 +367,13 @@ export default function AnnotationWorkbench() {
           else if (newAnnotationCount > 0) newStatus = "partial";
           else newStatus = "pending";
 
+          console.debug(`[DIAG-Issue1] article=${articleId} derived-new-state:`, {
+            newAnnotatedBy,
+            newAnnotationCount,
+            newStatus,
+            WILL_ENTER_SCORE_BRANCH: newStatus === "complete" && newAnnotationCount >= REQUIRED,
+          });
+
           const articleUpdates: any = {
             annotation_count: newAnnotationCount,
             annotated_by: newAnnotatedBy,
@@ -338,39 +382,148 @@ export default function AnnotationWorkbench() {
 
           // When reaching exactly 5 DISTINCT annotators → compute everything atomically
           // in the SAME transaction so bias/kappa/final_label can never be missing on completion
-          let completionCounts: { neutral: number; slightly: number; highly: number } | null = null;
           if (newStatus === "complete" && newAnnotationCount >= REQUIRED) {
-            const responsesSnap = await txGetSafe(transaction, collection(db, "annotations", articleId, "responses"));
+            scoreBranchEntered = true;
+            console.groupCollapsed(`[DIAG-Issue1] 5TH-ANNOTATION COMPLETION BRANCH — article=${articleId}`);
             const priorResponses: any[] = [];
-            try {
-              if (responsesSnap && typeof responsesSnap.docs === "object" && Array.isArray(responsesSnap.docs)) {
-                for (const d of responsesSnap.docs) priorResponses.push(d.data());
+
+            // ── IMPORTANT: NO collection/query reads inside a Firestore transaction ──
+            // Firestore `transaction.get()` only accepts DocumentReference.
+            // Passing a Query/CollectionReference to transaction.get() is
+            // UNSUPPORTED by the SDK (hard runtime error) AND TypeScript correctly
+            // rejects it (the error you just saw: Query missing id/path/parent/toJSON).
+            // The prior code called txGetSafe(transaction, collection(...)) which
+            // SWALLOWED this thrown error in its catch-all → returned a fake
+            // "not exists" doc shim with NO .docs property → priorResponses.length
+            // stayed 0 → bias/kappa computed with ONLY the 5th submitter's label.
+            //
+            // Strategy 1 (LIST) is removed. We only use Strategy 2 (individual
+            // per-doc GETs via DocumentReference → transaction.get(priorRef)),
+            // which IS valid inside a transaction.
+            const priorCountExpected = priorAnnotated.length; // should be REQUIRED-1=4
+            console.debug(`[DIAG-Issue1] priorAnnotated (expected prior=${priorCountExpected})=`, priorAnnotated);
+
+            for (const priorEmailRaw of priorAnnotated) {
+              const priorEmail = typeof priorEmailRaw === "string" ? priorEmailRaw : "";
+              if (!priorEmail) continue;
+              const priorDocId = sanitizeEmailForDocId(priorEmail);
+              const priorRef = doc(db, "annotations", articleId, "responses", priorDocId);
+              try {
+                console.debug(`[DIAG-Issue1] tx.get(DocumentReference) → responses/${priorDocId} (${priorEmail})`);
+                // NOTE: Do NOT wrap in txGetSafe here. txGetSafe has a permission→notExists
+                // shim that swallows real errors. We use raw transaction.get so that
+                // ANY thrown error has its full Firebase `code`/`message` logged.
+                let priorSnap;
+                try {
+                  priorSnap = await transaction.get(priorRef);
+                } catch (innerErr: any) {
+                  const innerCode = innerErr?.code ?? "NO_CODE";
+                  const innerMsg = (innerErr?.message ?? String(innerErr)).slice(0, 200);
+                  console.warn(
+                    `[DIAG-Issue1] tx.get FAILED for priorEmail=${priorEmail} responses/${priorDocId}. ` +
+                    `code=${innerCode}. msg=${innerMsg}. THIS PRIOR ANNOTATOR'S LABEL WILL BE EXCLUDED from bias/kappa/final_label. ` +
+                    `HINT: If code=permission-denied, check rules allow GET on /annotations/{articleId}/responses/{docId}. ` +
+                    `If code=not-found, response doc was never written for that annotator (article.annotated_by may be stale).`
+                  );
+                  continue;
+                }
+                if (priorSnap && typeof priorSnap.exists === "function" && priorSnap.exists()) {
+                  const d = priorSnap.data();
+                  if (d && typeof d.label === "string") {
+                    priorResponses.push(d);
+                    console.debug(`[DIAG-Issue1] ADDED label=${d.label} from priorEmail=${priorEmail}. priorResponses.length=${priorResponses.length}.`);
+                  } else {
+                    console.warn(`[DIAG-Issue1] Doc for priorEmail=${priorEmail} had no valid label field. d.label=${String(d?.label)}`);
+                  }
+                } else {
+                  const exFn = priorSnap && typeof priorSnap.exists === "function" ? priorSnap.exists() : "priorSnap_malformed";
+                  console.warn(`[DIAG-Issue1] priorEmail=${priorEmail} doc exists?=${String(exFn)}. Response doc MISSING for known annotator. Article.annotated_by may contain stale entries.`);
+                }
+              } catch (outerErr: any) {
+                const outerCode = outerErr?.code ?? "NO_CODE";
+                const outerMsg = (outerErr?.message ?? String(outerErr)).slice(0, 200);
+                console.warn(`[DIAG-Issue1] OUTER unexpected error for priorEmail=${priorEmail}. code=${outerCode}. msg=${outerMsg}`);
               }
-            } catch { /* safe — no responses */ }
+            }
+
+            const labelsFromPrior = priorResponses.map((r: any) => r.label);
+            console.debug(`[DIAG-Issue1] FINAL priorResponses SUMMARY:`, {
+              expectedPriorCount: REQUIRED - 1,
+              actualPriorCount: priorResponses.length,
+              labelsFromPrior,
+              submitterSavedLabel: savedLabel,
+            });
+
             const allCounts = { neutral: 0, slightly: 0, highly: 0 };
             for (const r of priorResponses) {
               if (r.label === "neutral") allCounts.neutral++;
               else if (r.label === "slightly_manipulative") allCounts.slightly++;
               else if (r.label === "highly_manipulative") allCounts.highly++;
+              else console.warn(`[DIAG-Issue1] Unexpected label value in prior response: label=${String(r.label)} annotator_email=${String(r.annotator_email)}`);
             }
             if (savedLabel === "neutral") allCounts.neutral++;
             else if (savedLabel === "slightly_manipulative") allCounts.slightly++;
             else if (savedLabel === "highly_manipulative") allCounts.highly++;
+            else console.warn(`[DIAG-Issue1] Unexpected savedLabel value! savedLabel=${String(savedLabel)}`);
+
+            console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts);
 
             const biasScore = calculateBiasScore(allCounts);
             const kappa = calculateFleissKappa(allCounts);
 
-            const entries = (Object.entries(allCounts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
+            // Map count-keys ("slightly", "highly") back to their canonical BiasLabel enum
+            // values ("slightly_manipulative", "highly_manipulative") so the stored
+            // final_label matches the rest of the codebase (ExportCSV, types, etc.).
+            const countKeyToBiasLabel = (k: string): BiasLabel | null => {
+              if (k === "neutral") return "neutral";
+              if (k === "slightly") return "slightly_manipulative";
+              if (k === "highly") return "highly_manipulative";
+              return null;
+            };
+            const entries = (Object.entries(allCounts) as Array<[string, number]>);
             entries.sort((a, b) => b[1] - a[1]);
-            const [topLabel, topCount] = entries[0];
-            const [_secondLabel, secondCount] = entries[1];
-            const finalLabelVal = (topCount > 0 && topCount !== secondCount) ? topLabel : null;
+            const [topKey, topCount] = entries[0];
+            const [_secondKey, secondCount] = entries[1];
+            const topLabel = countKeyToBiasLabel(topKey);
+            const finalLabelVal =
+              (topCount > 0 && topCount !== secondCount && topLabel !== null) ? topLabel : null;
+
+            console.debug(`[DIAG-Issue1] COMPUTED SCORES:`, {
+              biasScore,
+              kappa,
+              topKey, topLabel, topCount,
+              secondKey: _secondKey, secondCount,
+              finalLabelVal,
+              tie_or_noMajority: topCount === secondCount || topCount === 0,
+            });
 
             articleUpdates.bias_score = biasScore;
             articleUpdates.fleiss_kappa = kappa;
             articleUpdates.final_label = finalLabelVal;
-            completionCounts = allCounts;
+
+            // Write to OUTER closure (see variable declaration above runTransaction)
+            lastTxCompletionCounts = allCounts;
+            lastTxBiasScore = biasScore;
+            lastTxKappa = kappa;
+            lastTxFinalLabel = finalLabelVal;
             finalBiasScoreForStats = biasScore;
+
+            const has_bias = Object.prototype.hasOwnProperty.call(articleUpdates, "bias_score");
+            const has_kappa = Object.prototype.hasOwnProperty.call(articleUpdates, "fleiss_kappa");
+            const has_final = Object.prototype.hasOwnProperty.call(articleUpdates, "final_label");
+            console.debug(`[DIAG-Issue1] articleUpdates object that will be transaction.set(merge=true):`, {
+              has_bias_score: has_bias,
+              bias_score_value: articleUpdates.bias_score,
+              has_fleiss_kappa: has_kappa,
+              fleiss_kappa_value: articleUpdates.fleiss_kappa,
+              has_final_label: has_final,
+              final_label_value: articleUpdates.final_label,
+              ALL_THREE_SCORE_KEYS_PRESENT: has_bias && has_kappa && has_final,
+              annotation_count: articleUpdates.annotation_count,
+              annotated_by_length: articleUpdates.annotated_by.length,
+              status: articleUpdates.status,
+            });
+            console.groupEnd();
           }
 
           transaction.set(articleRef, articleUpdates, { merge: true });
@@ -398,8 +551,6 @@ export default function AnnotationWorkbench() {
           const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
           if (totalCompleted >= 20) annotatorUpdates.completed = true;
           transaction.set(annotatorRef, annotatorUpdates, { merge: true });
-
-          void completionCounts;
         });
 
         if (nextStatusForStats) {
@@ -409,6 +560,62 @@ export default function AnnotationWorkbench() {
             console.warn("Stats sync post-transaction failed:", e);
           }
         }
+
+        // ---- DIAGNOSTIC: POST-COMMIT READ-BACK -----------------------------------
+        // Immediately re-read the article doc to PROVE the values were persisted.
+        // Uses the out-of-closure `lastTxCompletionCounts` / `lastTxBiasScore` etc.
+        // to 100% guarantee we're comparing the same values the transaction wrote.
+        try {
+          const _delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+          await _delay(10);
+          const verifyArticleRef = doc(db, "articles", articleId);
+          const verifySnap = await safeGetDoc(verifyArticleRef);
+          if (verifySnap.exists()) {
+            const vd = verifySnap.data() as Article;
+            if (vd.status === "complete") {
+              console.groupCollapsed(`[DIAG-Issue1-POSTCOMMIT] article=${articleId} READBACK AFTER COMMIT (10 ms)`);
+              const expectedBias = lastTxBiasScore;
+              const expectedKappa = lastTxKappa;
+              const biasMatch = (expectedBias == null || vd.bias_score == null)
+                ? Object.is(expectedBias, vd.bias_score)
+                : Math.abs(Number(vd.bias_score) - Number(expectedBias)) < 0.001;
+              const kappaMatch = (expectedKappa == null || vd.fleiss_kappa == null)
+                ? Object.is(expectedKappa, vd.fleiss_kappa)
+                : Math.abs(Number(vd.fleiss_kappa) - Number(expectedKappa)) < 0.001;
+              const labelMatch = Object.is(vd.final_label, lastTxFinalLabel);
+              const allScoresPresent = (vd.bias_score != null) && (vd.fleiss_kappa != null);
+              console.debug({
+                scoreBranchEntered,
+                status: vd.status,
+                annotation_count: vd.annotation_count,
+                annotated_by_length: vd.annotated_by?.length ?? 0,
+                // READBACK (actual Firestore state)
+                bias_score_readback: vd.bias_score,
+                fleiss_kappa_readback: vd.fleiss_kappa,
+                final_label_readback: vd.final_label,
+                // EXPECTED (closure values computed inside tx and written via merge)
+                bias_score_transaction: expectedBias,
+                fleiss_kappa_transaction: expectedKappa,
+                final_label_transaction: lastTxFinalLabel,
+                MATCH_bias: biasMatch,
+                MATCH_kappa: kappaMatch,
+                MATCH_finalLabel: labelMatch,
+                SCORES_PRESENT_in_READBACK: allScoresPresent,
+                FAILURE_CLASSIFICATION:
+                  !scoreBranchEntered ? "A — SCORE BRANCH NEVER ENTERED (newAnnotationCount<5 or newStatus!=complete — see WILL_ENTER_SCORE_BRANCH line)" :
+                  !allScoresPresent ? "B — SCORE BRANCH ENTERED BUT SCORES NOT WRITTEN (see ALL_THREE_SCORE_KEYS_PRESENT line, should be true)" :
+                  (!biasMatch || !kappaMatch || !labelMatch) ? "B-VALUES — SCORE BRANCH ENTERED AND WROTE BUT VALUES ARE WRONG (see MATCH_* lines — any false)" :
+                  "OK — scores physically written AND match in-transaction values",
+              });
+              console.groupEnd();
+            } else {
+              console.debug(`[DIAG-Issue1-POSTCOMMIT] article=${articleId} status=${vd.status} (not complete) — skip score comparison.`);
+            }
+          }
+        } catch (postReadErr) {
+          console.warn(`[DIAG-Issue1-POSTCOMMIT] read-back failed`, postReadErr);
+        }
+        // ---- END DIAGNOSTIC POST-COMMIT READBACK --------------------------------
       }, 3, 500);
 
       // --- 4. Transaction was atomic — if we reached here, the save is DONE.
