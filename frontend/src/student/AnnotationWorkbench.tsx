@@ -268,6 +268,53 @@ export default function AnnotationWorkbench() {
         const articleRef = doc(db, "articles", articleId);
         const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(userEmail));
 
+        // ── Issue-1 PRE-FLIGHT: Read ACTUAL /responses subcollection truth.
+        // Firestore transactions cannot do collection()/query() reads, only
+        // DocumentReference.get(). But reconcileArticle (triggered by any other
+        // student's login / assignment flow) may have recently WIPED
+        // article.annotated_by to [ ] (filtering deleted annotators) while the
+        // actual response docs still exist. Without this read we'd treat a
+        // perfectly-valid 4/5 article as 0/5 → never enter 5th-completion
+        // branch → scores never written, CSV shows 5 responses with 0 bias.
+        type PriorResp = { annotator_email: string; label: string };
+        let actualPriorResponses: PriorResp[] = [];
+        try {
+          const snaps = await getDocs(collection(db, "annotations", articleId, "responses"));
+          snaps.forEach((d) => {
+            const data = d.data();
+            const em = typeof (data as any)?.annotator_email === "string"
+              ? (data as any).annotator_email
+              : null;
+            const lab = typeof (data as any)?.label === "string" ? (data as any).label : null;
+            if (em && lab) actualPriorResponses.push({ annotator_email: em, label: lab });
+          });
+        } catch (preErr: any) {
+          console.warn(
+            `[DIAG-Issue1] PREFLIGHT /responses getDocs FAILED for article=${articleId}. ` +
+            `Falling back to article.annotated_by ONLY (counters may be stale, may miss scoring branch). ` +
+            `code=${preErr?.code ?? "NO_CODE"} msg=${String(preErr?.message ?? preErr).slice(0, 200)}`
+          );
+        }
+        // Exclude THIS submitter's response if already present in preflight
+        // (idempotency; keeps counts correct on retries).
+        const emailNormForFilter = userEmail.toLowerCase().trim();
+        const actualPriorResponsesFiltered = actualPriorResponses.filter(
+          (r) => r.annotator_email.toLowerCase().trim() !== emailNormForFilter
+        );
+        const actualPriorAnnotatorsNormalised = Array.from(
+          new Set(
+            actualPriorResponsesFiltered.map((r) =>
+              typeof r.annotator_email === "string" ? r.annotator_email.toLowerCase().trim() : ""
+            ).filter((e) => !!e)
+          )
+        );
+        console.debug(`[DIAG-Issue1] article=${articleId} PREFLIGHT /responses truth:`, {
+          rawResponseCount: actualPriorResponses.length,
+          priorDistinct_fromResponses: actualPriorAnnotatorsNormalised.length,
+          priorEmails_fromResponses: actualPriorAnnotatorsNormalised,
+          submitterExcluded: actualPriorResponses.length - actualPriorResponsesFiltered.length,
+        });
+
         // Utility: wrap transaction.get() so PERMISSION_DENIED on a doc that
         // doesn't exist yet (e.g. a brand-new response doc) is treated as a
         // "missing doc" snapshot instead of aborting the whole transaction.
@@ -320,18 +367,56 @@ export default function AnnotationWorkbench() {
           }
           const articleData = articleSnap.data() as Article;
 
-          // Authoritative distinct annotator list from article.annotated_by (sorted, deduped, live-normalised)
+          // ── Issue-1: Authoritative prior-annotator set = UNION of (a) what the
+          // article doc says (article.annotated_by) AND (b) what the actual
+          // /responses subcollection contains (preflight read above).
+          //
+          // Rationale: reconcileArticle.filterLive() can legally wipe
+          // article.annotated_by to [ ] when annotators are deleted, but the
+          // actual response docs still exist and should count toward the
+          // 5-annotation threshold (this is exactly what ExportCSV.tsx does).
+          // Without the union, priorDistinctCount=0 → user is treated as #1 →
+          // scoring branch NEVER fires → bias/kappa/final_label stay null.
           const emailNorm = userEmail.toLowerCase().trim();
-          const priorAnnotated = Array.isArray(articleData.annotated_by) ? articleData.annotated_by : [];
-          const priorAnnotatorsNormalised = priorAnnotated
-            .map((e) => typeof e === "string" ? e.toLowerCase().trim() : "")
-            .filter((e) => !!e);
-          const priorDistinctAnnotatorSet = new Set(priorAnnotatorsNormalised);
-          const priorDistinctCount = priorDistinctAnnotatorSet.size;
+          const rawPriorAnnotatedFromArticle = Array.isArray(articleData.annotated_by)
+            ? articleData.annotated_by
+            : [];
+          const priorAnnotatedNormalisedArticle = rawPriorAnnotatedFromArticle
+            .map((e: any) => typeof e === "string" ? e.toLowerCase().trim() : "")
+            .filter((e: string) => !!e);
+          // actualPriorAnnotatorsNormalised comes from the PREFLIGHT getDocs on
+          // /annotations/{articleId}/responses — captured OUTSIDE the transaction.
+          const priorDistinctAnnotatorSetAuthoritative = new Set<string>([
+            ...priorAnnotatedNormalisedArticle,
+            ...actualPriorAnnotatorsNormalised,
+          ]);
+          // Guard: the submitter shouldn't count in "prior" set (they are "now").
+          priorDistinctAnnotatorSetAuthoritative.delete(emailNorm);
+          const priorDistinctCount = priorDistinctAnnotatorSetAuthoritative.size;
+          const priorAnnotatedAuthoritative = Array.from(priorDistinctAnnotatorSetAuthoritative);
+
+          // Build the label lookup: for each prior annotator email, what is
+          // their label? Prefer the preflight read from actual response
+          // documents (guaranteed to exist for emails in
+          // actualPriorAnnotatorsNormalised). Fallback: no label (we'll try to
+          // read inside the transaction below for any extra emails in the
+          // article.annotated_by set).
+          const priorEmailToLabel: Record<string, string> = {};
+          for (const r of actualPriorResponsesFiltered) {
+            const key = r.annotator_email.toLowerCase().trim();
+            if (!key) continue;
+            priorEmailToLabel[key] = r.label;
+          }
 
           console.debug(`[DIAG-Issue1] article=${articleId} submitter=${emailNorm}`, {
-            priorDistinctCount,
-            priorAnnotated_by: priorAnnotated,
+            // NEW: UNION-derived counters
+            priorDistinctCount_authoritative: priorDistinctCount,
+            priorAnnotated_authoritative: priorAnnotatedAuthoritative,
+            priorEmailsKnownLabels_count: Object.keys(priorEmailToLabel).length,
+            // OLD: purely from article doc (what was used BEFORE the fix,
+            // retained for side-by-side comparison to prove stale counters)
+            priorDistinctCount_articleDocOnly: new Set(priorAnnotatedNormalisedArticle).size,
+            priorAnnotated_by_articleDocOnly: rawPriorAnnotatedFromArticle,
             article_annotation_count: articleData.annotation_count,
             article_status_before: articleData.status,
             article_bias_before: articleData.bias_score,
@@ -340,7 +425,7 @@ export default function AnnotationWorkbench() {
           });
 
           // Guard: student has already submitted?
-          if (priorDistinctAnnotatorSet.has(emailNorm)) {
+          if (priorDistinctAnnotatorSetAuthoritative.has(emailNorm)) {
             console.debug(`[DIAG-Issue1] article=${articleId} already-in-annotated_by guard → bail.`);
             return;
           }
@@ -360,7 +445,9 @@ export default function AnnotationWorkbench() {
           const annotatorData = annotatorSnap.data() as Annotator;
 
           // Single authoritative next state
-          const newAnnotatedBy = Array.from(new Set([...priorAnnotated.map((e: any) => typeof e === "string" ? e.toLowerCase().trim() : "").filter(Boolean), emailNorm]));
+          const newAnnotatedBy = Array.from(
+            new Set([...priorAnnotatedAuthoritative.map((e: any) => typeof e === "string" ? e.toLowerCase().trim() : "").filter(Boolean), emailNorm])
+          );
           const newAnnotationCount = newAnnotatedBy.length;
           let newStatus: Article["status"] = articleData.status;
           if (newAnnotationCount >= REQUIRED) newStatus = "complete";
@@ -372,6 +459,12 @@ export default function AnnotationWorkbench() {
             newAnnotationCount,
             newStatus,
             WILL_ENTER_SCORE_BRANCH: newStatus === "complete" && newAnnotationCount >= REQUIRED,
+            // Debug: was priorAnnotated_authoritative stale / missing entries that
+            // the actual preflight truth list knew about? If so we still got them
+            // because both are unioned above.
+            priorAnnotated_authoritative_len: priorAnnotatedAuthoritative.length,
+            priorAnnotated_articleDocOnly_len: priorAnnotatedNormalisedArticle.length,
+            actualPriorAnnotatorsNormalised_len: actualPriorAnnotatorsNormalised.length,
           });
 
           const articleUpdates: any = {
@@ -400,16 +493,56 @@ export default function AnnotationWorkbench() {
             // Strategy 1 (LIST) is removed. We only use Strategy 2 (individual
             // per-doc GETs via DocumentReference → transaction.get(priorRef)),
             // which IS valid inside a transaction.
-            const priorCountExpected = priorAnnotated.length; // should be REQUIRED-1=4
-            console.debug(`[DIAG-Issue1] priorAnnotated (expected prior=${priorCountExpected})=`, priorAnnotated);
+            //
+            // ── Issue-1 FIX: Use the AUTHORITATIVE prior email UNION list:
+            //    priorAnnotatedAuthoritative = article.annotated_by ∪ (actualPriorEmails
+            //    from PREFLIGHT /responses subcollection read done OUTSIDE the
+            //    transaction). Before this fix, the for-loop iterated over the
+            //    STALE article-only list (often [ ] after reconcileArticle wiped it)
+            //    → priorResponses stayed empty → allCounts = 0,0,1 → WRONG bias,
+            //    or for-loop never ran → no scores at all if article.annotated_by
+            //    was the only input to the completion gate.
+            const priorCountExpected = priorAnnotatedAuthoritative.length; // should be REQUIRED-1=4
+            console.debug(`[DIAG-Issue1] priorAnnotatedAuthoritative (expected prior=${priorCountExpected})=`, priorAnnotatedAuthoritative);
 
-            for (const priorEmailRaw of priorAnnotated) {
-              const priorEmail = typeof priorEmailRaw === "string" ? priorEmailRaw : "";
-              if (!priorEmail) continue;
-              const priorDocId = sanitizeEmailForDocId(priorEmail);
+            for (const priorEmail of priorAnnotatedAuthoritative) {
+              const priorEmailNorm = typeof priorEmail === "string" ? priorEmail : "";
+              if (!priorEmailNorm) continue;
+              const priorDocId = sanitizeEmailForDocId(priorEmailNorm);
               const priorRef = doc(db, "annotations", articleId, "responses", priorDocId);
+
+              // ── Issue-1 SPEEDUP / STABILITY: If we ALREADY KNOW this prior annotator's
+              // label from the PREFLIGHT /responses subcollection getDocs() (captured
+              // outside the transaction BEFORE runTransaction started), skip the
+              // transaction.get(priorRef) entirely. This avoids N-1 per-doc GETs
+              // inside the transaction, which:
+              //   (a) speeds up the transaction (less lock contention → fewer aborts),
+              //   (b) eliminates the "poisoned transaction" issue where
+              //       a per-doc error code like `aborted` cascades to lose the ENTIRE
+              //       write,
+              //   (c) protects against the prior response doc having been written
+              //       by a deleted annotator whose transaction.get() would throw
+              //       permission-denied due to rules (preflight read via collection
+              //       getDocs already authenticated OK and got the label, so we
+              //       bypass the per-doc read which may have stricter rule checks).
+              // We still verify the label is one of the 3 canonical enum values
+              // (defense-in-depth — don't trust preflight data blindly).
+              const preflightLabel = priorEmailToLabel[priorEmailNorm] ?? null;
+              const canonicalLabels: string[] = ["neutral", "slightly_manipulative", "highly_manipulative"];
+              if (preflightLabel && canonicalLabels.includes(preflightLabel)) {
+                priorResponses.push({
+                  annotator_email: priorEmailNorm,
+                  label: preflightLabel,
+                });
+                console.debug(
+                  `[DIAG-Issue1] USED PREFLIGHT label=${preflightLabel} for priorEmail=${priorEmailNorm}. ` +
+                  `priorResponses.length=${priorResponses.length}. Skipped tx.get.`
+                );
+                continue;
+              }
+
               try {
-                console.debug(`[DIAG-Issue1] tx.get(DocumentReference) → responses/${priorDocId} (${priorEmail})`);
+                console.debug(`[DIAG-Issue1] tx.get(DocumentReference) → responses/${priorDocId} (${priorEmailNorm}) — preflight label missing, fallback tx.get`);
                 // NOTE: Do NOT wrap in txGetSafe here. txGetSafe has a permission→notExists
                 // shim that swallows real errors. We use raw transaction.get so that
                 // ANY thrown error has its full Firebase `code`/`message` logged.
@@ -420,10 +553,11 @@ export default function AnnotationWorkbench() {
                   const innerCode = innerErr?.code ?? "NO_CODE";
                   const innerMsg = (innerErr?.message ?? String(innerErr)).slice(0, 200);
                   console.warn(
-                    `[DIAG-Issue1] tx.get FAILED for priorEmail=${priorEmail} responses/${priorDocId}. ` +
+                    `[DIAG-Issue1] tx.get FAILED for priorEmail=${priorEmailNorm} responses/${priorDocId}. ` +
                     `code=${innerCode}. msg=${innerMsg}. THIS PRIOR ANNOTATOR'S LABEL WILL BE EXCLUDED from bias/kappa/final_label. ` +
                     `HINT: If code=permission-denied, check rules allow GET on /annotations/{articleId}/responses/{docId}. ` +
-                    `If code=not-found, response doc was never written for that annotator (article.annotated_by may be stale).`
+                    `If code=not-found, response doc was never written for that annotator (article.annotated_by may be stale). ` +
+                    `If code=aborted/failed-precondition, prior tx.get() poisoned the whole transaction — earlier preflight label should have been used.`
                   );
                   continue;
                 }
@@ -431,18 +565,18 @@ export default function AnnotationWorkbench() {
                   const d = priorSnap.data();
                   if (d && typeof d.label === "string") {
                     priorResponses.push(d);
-                    console.debug(`[DIAG-Issue1] ADDED label=${d.label} from priorEmail=${priorEmail}. priorResponses.length=${priorResponses.length}.`);
+                    console.debug(`[DIAG-Issue1] ADDED label=${d.label} from priorEmail=${priorEmailNorm}. priorResponses.length=${priorResponses.length}.`);
                   } else {
-                    console.warn(`[DIAG-Issue1] Doc for priorEmail=${priorEmail} had no valid label field. d.label=${String(d?.label)}`);
+                    console.warn(`[DIAG-Issue1] Doc for priorEmail=${priorEmailNorm} had no valid label field. d.label=${String(d?.label)}`);
                   }
                 } else {
                   const exFn = priorSnap && typeof priorSnap.exists === "function" ? priorSnap.exists() : "priorSnap_malformed";
-                  console.warn(`[DIAG-Issue1] priorEmail=${priorEmail} doc exists?=${String(exFn)}. Response doc MISSING for known annotator. Article.annotated_by may contain stale entries.`);
+                  console.warn(`[DIAG-Issue1] priorEmail=${priorEmailNorm} doc exists?=${String(exFn)}. Response doc MISSING for known annotator. Article.annotated_by may contain stale entries.`);
                 }
               } catch (outerErr: any) {
                 const outerCode = outerErr?.code ?? "NO_CODE";
                 const outerMsg = (outerErr?.message ?? String(outerErr)).slice(0, 200);
-                console.warn(`[DIAG-Issue1] OUTER unexpected error for priorEmail=${priorEmail}. code=${outerCode}. msg=${outerMsg}`);
+                console.warn(`[DIAG-Issue1] OUTER unexpected error for priorEmail=${priorEmailNorm}. code=${outerCode}. msg=${outerMsg}`);
               }
             }
 

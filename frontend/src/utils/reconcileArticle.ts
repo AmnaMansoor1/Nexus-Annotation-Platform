@@ -89,16 +89,28 @@ function filterLive(emails: unknown, live: Set<string>): string[] {
  * Truth priority for assigned_to:
  *   1. ctx.articlesByAssignee.get(article_id)  — if non-empty, use it.
  *      (annotator.assigned_articles[] is authoritative.)
- *   2. 
- * Otherwise filter raw.assigned_to by liveEmails only.
+ *   2. Otherwise filter raw.assigned_to by liveEmails only.
  *      (handles articles that nobody was ever actually assigned to.)
  *
- * annotated_by is always filtered by live annotators only.
+ * Truth priority for annotated_by:
+ *   (NEW, v3) UNION of:
+ *     (a) raw.annotated_by filtered by liveEmails (the annotator-deletion filter,
+ *         which alone caused Issue-1 because deleted annotators can still have
+ *         valid pre-existing response docs that count toward the 5-annotation
+ *         completion branch — see CSV ExportCSV.tsx which also reads the
+ *         /responses subcollection, NOT raw.annotated_by).
+ *     (b) responseAnnotatorEmails (if supplied) filtered by liveEmails,
+ *         derived from the ACTUAL /annotations/{articleId}/responses/ subcollection.
+ *         If a callers does not pass responses (e.g. old callers/tests) we
+ *         gracefully fall back to (a) alone, preserving backward compat.
+ *   This prevents reconcileArticle from wiping a perfectly-valid 4/5 article
+ *   to 0/5 (causing the 5th annotator's submission to be treated as #1).
  */
 export function reconcileArticle(
   raw: Partial<Article> & { article_id: string },
   ctx: Set<string> | AnnotatorContext,
-  requiredAnnotations: number
+  requiredAnnotations: number,
+  opts?: { responseAnnotatorEmails?: string[] | null }
 ): ReconcileResult {
   const { liveEmails, articlesByAssignee } = toAnnotatorContext(ctx);
 
@@ -109,7 +121,27 @@ export function reconcileArticle(
   const assignedTo = uniqueEmails(
     truthAssigned.size > 0 ? [...truthAssigned] : filterLive(rawAssignedTo, liveEmails)
   );
-  const annotatedBy = uniqueEmails(filterLive(rawAnnotatedBy, liveEmails));
+
+  // ── UNION truth for annotated_by (Issue-1 fix) ──────────────────────────
+  // RAW article annotated_by is filtered by liveEmails (annotator deletion
+  // hygiene). The responses subcollection is the TRUE ground truth of who
+  // actually annotated — ExportCSV.tsx reads these same docs directly,
+  // WITHOUT liveEmails filtering, so ANY response doc present counts for
+  // CSV human_label columns, CSV "5 annotations complete" display, and bias
+  // computation. Therefore we MUST include response annotator emails in
+  // annotated_by EVEN IF the corresponding annotator doc no longer exists.
+  // Not doing so caused reconcileArticle to wipe annotated_by to [ ] after
+  // annotator deletion, making the 5th submission be treated as #1 → never
+  // fires the scoring branch.
+  const rawLiveAnnotated = filterLive(rawAnnotatedBy, liveEmails);
+  const responseNormalized =
+    Array.isArray(opts?.responseAnnotatorEmails)
+      ? (opts!.responseAnnotatorEmails as unknown[])
+          .map((e) => (typeof e === "string" ? normalizeEmail(e) : ""))
+          .filter((e) => !!e)
+      : [];
+  const annotatedBy = uniqueEmails([...rawLiveAnnotated, ...responseNormalized]);
+
   const assignedCount = assignedTo.length;
   const annotationCount = annotatedBy.length;
 
@@ -203,12 +235,40 @@ export async function healArticles(
   ctx: Set<string> | AnnotatorContext,
   adminConfig?: { annotators_per_article?: number } | null
 ): Promise<Article[]> {
+  // ── Issue-1: rebuild annotated_by from the ACTUAL responses subcollection.
+  // Annotator deletion + filterLive() used to wipe annotated_by to [ ] while
+  // the response docs still existed physically. Doing this one-shot read per
+  // article (getDocs on /responses) is cheap compared to the wrong counter
+  // cascade that followed (never reaching 5/5, no scoring written).
+  const rawsWithResponses = await Promise.all(
+    raws.map(async (raw) => {
+      let responseEmails: string[] = [];
+      try {
+        const snaps = await getDocs(collection(db, "annotations", raw.article_id, "responses"));
+        snaps.forEach((d) => {
+          const em = (d.data() as any)?.annotator_email;
+          if (typeof em === "string") responseEmails.push(em);
+        });
+      } catch (readErr: any) {
+        // Rules or transient — skip the truth enrichment. reconcileArticle
+        // falls back to raw.annotated_by + liveEmail filter (old behavior),
+        // so we never silently double-count on error.
+        console.warn(
+          `[healArticles] Could not read responses for article=${raw.article_id} (rules/transient?). ` +
+          `Using raw.annotated_by only as fallback. code=${readErr?.code ?? "NO_CODE"}`,
+          readErr
+        );
+      }
+      return { raw, responseEmails };
+    })
+  );
+
   const repairs: Array<{ articleId: string; updates: Partial<Article> }> = [];
   const healed: Article[] = [];
 
-  for (const raw of raws) {
+  for (const { raw, responseEmails } of rawsWithResponses) {
     const required = getRequiredAnnotations(raw, adminConfig);
-    const result = reconcileArticle(raw, ctx, required);
+    const result = reconcileArticle(raw, ctx, required, { responseAnnotatorEmails: responseEmails });
     healed.push(result.article);
     if (result.needsPersist && result.updates) {
       repairs.push({ articleId: raw.article_id, updates: result.updates });

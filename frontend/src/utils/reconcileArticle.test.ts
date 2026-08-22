@@ -153,4 +153,83 @@ describe("reconcileArticle self-heal", () => {
     expect(result.article.assigned_count).toBe(1);
     expect(result.article.assigned_to).toEqual(["a@test.com"]);
   });
+
+  describe("Issue-1: responseAnnotatorEmails union with raw.annotated_by (prevents deleted-annotator wipe)", () => {
+    test("responseAnnotatorEmails RESTORES 4/5 annotations that were wiped by deleted-annotator filter", () => {
+      // Simulate: 4 annotators (A,B,C,D) submitted, then they were deleted from
+      // /annotators. reconcileArticle's old behavior would filter all 4 out of
+      // raw.annotated_by → annotation_count=0, status=pending. CSV still shows
+      // 4 responses in subcollection. New behavior UNIONS raw with responses.
+      const ctx = ctxFromLive(new Set(["newuser@x.com"])); // only a new live user, all 4 are deleted
+      const result = reconcileArticle(
+        {
+          article_id: "ART_RESPONSE_TRUTH",
+          assigned_to: ["deleted1@x.com", "deleted2@x.com", "deleted3@x.com", "deleted4@x.com"],
+          annotated_by: ["deleted1@x.com", "deleted2@x.com", "deleted3@x.com", "deleted4@x.com"],
+          assigned_count: 4,
+          annotation_count: 4,
+          status: "partial",
+        },
+        ctx,
+        5,
+        {
+          responseAnnotatorEmails: [
+            "deleted1@x.com",
+            "deleted2@x.com",
+            "deleted3@x.com",
+            "deleted4@x.com",
+          ],
+        }
+      );
+      // Even though all 4 are "deleted" from annotators, response docs still
+      // exist physically → they count toward annotation_count.
+      expect(result.article.annotation_count).toBe(4);
+      expect(result.article.annotated_by.length).toBe(4);
+      expect(result.article.status).toBe("partial");
+      expect(result.needsPersist).toBe(true); // raw vs union changed
+    });
+
+    test("responseAnnotatorEmails UNION with raw.annotated_by merges disjoint sets", () => {
+      const ctx = ctxFromLive(new Set(["a@x.com", "d@x.com"]));
+      const result = reconcileArticle(
+        {
+          article_id: "ART_MERGE",
+          assigned_to: ["a@x.com"],
+          annotated_by: ["a@x.com"],
+          assigned_count: 1,
+          annotation_count: 1,
+          status: "partial",
+        },
+        ctx,
+        5,
+        {
+          // Responses contain a (already in raw) plus d (live) plus deleted b,c
+          responseAnnotatorEmails: ["a@x.com", "b-deleted@x.com", "c-deleted@x.com", "d@x.com"],
+        }
+      );
+      expect(result.article.annotation_count).toBe(4); // a,d from live ∪ b-deleted,c-deleted via responses
+      expect(new Set(result.article.annotated_by).size).toBe(4);
+      expect(result.article.status).toBe("partial");
+    });
+
+    test("responseAnnotatorEmails not passed → falls back to legacy filter behavior (backward compat)", () => {
+      const ctx = ctxFromLive(new Set(["live1@x.com"])); // 3 deleted, only 1 lives
+      const result = reconcileArticle(
+        {
+          article_id: "ART_FALLBACK",
+          assigned_to: ["d1@x.com", "d2@x.com", "d3@x.com", "live1@x.com"],
+          annotated_by: ["d1@x.com", "d2@x.com", "d3@x.com", "live1@x.com"],
+          assigned_count: 4,
+          annotation_count: 4,
+          status: "partial",
+        },
+        ctx,
+        5
+      );
+      // Legacy: only live annotators remain in annotation_count.
+      expect(result.article.annotation_count).toBe(1);
+      expect(result.article.annotated_by.length).toBe(1);
+      expect(result.article.status).toBe("partial");
+    });
+  });
 });
