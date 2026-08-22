@@ -201,11 +201,13 @@ export default function AnnotatorsTable() {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
               updates.final_label = null;
+              updates.label = null;
               if (article.bias_score !== null) localBiasCleared = true;
             } else if (newCount === REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
               updates.final_label = null;
+              updates.label = null;
               if (article.bias_score !== null) localBiasRecomputed = true;
               shouldRecomputeScores = true;
             }
@@ -242,31 +244,73 @@ export default function AnnotatorsTable() {
           const articleSnap2 = await getDoc(doc(db, "articles", articleId));
           if (articleSnap2.exists()) {
             const art = articleSnap2.data() as Article;
-            if (art.bias_score === null && art.annotation_count === REQUIRED_ANNOTATIONS) {
+            if (art.annotation_count === REQUIRED_ANNOTATIONS) {
               const remainingResp = await getDocs(collection(db, "annotations", articleId, "responses"));
-              const labels = remainingResp.docs.map((d) => (d.data() as any).label as string).filter(Boolean);
-              const counts = {
-                neutral: labels.filter((l) => l === "neutral").length,
-                slightly: labels.filter((l) => l === "slightly_manipulative").length,
-                highly: labels.filter((l) => l === "highly_manipulative").length,
-              };
-              const newScore = calculateBiasScore(counts);
-              const newKappa = calculateFleissKappa(counts);
-
-              const entries = (Object.entries(counts) as Array<["neutral" | "slightly_manipulative" | "highly_manipulative", number]>);
-              entries.sort((a, b) => b[1] - a[1]);
-              const [topLabel, topCount] = entries[0];
-              const [_secondLabel, secondCount] = entries[1];
-              let finalLabel: any = null;
-              if (topCount > 0 && topCount !== secondCount) {
-                finalLabel = topLabel;
+              // ── ISSUE-3 INTEGRITY: Build counts from EXACTLY the annotator
+              //    emails that are listed in article.annotated_by (5 emails).
+              //    If orphaned response docs exist from a previously hard-deleted
+              //    annotator, they will still be physically present (if deleted
+              //    through non-UI pathways). Filtering to annotated_by emails
+              //    ensures n===5 always, preventing wrong kappa values and
+              //    wrong tie-majority decisions when exactly 5 remain.
+              const allowedEmails = new Set(
+                (Array.isArray(art.annotated_by) ? art.annotated_by : [])
+                  .map((e: any) => String(e).toLowerCase().trim())
+                  .filter(Boolean)
+              );
+              const counts = { neutral: 0, slightly: 0, highly: 0 };
+              for (const d of remainingResp.docs) {
+                const raw = d.data() as any;
+                const em = String(raw?.annotator_email || "").toLowerCase().trim();
+                if (!em || !allowedEmails.has(em)) continue;
+                const lbl = String(raw?.label || "");
+                if (lbl === "neutral") counts.neutral++;
+                else if (lbl === "slightly_manipulative") counts.slightly++;
+                else if (lbl === "highly_manipulative") counts.highly++;
               }
+              const totalCounted = counts.neutral + counts.slightly + counts.highly;
 
-              await updateDoc(doc(db, "articles", articleId), {
-                bias_score: newScore,
-                fleiss_kappa: newKappa,
-                final_label: finalLabel,
-              });
+              const needRecompute =
+                art.bias_score === null ||
+                art.fleiss_kappa === null ||
+                art.final_label === null ||
+                !(art.label === 0 || art.label === 1);
+
+              if (totalCounted === REQUIRED_ANNOTATIONS && needRecompute) {
+                const newScore = calculateBiasScore(counts);
+                const newKappa = calculateFleissKappa(counts);
+
+                const entries = (Object.entries(counts) as Array<["neutral" | "slightly" | "highly", number]>);
+                entries.sort((a, b) => b[1] - a[1]);
+                const [topKey, topCount] = entries[0];
+                const [_secondKey, secondCount] = entries[1];
+                let finalLabel: Article["final_label"] = null;
+                if (topCount > 0 && topCount !== secondCount) {
+                  if (topKey === "neutral") finalLabel = "neutral";
+                  else if (topKey === "slightly") finalLabel = "slightly_manipulative";
+                  else if (topKey === "highly") finalLabel = "highly_manipulative";
+                }
+                // ISSUE-1: Binary label — FYP locked spec: bias_score >= 2.5
+                // Equivalent to avg annotator 0-2 score >= 1.0
+                const newBinaryLabel: 0 | 1 = newScore >= 2.5 ? 1 : 0;
+
+                await updateDoc(doc(db, "articles", articleId), {
+                  bias_score: newScore,
+                  fleiss_kappa: newKappa,
+                  final_label: finalLabel,
+                  label: newBinaryLabel,
+                });
+              } else if (totalCounted !== REQUIRED_ANNOTATIONS && art.annotation_count === REQUIRED_ANNOTATIONS) {
+                // Integrity mismatch: annotated_by says 5 but only <5 valid
+                // labelled response docs match the allow-list. Clear scores
+                // instead of writing garbage values; admin can investigate.
+                await updateDoc(doc(db, "articles", articleId), {
+                  bias_score: null,
+                  fleiss_kappa: null,
+                  final_label: null,
+                  label: null,
+                });
+              }
             }
           }
 

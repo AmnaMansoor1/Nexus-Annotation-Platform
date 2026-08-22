@@ -131,6 +131,7 @@ describe("reconcileArticle self-heal", () => {
     expect((result.article as any).bias_score).toBeNull();
     expect((result.article as any).fleiss_kappa).toBeNull();
     expect((result.article as any).final_label).toBeNull();
+    expect((result.article as any).label).toBeNull();
     expect(result.article.status).toBe("pending");
   });
 

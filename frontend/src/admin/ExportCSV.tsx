@@ -4,6 +4,7 @@ import { db } from "../firebase";
 import { Article, BiasLabel } from "../types";
 import { downloadCSV } from "../utils/csvExport";
 import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
+import { calculateOverallFleissKappa, BiasCounts } from "../utils/calculateKappa";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
 
 export function majorityLabelFromLabels(labels: BiasLabel[]): { label: BiasLabel | null; numeric: number | null } {
@@ -144,6 +145,80 @@ export default function ExportCSV() {
 
         return row;
       }));
+
+      // ── ISSUE-2b: Dataset-wide Fleiss' Kappa summary row ──────────────────
+      // Compute overall κ dynamically from ONLY the articles currently stored
+      // as "complete" with the required annotation count — no assumption of
+      // the full 1,493 corpus target. Uses the standard pooling formula
+      // (aggregate observed agreement + marginal category proportions) that
+      // is statistically correct for unequal completion rates mid-experiment.
+      const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
+      const completedCountsArray: BiasCounts[] = [];
+      for (const article of articles) {
+        if (article.status !== "complete") continue;
+        if (typeof article.annotation_count !== "number" || article.annotation_count < REQUIRED) continue;
+        // Use the article's stored bias/label fields to reconstruct counts:
+        // We need exact per-category counts to pool correctly. The article
+        // doc does not cache counts, so we must derive them from the same
+        // live-filtered responses we used for the rows. We already have the
+        // article → article index correspondence via the outer Promise.all
+        // so we do a second lightweight response fetch only for complete
+        // articles (bounded by how many are complete at export time).
+        try {
+          const rSnap = await getDocs(collection(db, "annotations", article.article_id, "responses"));
+          const liveFiltered = rSnap.docs
+            .map(d => d.data() as any)
+            .filter((res: any) => {
+              const e = typeof res.annotator_email === "string"
+                ? res.annotator_email.toLowerCase().trim()
+                : "";
+              return !!e && liveAnnotatorEmails.has(e);
+            });
+          const counts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
+          for (const res of liveFiltered) {
+            const lbl = String(res?.label || "");
+            if (lbl === "neutral") counts.neutral++;
+            else if (lbl === "slightly_manipulative") counts.slightly++;
+            else if (lbl === "highly_manipulative") counts.highly++;
+          }
+          // Only include articles that have exactly REQUIRED live annotators
+          // — this matches the per-article scoring gate. Otherwise overall
+          // kappa will be mathematically corrupted by partial inputs.
+          const n = counts.neutral + counts.slightly + counts.highly;
+          if (n === REQUIRED) completedCountsArray.push(counts);
+        } catch (e) {
+          console.warn(`[ExportCSV] Skipping overall-kappa counts for ${article.article_id}:`, e);
+        }
+      }
+      const overallKappa = calculateOverallFleissKappa(completedCountsArray);
+      if (completedCountsArray.length > 0) {
+        const summaryRow: any = {};
+        summaryRow.sequence_number = "";
+        summaryRow.article_id = "OVERALL_DATASET_KAPPA";
+        summaryRow.headline = `Dataset-wide Fleiss' Kappa across ${completedCountsArray.length} currently complete articles (n=${DEFAULT_REQUIRED_ANNOTATIONS} raters each)`;
+        summaryRow.source = "";
+        summaryRow.author = "";
+        summaryRow.date_published = "";
+        summaryRow.url = "";
+        summaryRow.category = "";
+        summaryRow.article_type = "";
+        summaryRow.word_count = completedCountsArray.length;
+        summaryRow.display_text = "";
+        summaryRow.status = "summary";
+        summaryRow.label = "";
+        summaryRow.bias_score = "";
+        summaryRow.fleiss_kappa = overallKappa;
+        summaryRow.total_annotations = completedCountsArray.length;
+        summaryRow.human_label = "";
+        for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
+          summaryRow[`ann_${i}_student_id`] = "";
+          summaryRow[`ann_${i}_label`] = "";
+        }
+        exportData.push(summaryRow);
+        console.log(`[ExportCSV] Overall dataset Fleiss' kappa = ${overallKappa}, computed from ${completedCountsArray.length} complete articles.`);
+      } else {
+        console.log(`[ExportCSV] No complete articles with exactly ${REQUIRED} live raters — skipping overall kappa summary row.`);
+      }
 
       downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split('T')[0]}.csv`);
     } catch (err) {

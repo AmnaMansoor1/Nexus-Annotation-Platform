@@ -143,9 +143,29 @@ for (const docSnap of articlesSnap.docs) {
   // If we filtered responseAnnotators by liveEmails, we'd still have the
   // "annotated_by=[ ] vs 5 real responses" drift that broke the scoring gate.
   const responseNormalized = uniqueEmails([...responseAnnotators]);
-  const newAnnotatedBy = uniqueEmails([...rawLiveAnnotated, ...responseNormalized]);
+  const newAnnotatedByUncapped = uniqueEmails([...rawLiveAnnotated, ...responseNormalized]);
+
+  // ── ISSUE-2 / ISSUE-3 INTEGRITY CAP: annotation_count and annotated_by
+  //    MUST be exactly REQUIRED (5) when at completion. The FYP spec locks
+  //    N=5 raters per article; any physical orphaned response docs from
+  //    deleted annotators are still counted in the UNION above but MUST
+  //    NOT inflate annotation_count beyond 5, otherwise kappa uses n>5
+  //    (producing -0.2 / -0.167 / -0.143 instead of the correct -0.25)
+  //    and tie-detection evaluates a wrong-size counts object (2-2-1 at
+  //    n=7 becomes 3-2-2 → false majority instead of null).
+  //    We take the FIRST REQUIRED emails in insertion order: the oldest
+  //    response docs (matches how the frontend completion tx would have
+  //    locked-in the 5th rater's submit order).
+  const newAnnotatedBy = newAnnotatedByUncapped.slice(0, REQUIRED);
   const newAC = newAssignedTo.length;
   const newAnnC = newAnnotatedBy.length;
+
+  // For score recomputation we build an EXACT allow-list of emails: only
+  // the emails that are in the capped newAnnotatedBy set. This GUARANTEES
+  // that count totals are exactly 5 when the article is "complete", even
+  // if the /responses subcollection physically contains 6-8 orphaned docs
+  // from annotators previously deleted via non-UI pathways.
+  const allowedEmailsForCounts = new Set(newAnnotatedBy.map(e => String(e).toLowerCase().trim()));
 
   let newStatus = article.status;
   if (newAnnC >= REQUIRED) newStatus = "complete";
@@ -171,26 +191,42 @@ for (const docSnap of articlesSnap.docs) {
   const oldBias = article.bias_score ?? null;
   const oldKappa = article.fleiss_kappa ?? null;
   const oldFinal = (article.final_label ?? null);
+  const oldLabel = (article.label === 0 || article.label === 1) ? article.label : null;
 
   if (newAnnC < REQUIRED) {
     updates.bias_score = null;
     updates.fleiss_kappa = null;
     updates.final_label = null;
-    needScoreWrite = oldBias !== null || oldKappa !== null || oldFinal !== null;
+    updates.label = null;
+    needScoreWrite = oldBias !== null || oldKappa !== null || oldFinal !== null || oldLabel !== null;
   } else {
     // ── Issue-1 (v2 repair): Articles that were drifted to 0/5 never went
     // through the 5th-annotation scoring transaction, so their
     // bias_score/kappa/final_label are still null even though their
     // annotation_count is now correctly 5+. Recompute them from actual
     // response labels here.
+    //
+    // ALSO recompute when label is missing (ISSUE-1 new field that was
+    // never previously written at completion time), or when the repair
+    // script capped newAnnC from >REQUIRED down to REQUIRED (meaning
+    // prior stored scores were computed with wrong n>5).
+    const scoreCapsizeDrift = newAnnotatedByUncapped.length > newAnnotatedBy.length;
     const anyScoreMissing =
-      oldBias == null || oldKappa == null || oldFinal == null;
+      oldBias == null || oldKappa == null || oldFinal == null || oldLabel == null || scoreCapsizeDrift;
     if (anyScoreMissing) {
       const counts = { neutral: 0, slightly: 0, highly: 0 };
       try {
         const respSnap = await db.collection(`annotations/${docSnap.id}/responses`).get();
         for (const rd of respSnap.docs) {
-          const lbl = (rd.data()?.label || "").toString();
+          const rdRaw = rd.data() ?? {};
+          const em = String(rdRaw.annotator_email || "").toLowerCase().trim();
+          // ISSUE-2 FIX: Only count labels from emails that are in the
+          // capped newAnnotatedBy set. Even if there are 6-8 physical
+          // response docs (orphaned deleted-annotator docs), exactly 5
+          // are counted → kappa identity -0.25 holds for any disagreement,
+          // and 2-2-1 at exactly n=5 correctly resolves as tie → null.
+          if (!em || !allowedEmailsForCounts.has(em)) continue;
+          const lbl = (rdRaw.label || "").toString();
           if (lbl === "neutral") counts.neutral++;
           else if (lbl === "slightly_manipulative") counts.slightly++;
           else if (lbl === "highly_manipulative") counts.highly++;
@@ -202,22 +238,47 @@ for (const docSnap of articlesSnap.docs) {
         );
       }
       const totalCounted = counts.neutral + counts.slightly + counts.highly;
-      if (totalCounted >= REQUIRED) {
-        updates.bias_score = calculateBiasScorePure(counts);
-        updates.fleiss_kappa = calculateFleissKappaPure(counts);
-        updates.final_label = finalLabelFromCounts(counts);
+      // ISSUE-2 FIX: Require EXACTLY REQUIRED raters, not >=. Anything
+      // other than n===5 produces mathematically wrong kappa and wrong
+      // tie-majority decisions, so we null-out instead of writing garbage.
+      if (totalCounted === REQUIRED) {
+        const newBias = calculateBiasScorePure(counts);
+        const newKappa = calculateFleissKappaPure(counts);
+        const newFinal = finalLabelFromCounts(counts);
+        // ISSUE-1 FIX: Binary label derivation — FYP locked spec:
+        //   avg_annotator_score_0_to_2 >= 1.0
+        //   ⟺ raw_avg = (HM*2 + SM + 0) / n >= 1.0
+        //   ⟺ bias_score = raw_avg * 2.5 >= 2.5
+        updates.bias_score = newBias;
+        updates.fleiss_kappa = newKappa;
+        updates.final_label = newFinal;
+        updates.label = newBias >= 2.5 ? 1 : 0;
         needScoreWrite = true;
       } else {
-        // Not enough valid-labelled responses (unexpected). Leave null.
-        updates.bias_score = oldBias;
-        updates.fleiss_kappa = oldKappa;
-        updates.final_label = oldFinal;
+        // Integrity failure: counted fewer/more than exactly 5 labels
+        // despite the cap. Null all scores to prevent wrong stored values.
+        updates.bias_score = null;
+        updates.fleiss_kappa = null;
+        updates.final_label = null;
+        updates.label = null;
+        needScoreWrite = true;
+        console.log(
+          `  [integrity] seq ${article.sequence_number} ${docSnap.id}: totalCounted=${totalCounted} REQUIRED=${REQUIRED} → clearing scores (prior bias=${String(oldBias)})`
+        );
       }
     } else {
       // Already set and valid. Keep existing values, no write needed for scores.
       updates.bias_score = oldBias;
       updates.fleiss_kappa = oldKappa;
       updates.final_label = oldFinal;
+      // ISSUE-1: If old binary label is missing but scores exist (field never
+      // written before), compute and write it without re-running bias/kappa.
+      if (oldLabel == null && typeof oldBias === "number") {
+        updates.label = oldBias >= 2.5 ? 1 : 0;
+        needScoreWrite = true;
+      } else {
+        updates.label = oldLabel;
+      }
     }
   }
 
@@ -227,7 +288,8 @@ for (const docSnap of articlesSnap.docs) {
       `  [score-recompute] seq ${article.sequence_number} ${docSnap.id}: ` +
       `bias ${String(oldBias)}→${String(updates.bias_score)}, ` +
       `kappa ${String(oldKappa)}→${String(updates.fleiss_kappa)}, ` +
-      `final_label ${String(oldFinal)}→${String(updates.final_label)}`
+      `final_label ${String(oldFinal)}→${String(updates.final_label)}, ` +
+      `label ${String(oldLabel)}→${String(updates.label)}`
     );
   }
 

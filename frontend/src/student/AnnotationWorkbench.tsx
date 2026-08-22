@@ -82,6 +82,9 @@ export default function AnnotationWorkbench() {
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
 
+  // Derived timer readiness (guaranteed by state OR wall-clock time elapsed >= 10s)
+  const isTimerComplete = timerExpired || (startTime > 0 && Date.now() - startTime >= 10000);
+
   // Stable timer complete handler
   const handleTimerComplete = useCallback(() => {
     setTimerExpired(true);
@@ -229,7 +232,7 @@ export default function AnnotationWorkbench() {
   }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle]);
 
   const handleSubmit = async () => {
-    if (!currentArticle || !label || !timerExpired) return;
+    if (!currentArticle || !label || !isTimerComplete) return;
 
     if (!userEmail) {
       alert("Session expired. Please login again.");
@@ -351,6 +354,7 @@ export default function AnnotationWorkbench() {
         let lastTxBiasScore: number | null = null;
         let lastTxKappa: number | null = null;
         let lastTxFinalLabel: BiasLabel | null = null;
+        let lastTxBinaryLabel: 0 | 1 | null = null;
         let scoreBranchEntered = false;
 
         await runTransaction(db, async (transaction) => {
@@ -600,7 +604,19 @@ export default function AnnotationWorkbench() {
             else if (savedLabel === "highly_manipulative") allCounts.highly++;
             else console.warn(`[DIAG-Issue1] Unexpected savedLabel value! savedLabel=${String(savedLabel)}`);
 
-            console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts);
+            const totalCounted = allCounts.neutral + allCounts.slightly + allCounts.highly;
+            if (totalCounted !== REQUIRED) {
+              const msg = `[SCORING-INTEGRITY-FAIL] article=${articleId} totalCounted=${totalCounted} REQUIRED=${REQUIRED} priorResponses.length=${priorResponses.length}. ` +
+                `Refusing to compute scores with wrong rater count — would produce invalid fleiss_kappa and wrong tie detection. ` +
+                `This means one or more prior response docs could not be resolved. Aborting transaction (no writes).`;
+              console.error(msg);
+              console.error(`[SCORING-INTEGRITY-FAIL] priorAnnotatedAuthoritative=`, priorAnnotatedAuthoritative);
+              console.error(`[SCORING-INTEGRITY-FAIL] priorEmailToLabel keys=`, Object.keys(priorEmailToLabel));
+              console.error(`[SCORING-INTEGRITY-FAIL] priorResponses emails=`, priorResponses.map(r => String(r?.annotator_email)));
+              throw new Error(msg);
+            }
+
+            console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts, { totalCounted, REQUIRED });
 
             const biasScore = calculateBiasScore(allCounts);
             const kappa = calculateFleissKappa(allCounts);
@@ -622,29 +638,37 @@ export default function AnnotationWorkbench() {
             const finalLabelVal =
               (topCount > 0 && topCount !== secondCount && topLabel !== null) ? topLabel : null;
 
+            // Binary ground-truth label (FYP locked spec): label=1 iff bias_score >= 2.5
+            // Algebraic equivalent: avg annotator score (0-2) >= 1.0
+            const binaryLabelVal: 0 | 1 = biasScore >= 2.5 ? 1 : 0;
+
             console.debug(`[DIAG-Issue1] COMPUTED SCORES:`, {
               biasScore,
               kappa,
               topKey, topLabel, topCount,
               secondKey: _secondKey, secondCount,
               finalLabelVal,
+              binaryLabelVal,
               tie_or_noMajority: topCount === secondCount || topCount === 0,
             });
 
             articleUpdates.bias_score = biasScore;
             articleUpdates.fleiss_kappa = kappa;
             articleUpdates.final_label = finalLabelVal;
+            articleUpdates.label = binaryLabelVal;
 
             // Write to OUTER closure (see variable declaration above runTransaction)
             lastTxCompletionCounts = allCounts;
             lastTxBiasScore = biasScore;
             lastTxKappa = kappa;
             lastTxFinalLabel = finalLabelVal;
+            lastTxBinaryLabel = binaryLabelVal;
             finalBiasScoreForStats = biasScore;
 
             const has_bias = Object.prototype.hasOwnProperty.call(articleUpdates, "bias_score");
             const has_kappa = Object.prototype.hasOwnProperty.call(articleUpdates, "fleiss_kappa");
             const has_final = Object.prototype.hasOwnProperty.call(articleUpdates, "final_label");
+            const has_label = Object.prototype.hasOwnProperty.call(articleUpdates, "label");
             console.debug(`[DIAG-Issue1] articleUpdates object that will be transaction.set(merge=true):`, {
               has_bias_score: has_bias,
               bias_score_value: articleUpdates.bias_score,
@@ -652,7 +676,9 @@ export default function AnnotationWorkbench() {
               fleiss_kappa_value: articleUpdates.fleiss_kappa,
               has_final_label: has_final,
               final_label_value: articleUpdates.final_label,
-              ALL_THREE_SCORE_KEYS_PRESENT: has_bias && has_kappa && has_final,
+              has_binary_label: has_label,
+              binary_label_value: articleUpdates.label,
+              ALL_FOUR_SCORE_KEYS_PRESENT: has_bias && has_kappa && has_final && has_label,
               annotation_count: articleUpdates.annotation_count,
               annotated_by_length: articleUpdates.annotated_by.length,
               status: articleUpdates.status,
@@ -717,7 +743,8 @@ export default function AnnotationWorkbench() {
                 ? Object.is(expectedKappa, vd.fleiss_kappa)
                 : Math.abs(Number(vd.fleiss_kappa) - Number(expectedKappa)) < 0.001;
               const labelMatch = Object.is(vd.final_label, lastTxFinalLabel);
-              const allScoresPresent = (vd.bias_score != null) && (vd.fleiss_kappa != null);
+              const binaryLabelMatch = Object.is(vd.label, lastTxBinaryLabel);
+              const allScoresPresent = (vd.bias_score != null) && (vd.fleiss_kappa != null) && (vd.label === 0 || vd.label === 1);
               console.debug({
                 scoreBranchEntered,
                 status: vd.status,
@@ -727,18 +754,21 @@ export default function AnnotationWorkbench() {
                 bias_score_readback: vd.bias_score,
                 fleiss_kappa_readback: vd.fleiss_kappa,
                 final_label_readback: vd.final_label,
+                binary_label_readback: vd.label,
                 // EXPECTED (closure values computed inside tx and written via merge)
                 bias_score_transaction: expectedBias,
                 fleiss_kappa_transaction: expectedKappa,
                 final_label_transaction: lastTxFinalLabel,
+                binary_label_transaction: lastTxBinaryLabel,
                 MATCH_bias: biasMatch,
                 MATCH_kappa: kappaMatch,
                 MATCH_finalLabel: labelMatch,
+                MATCH_binaryLabel: binaryLabelMatch,
                 SCORES_PRESENT_in_READBACK: allScoresPresent,
                 FAILURE_CLASSIFICATION:
                   !scoreBranchEntered ? "A — SCORE BRANCH NEVER ENTERED (newAnnotationCount<5 or newStatus!=complete — see WILL_ENTER_SCORE_BRANCH line)" :
-                  !allScoresPresent ? "B — SCORE BRANCH ENTERED BUT SCORES NOT WRITTEN (see ALL_THREE_SCORE_KEYS_PRESENT line, should be true)" :
-                  (!biasMatch || !kappaMatch || !labelMatch) ? "B-VALUES — SCORE BRANCH ENTERED AND WROTE BUT VALUES ARE WRONG (see MATCH_* lines — any false)" :
+                  !allScoresPresent ? "B — SCORE BRANCH ENTERED BUT SCORES NOT WRITTEN (see ALL_FOUR_SCORE_KEYS_PRESENT line, should be true)" :
+                  (!biasMatch || !kappaMatch || !labelMatch || !binaryLabelMatch) ? "B-VALUES — SCORE BRANCH ENTERED AND WROTE BUT VALUES ARE WRONG (see MATCH_* lines — any false)" :
                   "OK — scores physically written AND match in-transaction values",
               });
               console.groupEnd();
@@ -844,13 +874,22 @@ export default function AnnotationWorkbench() {
           alert("You've annotated all available articles! Please check back later for more to reach your 20-article target.");
         }
       } else {
-        // Submitting ends NOW. The useEffect will take it from here.
-        // Invalidate lastLoadedArticleIdRef so the useEffect RE-LOADS the next
-        // article (finds it via findIndex on latestAssignedArticles / latestCompletedArticles
-        // which we just wrote above) instead of short-circuiting on a stale id.
-        // Setting to null forces the load guard (line: articleId !== lastLoadedRef)
-        // to pass the very next time useEffect runs.
-        lastLoadedArticleIdRef.current = null;
+        const nextArticleId = latestAssignedArticles[nextPendingIndex];
+        lastLoadedArticleIdRef.current = nextArticleId;
+
+        // Try preloaded nextArticle first, otherwise load from cache or DB
+        const nextArt = (nextArticle && nextArticle.article_id === nextArticleId)
+          ? nextArticle
+          : await loadArticleFromCacheOrDB(nextArticleId);
+
+        if (nextArt) {
+          setCurrentIndex(nextPendingIndex);
+          setCurrentArticle(nextArt);
+          setStartTime(Date.now());
+          setTimerExpired(false);
+          setLabel(null);
+          void preloadNextArticle(nextPendingIndex + 1);
+        }
         setSubmitting(false);
       }
 
@@ -943,6 +982,7 @@ export default function AnnotationWorkbench() {
               <TimerRing
                 key={currentArticle.article_id}
                 duration={10}
+                startTime={startTime}
                 onComplete={handleTimerComplete}
               />
             </div>
@@ -1017,9 +1057,9 @@ export default function AnnotationWorkbench() {
           <div className="pt-4">
             <button
               onClick={handleSubmit}
-              disabled={!label || !timerExpired || submitting || verifyingFinalAnnotations}
+              disabled={!label || !isTimerComplete || submitting || verifyingFinalAnnotations}
               className={`w-full py-4 rounded-xl font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-2 ${
-                label && timerExpired && !submitting && !verifyingFinalAnnotations
+                label && isTimerComplete && !submitting && !verifyingFinalAnnotations
                   ? "bg-primary text-white shadow-primary/25 hover:bg-primary/90"
                   : "bg-slate-100 text-slate-400 cursor-not-allowed shadow-none"
               }`}
@@ -1031,7 +1071,7 @@ export default function AnnotationWorkbench() {
                   <Loader2 className="animate-spin" size={24} />
                   <span>Saving & Verifying Final Annotations...</span>
                 </>
-              ) : !timerExpired ? (
+              ) : !isTimerComplete ? (
                 <span>Wait for timer...</span>
               ) : !label ? (
                 <span>Select a tone to continue</span>
@@ -1039,7 +1079,7 @@ export default function AnnotationWorkbench() {
                 <>Submit & Next <Check size={20} /></>
               )}
             </button>
-            {!timerExpired && (
+            {!isTimerComplete && (
               <p className="text-center text-xs text-slate-400 mt-3">
                 Please read the article thoroughly before submitting.
               </p>

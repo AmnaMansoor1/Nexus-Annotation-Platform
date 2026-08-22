@@ -152,7 +152,7 @@ export function reconcileArticle(
 
   const needsScoreClear =
     annotationCount < requiredAnnotations &&
-    (raw.bias_score != null || raw.fleiss_kappa != null || (raw as any).final_label != null);
+    (raw.bias_score != null || raw.fleiss_kappa != null || (raw as any).final_label != null || (raw as any).label != null);
 
   const oldAssignedTo = rawAssignedTo;
   const oldAnnotatedBy = rawAnnotatedBy;
@@ -171,6 +171,7 @@ export function reconcileArticle(
     (articleRaw as any).bias_score = null;
     (articleRaw as any).fleiss_kappa = null;
     (articleRaw as any).final_label = null;
+    (articleRaw as any).label = null;
   }
   const article = articleRaw as Article;
 
@@ -198,6 +199,7 @@ export function reconcileArticle(
     (updates as any).bias_score = null;
     (updates as any).fleiss_kappa = null;
     (updates as any).final_label = null;
+    (updates as any).label = null;
   }
 
   return { article, needsPersist: true, updates };

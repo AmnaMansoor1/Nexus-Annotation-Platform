@@ -309,6 +309,7 @@ export default function Dashboard() {
           if (article.bias_score !== null) { updates.bias_score = null; needsRepair = true; }
           if (article.fleiss_kappa !== null) { updates.fleiss_kappa = null; needsRepair = true; }
           if (article.final_label !== null) { updates.final_label = null; needsRepair = true; }
+          if (article.label !== null && article.label !== undefined) { updates.label = null; needsRepair = true; }
         }
 
         const repaired: Article = {
