@@ -90,6 +90,15 @@ export default function AnnotationWorkbench() {
     setTimerExpired(true);
   }, []);
 
+  // Centralized single source of truth for article activation:
+  // Resets timer & form state EXACTLY ONCE when a new article becomes active.
+  useEffect(() => {
+    if (!currentArticle?.article_id) return;
+    setStartTime(Date.now());
+    setTimerExpired(false);
+    setLabel(null);
+  }, [currentArticle?.article_id]);
+
   // Track last loaded article to prevent unnecessary reloads
   const lastLoadedArticleIdRef = useRef<string | null>(null);
   // Guard to prevent concurrent loadArticle() invocations (fixes hangs)
@@ -205,10 +214,6 @@ export default function AnnotationWorkbench() {
           
           if (article) {
             setCurrentArticle(article);
-            setStartTime(Date.now());
-            setTimerExpired(false);
-            setLabel(null);
-            
             await preloadNextArticle(firstPendingIndex + 1);
           } else {
             console.warn(`[AnnotationWorkbench] loadArticleFromCacheOrDB(${articleId}) returned null/undefined — article may not exist in Firestore.`);
@@ -885,9 +890,6 @@ export default function AnnotationWorkbench() {
         if (nextArt) {
           setCurrentIndex(nextPendingIndex);
           setCurrentArticle(nextArt);
-          setStartTime(Date.now());
-          setTimerExpired(false);
-          setLabel(null);
           void preloadNextArticle(nextPendingIndex + 1);
         }
         setSubmitting(false);
@@ -982,7 +984,6 @@ export default function AnnotationWorkbench() {
               <TimerRing
                 key={currentArticle.article_id}
                 duration={10}
-                startTime={startTime}
                 onComplete={handleTimerComplete}
               />
             </div>

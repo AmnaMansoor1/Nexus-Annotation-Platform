@@ -6,19 +6,18 @@ interface TimerRingProps {
   onComplete: () => void;
 }
 
-export default function TimerRing({ duration, startTime, onComplete }: TimerRingProps) {
+export default function TimerRing({ duration, onComplete }: TimerRingProps) {
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
   const completedFiredRef = useRef(false);
+  const startMsRef = useRef<number>(Date.now());
 
-  const getEffectiveStart = () => (typeof startTime === "number" && startTime > 0 ? startTime : Date.now());
-
-  const calcRemaining = (startMs: number) => {
-    const elapsedSec = Math.floor((Date.now() - startMs) / 1000);
+  const calcRemaining = () => {
+    const elapsedSec = Math.floor((Date.now() - startMsRef.current) / 1000);
     return Math.max(0, duration - elapsedSec);
   };
 
-  const [timeLeft, setTimeLeft] = useState(() => calcRemaining(getEffectiveStart()));
+  const [timeLeft, setTimeLeft] = useState(() => calcRemaining());
 
   const strokeWidth = 4;
   const radius = 20;
@@ -27,8 +26,7 @@ export default function TimerRing({ duration, startTime, onComplete }: TimerRing
 
   useEffect(() => {
     completedFiredRef.current = false;
-    const startMs = getEffectiveStart();
-    const initialRemaining = calcRemaining(startMs);
+    const initialRemaining = calcRemaining();
     setTimeLeft(initialRemaining);
 
     if (initialRemaining <= 0) {
@@ -40,7 +38,7 @@ export default function TimerRing({ duration, startTime, onComplete }: TimerRing
     }
 
     const interval = setInterval(() => {
-      const remaining = calcRemaining(startMs);
+      const remaining = calcRemaining();
       setTimeLeft(remaining);
 
       if (remaining <= 0) {
@@ -50,13 +48,14 @@ export default function TimerRing({ duration, startTime, onComplete }: TimerRing
             onCompleteRef.current();
           } catch {}
         }
+        clearInterval(interval);
       }
     }, 200);
 
     return () => {
       clearInterval(interval);
     };
-  }, [duration, startTime]);
+  }, [duration]);
 
   // Safety fallback: if timeLeft ever hits 0 and completion hasn't fired
   useEffect(() => {
