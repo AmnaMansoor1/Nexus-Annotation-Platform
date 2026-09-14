@@ -19,20 +19,17 @@ export default function Completion() {
         if (snap.exists()) {
           const data = snap.data() as Annotator;
           const completedArr = Array.isArray(data.completed_articles) ? data.completed_articles : [];
-          // Defense-in-depth: require BOTH the `completed` boolean AND
-          // 20+ entries in completed_articles. This avoids showing
-          // "Mission Accomplished" when an off-by-one left the array one short.
-          let confirmedDone = !!data.completed && completedArr.length >= 20;
+          // Defense-in-depth: consider confirmed done if 20+ articles or marked completed
+          let confirmedDone = (!!data.completed && completedArr.length >= 20) || completedArr.length >= 20;
 
-          // If it looks like we're almost there (bool says done but array is
-          // short), retry once after a short delay (the write may be settling).
-          if (!!data.completed && completedArr.length >= 19 && completedArr.length < 20) {
-            await new Promise(r => setTimeout(r, 600));
+          // If it looks like we're almost there, retry once after a short delay (the write may be settling).
+          if (!confirmedDone && (completedArr.length >= 19 || !!data.completed)) {
+            await new Promise(r => setTimeout(r, 800));
             snap = await getDoc(docRef);
             if (snap.exists()) {
               const retryData = snap.data() as Annotator;
               const retryArr = Array.isArray(retryData.completed_articles) ? retryData.completed_articles : [];
-              confirmedDone = !!retryData.completed && retryArr.length >= 20;
+              confirmedDone = (!!retryData.completed && retryArr.length >= 20) || retryArr.length >= 20;
             }
           }
 

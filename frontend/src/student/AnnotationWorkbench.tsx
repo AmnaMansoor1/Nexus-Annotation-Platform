@@ -182,7 +182,7 @@ export default function AnnotationWorkbench() {
   // Load current article based on assigned pool and local completed state
   useEffect(() => {
     async function loadArticle() {
-      if (loadArticleRunningRef.current) {
+      if (loadArticleRunningRef.current || submitting) {
         return;
       }
       loadArticleRunningRef.current = true;
@@ -231,13 +231,13 @@ export default function AnnotationWorkbench() {
       }
     }
 
-    if (!assignmentLoading) {
+    if (!assignmentLoading && !submitting) {
       loadArticle();
     }
-  }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle]);
+  }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle, submitting]);
 
   const handleSubmit = async () => {
-    if (!currentArticle || !label || !isTimerComplete) return;
+    if (!currentArticle || !label || !isTimerComplete || submitting) return;
 
     if (!userEmail) {
       alert("Session expired. Please login again.");
@@ -248,13 +248,8 @@ export default function AnnotationWorkbench() {
     const timeSpent = Math.round((Date.now() - startTime) / 1000);
     const articleId = currentArticle.article_id;
 
-    // --- 1. INSTANT OPTIMISTIC UI UPDATE ---
+    // --- CAPTURE VARS & LOCK SUBMISSION (DO NOT optimistically navigate or trigger completion effects) ---
     const newCompletedArticles = [...completedArticles, articleId];
-    setCompletedArticles(newCompletedArticles);
-    const newCompletedCount = Math.min(completedCount + 1, 20);
-    setCompletedCount(newCompletedCount);
-
-    // --- 2. CAPTURE ALL VARS WE NEED TO SAVE FIRST ---
     const savedLabel = label;
     const savedCurrentArticle = currentArticle;
     setSubmitting(true);
@@ -790,11 +785,7 @@ export default function AnnotationWorkbench() {
       // --- 4. Transaction was atomic — if we reached here, the save is DONE.
       txnCommitted = true;
 
-      // --- 5. Lightweight verify: try to read the response doc (non-fatal if
-      // rules block it — we trust the atomic transaction). If the annotator
-      // read fails on PERMISSION_DENIED, we continue using the optimistic
-      // local state instead of throwing and confusing the user.
-      let completedCountFromServer: number | null = null;
+      // --- 5. Read verified state from server (with graceful fallbacks)
       let latestAssignedArticles: string[] = [...assignedArticlesState];
       let latestCompletedArticles: string[] = [...newCompletedArticles];
       let latestAnnotator: Annotator | null = null;
@@ -806,37 +797,31 @@ export default function AnnotationWorkbench() {
           safeGetDoc(verifyRef),
           safeGetDoc(annotatorRef),
         ]);
-        // Treat a missing verification doc only as a soft-warning (console).
         if (!verifyDoc.exists()) {
           console.warn("[AnnotationWorkbench] Could not independently verify response doc (rules?), but transaction succeeded.");
         }
         if (initialAnnotatorCheck.exists()) {
           const data = initialAnnotatorCheck.data() as Annotator;
           latestAnnotator = data;
-          completedCountFromServer = data.completed_articles?.length ?? newCompletedArticles.length;
           latestAssignedArticles = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : latestAssignedArticles;
           latestCompletedArticles = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : latestCompletedArticles;
-          // Refresh local state with server truth immediately.
-          setAssignedArticlesState(latestAssignedArticles);
-          setCompletedArticles(latestCompletedArticles);
-          setCompletedCount(Math.min(latestCompletedArticles.length, 20));
-        } else {
-          completedCountFromServer = newCompletedArticles.length;
         }
       } catch (readErr: any) {
-        console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to optimistic state:", readErr);
-        completedCountFromServer = newCompletedArticles.length;
+        console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to local state:", readErr);
       }
-      
-      // Find next pending index using the LATEST data
-      let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
 
-      // --- 6. If completed count reached 20, go straight to the done screen.
-      if (latestCompletedArticles.length >= 20) {
+      // --- 6. If completed count reached 20 (or annotator is marked completed), go to done screen!
+      const isTargetReached = latestCompletedArticles.length >= 20 || (latestAnnotator && latestAnnotator.completed);
+      if (isTargetReached) {
+        setCompletedArticles(latestCompletedArticles);
+        setCompletedCount(20);
         setSubmitting(false);
         navigate("/done");
         return;
       }
+      
+      // Find next pending index using the LATEST data
+      let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
 
       // If we still don't have a next article, and haven't reached 20 completed, try to load more!
       if (nextPendingIndex === -1 && latestCompletedArticles.length < 20) {
@@ -855,17 +840,7 @@ export default function AnnotationWorkbench() {
         }
       }
 
-      // ── SINGLE SOURCE OF TRUTH: ONE consolidated state update. ──
-      // NEVER call setCurrentIndex / setCurrentArticle from handleSubmit.
-      // The useEffect (lines ~171–229) owns ALL article transitions:
-      //   • It reads assignedArticlesState + completedArticles (which we set here)
-      //   • Uses loadArticleRunningRef guard against concurrent execution
-      //   • Uses lastLoadedArticleIdRef to skip re-loads of the same article
-      //   • Resets startTime / timerExpired / label correctly
-      //   • Preloads the FOLLOWING article after advancing
-      // This eliminates the race where BOTH handleSubmit + useEffect wrote
-      // setCurrentArticle(article2) concurrently (causing TimerRing remount loop
-      // + label reset mid-user-interaction = UI freeze on 2nd article).
+      // ── SINGLE SOURCE OF TRUTH: Update local state after successful commit. ──
       setAssignedArticlesState(latestAssignedArticles);
       setCompletedArticles(latestCompletedArticles);
       setCompletedCount(Math.min(latestCompletedArticles.length, 20));
@@ -901,18 +876,10 @@ export default function AnnotationWorkbench() {
       setVerifyingFinalAnnotations(false);
 
       if (txnCommitted) {
-        // The Firestore write actually succeeded — the error came from a
-        // soft post-read / navigation. The annotation is persisted. Do NOT
-        // roll back the optimistic UI so the user isn't confused into
-        // re-annotating the same article (and double-incrementing server data).
-        console.warn("[AnnotationWorkbench] Transaction already committed before error. Keeping optimistic UI state.");
-        // If a soft error happened but we can't reliably advance, reload.
-        alert("Your annotation was saved. The next article is loading slowly — please refresh if nothing changes.");
+        console.warn("[AnnotationWorkbench] Transaction already committed before error. Keeping state.");
+        alert("Your annotation was saved. Please refresh if the next article does not load automatically.");
       } else {
-        // Actual write failure — undo the optimistic UI.
-        alert("Annotation failed to save properly. Please refresh and try again!");
-        setCompletedArticles(prev => prev.filter(id => id !== articleId));
-        setCompletedCount(prev => prev - 1);
+        alert("Annotation failed to save properly. Please check your connection and click Submit again!");
       }
     }
   };
@@ -1077,7 +1044,9 @@ export default function AnnotationWorkbench() {
               ) : !label ? (
                 <span>Select a tone to continue</span>
               ) : (
-                <>Submit & Next <Check size={20} /></>
+                <>
+                  {completedCount >= 19 ? "Submit & Finish" : "Submit & Next"} <Check size={20} />
+                </>
               )}
             </button>
             {!isTimerComplete && (
