@@ -37,7 +37,13 @@ export function isEligible(article: Article, email: string, requiredAnnotations:
   }
 
   if (article.assigned_count >= requiredAnnotations) return { ok: false, reason: `assigned_count=${article.assigned_count}>=${requiredAnnotations}` };
-  if (article.assigned_to.includes(email)) return { ok: false, reason: "already-assigned-to-me" };
+  
+  const emailNorm = email.toLowerCase().trim();
+  const assignedList = Array.isArray(article.assigned_to) ? article.assigned_to.map(e => String(e).toLowerCase().trim()) : [];
+  if (assignedList.includes(emailNorm)) return { ok: false, reason: "already-assigned-to-me" };
+
+  const annotatedList = Array.isArray(article.annotated_by) ? article.annotated_by.map(e => String(e).toLowerCase().trim()) : [];
+  if (annotatedList.includes(emailNorm)) return { ok: false, reason: "already-annotated-by-me" };
 
   return { ok: true };
 }

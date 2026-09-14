@@ -358,12 +358,6 @@ export default function AnnotationWorkbench() {
         let scoreBranchEntered = false;
 
         await runTransaction(db, async (transaction) => {
-          const responseSnap = await txGetSafe(transaction, responseRef);
-          if (responseSnap.exists()) {
-            console.debug(`[DIAG-Issue1] article=${articleId} idempotency-guard: response doc exists → bail.`);
-            return;
-          }
-
           const articleSnap = await txGetSafe(transaction, articleRef);
           if (!articleSnap.exists()) {
             console.debug(`[DIAG-Issue1] article=${articleId} article doc MISSING → bail.`);
@@ -428,16 +422,11 @@ export default function AnnotationWorkbench() {
             article_finalLabel_before: articleData.final_label,
           });
 
-          // Guard: student has already submitted?
-          if (priorDistinctAnnotatorSetAuthoritative.has(emailNorm)) {
-            console.debug(`[DIAG-Issue1] article=${articleId} already-in-annotated_by guard → bail.`);
-            return;
-          }
-
-          // Guard: article already has 5 distinct submissions?
+          // Guard: article already has 5 distinct other submissions?
           const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
           if (priorDistinctCount >= REQUIRED) {
-            console.debug(`[DIAG-Issue1] article=${articleId} priorDistinctCount=${priorDistinctCount}>=${REQUIRED} → bail (full).`);
+            console.debug(`[DIAG-Issue1] article=${articleId} priorDistinctCount=${priorDistinctCount}>=${REQUIRED} → marking annotator done & advance.`);
+            transaction.set(annotatorRef, { completed_articles: arrayUnion(articleId) }, { merge: true });
             return;
           }
 
