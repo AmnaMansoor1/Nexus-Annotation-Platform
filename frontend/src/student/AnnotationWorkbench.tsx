@@ -249,7 +249,7 @@ export default function AnnotationWorkbench() {
     const articleId = currentArticle.article_id;
 
     // --- CAPTURE VARS & LOCK SUBMISSION (DO NOT optimistically navigate or trigger completion effects) ---
-    const newCompletedArticles = [...completedArticles, articleId];
+    const newCompletedArticles = Array.from(new Set([...completedArticles, articleId]));
     const savedLabel = label;
     const savedCurrentArticle = currentArticle;
     setSubmitting(true);
@@ -436,6 +436,10 @@ export default function AnnotationWorkbench() {
             return;
           }
           const annotatorData = annotatorSnap.data() as Annotator;
+
+          // Safe read of responseRef inside transaction before any writes
+          const responseSnap = await txGetSafe(transaction, responseRef);
+          const responseAlreadyExists = typeof responseSnap?.exists === "function" ? responseSnap.exists() : false;
 
           // Single authoritative next state
           const newAnnotatedBy = Array.from(
@@ -676,7 +680,11 @@ export default function AnnotationWorkbench() {
           }
 
           transaction.set(articleRef, articleUpdates, { merge: true });
-          transaction.set(responseRef, responseData);
+          if (!responseAlreadyExists) {
+            transaction.set(responseRef, responseData);
+          } else {
+            console.debug(`[AnnotationWorkbench] response doc already exists for ${articleId} by ${userEmail} — skipping duplicate response creation`);
+          }
 
           if (articleData.status !== newStatus) {
             prevStatusForStats = articleData.status === "pending" || articleData.status === "partial"
@@ -697,7 +705,11 @@ export default function AnnotationWorkbench() {
             annotatorUpdates.gold_accuracy = Math.round((newCorrect / newTotal) * 100);
             annotatorUpdates.reliability_score = annotatorUpdates.gold_accuracy;
           }
-          const totalCompleted = (annotatorData.completed_articles?.length || 0) + 1;
+          const currentCompletedSet = new Set(
+            Array.isArray(annotatorData.completed_articles) ? annotatorData.completed_articles : []
+          );
+          currentCompletedSet.add(articleId);
+          const totalCompleted = currentCompletedSet.size;
           if (totalCompleted >= 20) annotatorUpdates.completed = true;
           transaction.set(annotatorRef, annotatorUpdates, { merge: true });
         });

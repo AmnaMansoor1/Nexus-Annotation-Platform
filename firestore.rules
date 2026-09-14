@@ -93,10 +93,9 @@ service cloud.firestore {
         // `annotator_email` equal to the caller's auth email, AND that email
         // is on the domain whitelist. So responses can only be written by
         // legitimate signed-in users.
-        allow create: if isAuthenticated()
+        allow create, update: if isAuthenticated()
                          && requestHasEmail('annotator_email')
                          && isAllowedStudentEmail(request.resource.data.annotator_email);
-        allow update: if false;
         allow delete: if isAdmin();
       }
     }
