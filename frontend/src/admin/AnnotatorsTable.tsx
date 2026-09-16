@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
-  collection, doc, updateDoc, getDoc, getDocs, deleteDoc, runTransaction,
-  increment
+  collection, collectionGroup, doc, updateDoc, getDoc, getDocs, deleteDoc,
+  runTransaction, increment, query, where
 } from "firebase/firestore";
 import { db } from "../firebase";
 import { Annotator, Article } from "../types";
@@ -75,6 +75,7 @@ export default function AnnotatorsTable() {
       `⚠️  PERMANENTLY DELETE annotator: ${email}\n\n` +
       `This will:\n` +
       `  • Delete their annotator profile\n` +
+      `  • Scan ALL articles (collectionGroup query) to find every response doc — including orphans not in their profile\n` +
       `  • Free ${completedLocal} completed annotations + ${assignedOnlyLocal - completedLocal >= 0 ? (assignedOnlyLocal - completedLocal) : 0} assigned-but-unfinished slots\n` +
       `  • Decrement annotation_count + assigned_count on every affected article\n` +
       `  • Recompute status; bias_score/fleiss_kappa recalculated ONLY when exactly 5 labels remain\n` +
@@ -106,12 +107,61 @@ export default function AnnotatorsTable() {
       const assignedArticleIds = Array.isArray(annotator.assigned_articles)
         ? [...new Set(annotator.assigned_articles.filter(Boolean))]
         : [];
-      const articleIdsFromAnnotator = [...new Set([...completedArticleIds, ...assignedArticleIds])];
+      const profileKnownIds = new Set([...completedArticleIds, ...assignedArticleIds]);
+
+      // ── PRE-SCAN: collectionGroup query to find ALL response docs belonging
+      //    to this annotator across every article — catches orphans that are NOT
+      //    listed in their annotator profile (assigned_articles / completed_articles).
+      //    Without this, orphaned docs survive deletion and corrupt future scoring.
+      const orphanArticleIds: string[] = [];
+      try {
+        console.log(`[HardDelete:${email}] Running collectionGroup("responses") pre-scan...`);
+        const orphanQ = query(
+          collectionGroup(db, "responses"),
+          where("annotator_email", "==", email)
+        );
+        const orphanSnap = await getDocs(orphanQ);
+        for (const d of orphanSnap.docs) {
+          // Path is: annotations/{articleId}/responses/{docId}
+          // d.ref.parent.parent.id === articleId
+          const articleId = d.ref.parent.parent?.id;
+          if (articleId && !profileKnownIds.has(articleId)) {
+            orphanArticleIds.push(articleId);
+            console.warn(`[HardDelete:${email}] ORPHAN response doc found: annotations/${articleId}/responses/${d.id} (not in annotator profile)`);
+          }
+        }
+        console.log(`[HardDelete:${email}] Pre-scan complete. Orphaned article IDs found: ${orphanArticleIds.length}`);
+      } catch (scanErr: any) {
+        // collectionGroup query may fail if the index isn't deployed yet.
+        // Log the error but continue — the profile-based IDs will still be processed.
+        console.error(
+          `[HardDelete:${email}] collectionGroup pre-scan FAILED (index missing?). ` +
+          `Orphaned response docs may survive. Deploy firestore.indexes.json to fix.`,
+          scanErr
+        );
+        alert(
+          `⚠️  Warning: The "Find all orphaned response docs" scan failed.\n` +
+          `Error: ${scanErr?.message ?? String(scanErr)}\n\n` +
+          `This usually means the Firestore index for responses.annotator_email is not deployed yet.\n` +
+          `Run: firebase deploy --only firestore:indexes\n\n` +
+          `Deletion will continue using the annotator profile lists only. ` +
+          `Orphaned response docs (if any) may need manual cleanup.`
+        );
+      }
+
+      const articleIdsFromAnnotator = [...new Set([
+        ...profileKnownIds,
+        ...orphanArticleIds,
+      ])];
 
       const completedCount = completedArticleIds.length;
       const assignedOnlyCount = articleIdsFromAnnotator.length - completedCount;
 
-      console.log(`[HardDelete:${email}] Articles to process: ${articleIdsFromAnnotator.length} (completed=${completedCount}, assigned-only=${assignedOnlyCount})`);
+      console.log(
+        `[HardDelete:${email}] Articles to process: ${articleIdsFromAnnotator.length}`,
+        `(profile-known=${profileKnownIds.size}, orphans-from-scan=${orphanArticleIds.length},`,
+        `completed=${completedCount}, assigned-only=${assignedOnlyCount})`
+      );
 
       const errors: string[] = [];
       let articleBecameIncomplete = 0;
@@ -367,7 +417,8 @@ export default function AnnotatorsTable() {
       const partialToPending = Math.max(0, articleBecameIncomplete - articleBecamePartial - articleBecamePending);
       let summary =
         `✅ Deleted ${email} successfully.\n\n` +
-        `  Articles touched: ${processed}\n` +
+        `  Articles touched: ${processed}` +
+          (orphanArticleIds.length > 0 ? ` (incl. ${orphanArticleIds.length} orphaned response docs found via full scan)` : "") + `\n` +
         `  Status transitions:\n` +
         `    complete → partial: ${articleBecamePartial}\n` +
         `    complete → pending: ${articleBecamePending}\n` +
