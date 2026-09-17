@@ -8,7 +8,12 @@ service cloud.firestore {
     }
     
     function isAdmin() {
-      return isAuthenticated() && request.auth.token.email.lower() == "admin@gmail.com";
+      return isAuthenticated() && (
+        request.auth.token.email.lower() == "admin@gmail.com"
+        || (exists(/databases/$(database)/documents/admin_config/settings)
+            && get(/databases/$(database)/documents/admin_config/settings).data.admin_emails is list
+            && request.auth.token.email.lower() in get(/databases/$(database)/documents/admin_config/settings).data.admin_emails)
+      );
     }
     
     function authEmailLower() {
@@ -98,6 +103,16 @@ service cloud.firestore {
                          && isAllowedStudentEmail(request.resource.data.annotator_email);
         allow delete: if isAdmin();
       }
+    }
+
+    // ── Collection-group rule for responses ─────────────────────────────────
+    // collectionGroup("responses") queries (used by admin hard-delete pre-scan
+    // to find ALL response docs for a given annotator across every article)
+    // require a top-level wildcard match. Without this, Firestore denies the
+    // query with PERMISSION_DENIED even though per-document reads on the same
+    // path are allowed by the nested rule above.
+    match /{path=**}/responses/{docId} {
+      allow read: if isAdmin();
     }
 
     match /admin_config/{document=**} {

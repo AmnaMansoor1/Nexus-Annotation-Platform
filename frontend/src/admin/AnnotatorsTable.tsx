@@ -132,18 +132,54 @@ export default function AnnotatorsTable() {
         }
         console.log(`[HardDelete:${email}] Pre-scan complete. Orphaned article IDs found: ${orphanArticleIds.length}`);
       } catch (scanErr: any) {
-        // collectionGroup query may fail if the index isn't deployed yet.
-        // Log the error but continue — the profile-based IDs will still be processed.
+        const errCode = scanErr?.code || "";
+        const errMsg = scanErr?.message ?? String(scanErr);
+        let diagnosis: string;
+        let actionHint: string;
+        let currentAdminEmail = "current user";
+        try {
+          const sessionRaw = localStorage.getItem("nexus_user_session");
+          if (sessionRaw) {
+            const parsed = JSON.parse(sessionRaw);
+            if (parsed?.email) currentAdminEmail = parsed.email;
+          }
+        } catch {}
+        if (errCode === "permission-denied" || /permission|insufficient|denied/i.test(errMsg)) {
+          diagnosis =
+            `Firestore security rules rejected the orphan-scan query.\n` +
+            `This means your admin email (${currentAdminEmail}) ` +
+            `is not recognized as admin server-side, or firestore.rules has not been deployed yet.`;
+          actionHint =
+            `Fix:\n` +
+            `  1. Add your email to Admin Emails in /admin/settings (if not already there).\n` +
+            `  2. Deploy the updated rules: firebase deploy --only firestore:rules\n` +
+            `  3. Then retry the hard delete.`;
+        } else if (errCode === "failed-precondition" || /index|precondition/i.test(errMsg)) {
+          diagnosis =
+            `Firestore rejected the orphan-scan query because the required ` +
+            `collection-group index for responses.annotator_email is not deployed yet.`;
+          actionHint =
+            `Fix: Deploy the missing index:\n` +
+            `  firebase deploy --only firestore:indexes\n` +
+            `Then retry the hard delete.`;
+        } else {
+          diagnosis = `The orphan-scan query failed with an unexpected error (code=${errCode}).`;
+          actionHint =
+            `Troubleshoot:\n` +
+            `  • Check browser Console for full stack trace.\n` +
+            `  • Verify Firestore rules and indexes are deployed.\n` +
+            `  • Retry the hard delete after fixing.`;
+        }
         console.error(
-          `[HardDelete:${email}] collectionGroup pre-scan FAILED (index missing?). ` +
-          `Orphaned response docs may survive. Deploy firestore.indexes.json to fix.`,
+          `[HardDelete:${email}] collectionGroup pre-scan FAILED. ` +
+          `Orphaned response docs may survive. ` +
+          `Diagnosis: ${diagnosis}`,
           scanErr
         );
         alert(
-          `⚠️  Warning: The "Find all orphaned response docs" scan failed.\n` +
-          `Error: ${scanErr?.message ?? String(scanErr)}\n\n` +
-          `This usually means the Firestore index for responses.annotator_email is not deployed yet.\n` +
-          `Run: firebase deploy --only firestore:indexes\n\n` +
+          `⚠️  Warning: The "Find all orphaned response docs" scan failed.\n\n` +
+          `Diagnosis:\n${diagnosis}\n\n` +
+          `${actionHint}\n\n` +
           `Deletion will continue using the annotator profile lists only. ` +
           `Orphaned response docs (if any) may need manual cleanup.`
         );
