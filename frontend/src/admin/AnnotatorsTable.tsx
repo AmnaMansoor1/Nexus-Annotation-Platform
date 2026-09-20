@@ -197,20 +197,36 @@ export default function AnnotatorsTable() {
           `⚠️  The "Find ALL response docs to delete" scan failed.\n\n` +
           `Diagnosis:\n${diagnosis}\n\n` +
           `${actionHint}\n\n` +
-          `Do you want to CONTINUE deleting ONLY the response docs listed in ` +
-          `${email}'s profile (${completedLocal} known responses)?\n` +
-          `Orphan response docs (if any) will NOT be deleted and will ` +
-          `continue counting toward article annotation_count.`
+          `Proceeding with fallback: scanning ${profileKnownIds.size} articles from ${email}'s profile directly.\n` +
+          `True orphan responses (if any) in articles OUTSIDE their profile will NOT be caught.`
         );
         if (!cont) {
           setLoading(false);
           return;
         }
-        // Fallback: build response doc refs from profile-known completed articles
-        for (const artId of completedArticleIds) {
-          allResponseDocRefs.push(doc(db, "annotations", artId, "responses", docId));
-          affectedArticleIds.add(artId);
+        // Fallback: scan each known article's /responses subcollection directly.
+        // No collectionGroup index required — just per-article getDocs reads.
+        // Filter by annotator_email field so doc ID format doesn't matter.
+        console.log(`[HardDelete:${email}] Fallback: scanning ${profileKnownIds.size} known articles individually...`);
+        for (const artId of [...profileKnownIds]) {
+          try {
+            const respSubSnap = await getDocs(collection(db, "annotations", artId, "responses"));
+            for (const rd of respSubSnap.docs) {
+              const rdEmail = typeof (rd.data() as any).annotator_email === "string"
+                ? (rd.data() as any).annotator_email.toLowerCase().trim()
+                : "";
+              if (rdEmail === email) {
+                allResponseDocRefs.push(rd.ref);
+                affectedArticleIds.add(artId);
+              }
+            }
+          } catch {
+            // Sub-read failed — fall back to doc-ID guess for this article only
+            allResponseDocRefs.push(doc(db, "annotations", artId, "responses", docId));
+            affectedArticleIds.add(artId);
+          }
         }
+        console.log(`[HardDelete:${email}] Fallback scan done. Found ${allResponseDocRefs.length} response doc(s) to delete.`);
       }
 
       // Profile-known assigned-only articles (they were assigned but never
