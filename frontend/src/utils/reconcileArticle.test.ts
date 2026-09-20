@@ -155,12 +155,12 @@ describe("reconcileArticle self-heal", () => {
     expect(result.article.assigned_to).toEqual(["a@test.com"]);
   });
 
-  describe("Issue-1: responseAnnotatorEmails union with raw.annotated_by (prevents deleted-annotator wipe)", () => {
-    test("responseAnnotatorEmails RESTORES 4/5 annotations that were wiped by deleted-annotator filter", () => {
-      // Simulate: 4 annotators (A,B,C,D) submitted, then they were deleted from
-      // /annotators. reconcileArticle's old behavior would filter all 4 out of
-      // raw.annotated_by → annotation_count=0, status=pending. CSV still shows
-      // 4 responses in subcollection. New behavior UNIONS raw with responses.
+  describe("Issue-1: responseAnnotatorEmails union with raw.annotated_by (deleted annotators' responses are NOT counted)", () => {
+    test("responseAnnotatorEmails EXCLUDES deleted annotator responses → 0/5, pending", () => {
+      // NEW REQUIREMENT: Deleted annotators' response docs MUST be physically
+      // purged from /responses during hardDeleteAnnotator, and even if any
+      // survive a race they are EXPLICITLY EXCLUDED from annotation_count
+      // here so they do NOT satisfy the 5-annotator completion gate.
       const ctx = ctxFromLive(new Set(["newuser@x.com"])); // only a new live user, all 4 are deleted
       const result = reconcileArticle(
         {
@@ -182,15 +182,14 @@ describe("reconcileArticle self-heal", () => {
           ],
         }
       );
-      // Even though all 4 are "deleted" from annotators, response docs still
-      // exist physically → they count toward annotation_count.
-      expect(result.article.annotation_count).toBe(4);
-      expect(result.article.annotated_by.length).toBe(4);
-      expect(result.article.status).toBe("partial");
+      // All 4 annotators are deleted → responses are excluded, no valid annotations.
+      expect(result.article.annotation_count).toBe(0);
+      expect(result.article.annotated_by.length).toBe(0);
+      expect(result.article.status).toBe("pending");
       expect(result.needsPersist).toBe(true); // raw vs union changed
     });
 
-    test("responseAnnotatorEmails UNION with raw.annotated_by merges disjoint sets", () => {
+    test("responseAnnotatorEmails UNION with raw.annotated_by keeps ONLY live annotators (a,d)", () => {
       const ctx = ctxFromLive(new Set(["a@x.com", "d@x.com"]));
       const result = reconcileArticle(
         {
@@ -204,12 +203,12 @@ describe("reconcileArticle self-heal", () => {
         ctx,
         5,
         {
-          // Responses contain a (already in raw) plus d (live) plus deleted b,c
+          // Responses: a (live, in raw) + d (live, not in raw) + b,c (DELETED, excluded)
           responseAnnotatorEmails: ["a@x.com", "b-deleted@x.com", "c-deleted@x.com", "d@x.com"],
         }
       );
-      expect(result.article.annotation_count).toBe(4); // a,d from live ∪ b-deleted,c-deleted via responses
-      expect(new Set(result.article.annotated_by).size).toBe(4);
+      expect(result.article.annotation_count).toBe(2); // only a + d are LIVE; b-deleted and c-deleted excluded
+      expect(new Set(result.article.annotated_by).size).toBe(2);
       expect(result.article.status).toBe("partial");
     });
 
