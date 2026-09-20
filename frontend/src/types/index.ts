@@ -50,6 +50,8 @@ export interface Annotator {
   gold_total_count?: number;
   gold_correct_count?: number;
   gold_accuracy?: number;
+  /** The real Firestore document ID — set when loading from /annotators collection. Never written to Firestore. */
+  firestoreDocId?: string;
 }
 
 export interface AdminConfig {

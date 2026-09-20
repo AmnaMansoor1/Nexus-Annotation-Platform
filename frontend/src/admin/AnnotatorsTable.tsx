@@ -22,7 +22,10 @@ export default function AnnotatorsTable() {
     setRefreshing(true);
     try {
       const snap = await getDocs(collection(db, "annotators"));
-      setAnnotators(snap.docs.map(d => d.data() as Annotator));
+      // Store the REAL Firestore doc ID alongside the data so delete/update
+      // operations always use the correct path even if the email was stored
+      // with a different sanitization scheme than sanitizeEmailForDocId().
+      setAnnotators(snap.docs.map(d => ({ ...(d.data() as Annotator), firestoreDocId: d.id })));
     } catch (error) {
       console.error("Error loading annotators:", error);
     } finally {
@@ -37,7 +40,9 @@ export default function AnnotatorsTable() {
 
   const toggleDeactivate = async (annotator: Annotator) => {
     try {
-      const ref = doc(db, "annotators", sanitizeEmailForDocId(annotator.email));
+      // Prefer the real stored doc ID; fall back to sanitized email
+      const resolvedDocId = annotator.firestoreDocId || sanitizeEmailForDocId(annotator.email);
+      const ref = doc(db, "annotators", resolvedDocId);
       await updateDoc(ref, { deactivated: !annotator.deactivated });
       // Refresh list to show the updated state immediately
       loadAnnotators();
@@ -99,7 +104,10 @@ export default function AnnotatorsTable() {
     try {
       await ensureSummaryExists();
 
-      const docId = sanitizeEmailForDocId(email);
+      // Use the real Firestore doc ID if available (avoids silent deleteDoc miss
+      // when the stored ID differs from what sanitizeEmailForDocId() produces).
+      const docId = annotator.firestoreDocId || sanitizeEmailForDocId(email);
+      console.log(`[HardDelete:${email}] Using Firestore doc ID: "${docId}"`);
       const annotatorRef = doc(db, "annotators", docId);
       const statsRef = doc(db, "stats", "platform_summary");
 
