@@ -439,14 +439,14 @@ export default function Dashboard() {
           <p className="text-slate-500 font-medium text-sm">Platform Metrics & Analytics</p>
         </div>
         <div className="flex items-center gap-4">
-          <button
+          {/* <button
             onClick={handleRepairSequenceNumbers}
             disabled={repairingSeq || syncing}
             className="flex items-center gap-2 bg-white px-4 py-2 rounded-xl border border-amber-200 text-amber-700 font-bold text-xs hover:bg-amber-50 transition-all shadow-sm disabled:opacity-50"
           >
             <ListOrdered size={14} className={repairingSeq ? "animate-spin" : ""} />
             {repairingSeq ? "Repairing Seq..." : "Repair Seq (1-1493)"}
-          </button>
+          </button> */}
           <button
             onClick={handleSyncStats}
             disabled={syncing}
