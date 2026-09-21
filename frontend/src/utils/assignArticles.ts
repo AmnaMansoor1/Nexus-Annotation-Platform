@@ -62,14 +62,9 @@ export function selectArticlesSequentially(
   const skipped_inconsistent: string[] = [];
   const eligible: Article[] = [];
 
-  const sorted = [...articles].sort((a, b) => {
-    const acA = typeof (a as any).annotation_count === "number" ? (a as any).annotation_count : 0;
-    const acB = typeof (b as any).annotation_count === "number" ? (b as any).annotation_count : 0;
-    if (acA !== acB) return acB - acA;
-    const snA = typeof (a as any).sequence_number === "number" ? (a as any).sequence_number : 0;
-    const snB = typeof (b as any).sequence_number === "number" ? (b as any).sequence_number : 0;
-    return snA - snB;
-  });
+  const sorted = [...articles].sort(
+    (a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0)
+  );
 
   for (const article of sorted) {
     const check = isEligible(article, email, requiredAnnotations);
@@ -140,7 +135,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       articlesRef,
       where("status", "in", ["pending", "partial"]),
       orderBy("sequence_number", "asc"),
-      limit(300)
+      limit(100)
     );
     const strategyASnap = await getDocs(strategyAQ);
     console.log("[assignArticlesForAnnotator] Strategy A returned", strategyASnap.size, "docs");
@@ -165,29 +160,22 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       console.warn("[assignArticlesForAnnotator] Strategy A skipped", inconsistencies.length, "inconsistent articles:", inconsistencies.slice(0, 5));
     }
 
-    candidates.sort((a, b) => {
-      const acA = typeof (a as any).annotation_count === "number" ? (a as any).annotation_count : 0;
-      const acB = typeof (b as any).annotation_count === "number" ? (b as any).annotation_count : 0;
-      if (acA !== acB) return acB - acA;
-      const snA = typeof (a as any).sequence_number === "number" ? (a as any).sequence_number : 0;
-      const snB = typeof (b as any).sequence_number === "number" ? (b as any).sequence_number : 0;
-      return snA - snB;
-    });
+    candidates.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
     eligibleArticles = candidates.slice(0, 20);
-    console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates. Sorted by annotation_count DESC then sequence_number ASC.");
+    console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates");
   } catch (err) {
     console.warn("[assignArticlesForAnnotator] Strategy A failed (index missing?):", err);
   }
 
   // ─────────────────────────────────────────────────────────────────
   // STRATEGY B (FALLBACK) — no composite index required
-  // orderBy(sequence_number, asc) + limit(800). Filter client-side.
+  // orderBy(sequence_number, asc) + limit(500). Filter client-side.
   // NEVER falls back to article_id/doc-name ordering.
   // ─────────────────────────────────────────────────────────────────
   if (eligibleArticles.length < 20) {
     try {
       console.log("[assignArticlesForAnnotator] Running Strategy B (fallback: sequence_number order, client-side filter)");
-      const fallbackQ = query(articlesRef, orderBy("sequence_number", "asc"), limit(800));
+      const fallbackQ = query(articlesRef, orderBy("sequence_number", "asc"), limit(500));
       const fallbackSnap = await getDocs(fallbackQ);
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
 
@@ -195,8 +183,8 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       for (const a of healedFallback) allHealedById.set(a.article_id, a);
       const alreadySeen = new Set(eligibleArticles.map(a => a.article_id));
       const inconsistencies: string[] = [];
-      const additional: Article[] = [];
       for (const article of healedFallback) {
+        if (eligibleArticles.length >= 20) break;
         if (alreadySeen.has(article.article_id)) continue;
         const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
         const check = isEligible(article, email, requiredAnnotations);
@@ -206,28 +194,14 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
           }
           continue;
         }
-        additional.push(article);
+        eligibleArticles.push(article);
         alreadySeen.add(article.article_id);
-      }
-
-      additional.sort((a, b) => {
-        const acA = typeof (a as any).annotation_count === "number" ? (a as any).annotation_count : 0;
-        const acB = typeof (b as any).annotation_count === "number" ? (b as any).annotation_count : 0;
-        if (acA !== acB) return acB - acA;
-        const snA = typeof (a as any).sequence_number === "number" ? (a as any).sequence_number : 0;
-        const snB = typeof (b as any).sequence_number === "number" ? (b as any).sequence_number : 0;
-        return snA - snB;
-      });
-
-      const fillNeeded = 20 - eligibleArticles.length;
-      for (let i = 0; i < fillNeeded && i < additional.length; i++) {
-        eligibleArticles.push(additional[i]);
       }
 
       if (inconsistencies.length > 0) {
         console.warn("[assignArticlesForAnnotator] Strategy B skipped", inconsistencies.length, "inconsistent articles");
       }
-      console.log("[assignArticlesForAnnotator] Strategy B total eligible now:", eligibleArticles.length, `(added ${Math.min(fillNeeded, additional.length)} from fallback pool, sorted annotation_count DESC then sequence_number ASC)`);
+      console.log("[assignArticlesForAnnotator] Strategy B total eligible now:", eligibleArticles.length);
     } catch (err2) {
       console.warn("[assignArticlesForAnnotator] Strategy B also failed:", err2);
     }
@@ -282,14 +256,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   const alreadyMineIds = alreadyMineArticles.map((a) => a.article_id);
   const alreadyMineSet = new Set(alreadyMineIds);
 
-  eligibleArticles.sort((a, b) => {
-    const acA = typeof (a as any).annotation_count === "number" ? (a as any).annotation_count : 0;
-    const acB = typeof (b as any).annotation_count === "number" ? (b as any).annotation_count : 0;
-    if (acA !== acB) return acB - acA;
-    const snA = typeof (a as any).sequence_number === "number" ? (a as any).sequence_number : 0;
-    const snB = typeof (b as any).sequence_number === "number" ? (b as any).sequence_number : 0;
-    return snA - snB;
-  });
+  eligibleArticles.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
   const newSlotsNeeded = Math.max(0, 20 - alreadyMineIds.length);
   const newToAssign = eligibleArticles
     .filter((a) => !alreadyMineSet.has(a.article_id))

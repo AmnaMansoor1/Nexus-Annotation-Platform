@@ -93,24 +93,18 @@ function filterLive(emails: unknown, live: Set<string>): string[] {
  *      (handles articles that nobody was ever actually assigned to.)
  *
  * Truth priority for annotated_by:
- *   (CORRECTED for annotator-deletion semantics:
- *    DELETED annotators' response docs MUST be physically purged from
- *    /responses during hardDeleteAnnotator, and the truth for
- *    annotated_by only EVER includes live-annotator emails. If a
- *    response doc for a deleted annotator somehow survived, we
- *    EXCLUDE it here so it cannot inflate annotation_count and
- *    cannot satisfy the 5-annotation completion gate.
- *   )
- *   UNION of:
- *     (a) raw.annotated_by filtered by liveEmails — the normal path.
- *     (b) responseAnnotatorEmails filtered by liveEmails ONLY,
- *         derived from the ACTUAL /annotations/{articleId}/responses/
- *         subcollection. Emails NOT in liveEmails are excluded
- *         explicitly (those annotators were deleted and their response
- *         docs are expected to be purged server-side; if any
- *         survive due to a race we still discount them here too
- *         so the 5-annotator scoring gate is correct and the
- *         article is eligible for reassignment.)
+ *   (NEW, v3) UNION of:
+ *     (a) raw.annotated_by filtered by liveEmails (the annotator-deletion filter,
+ *         which alone caused Issue-1 because deleted annotators can still have
+ *         valid pre-existing response docs that count toward the 5-annotation
+ *         completion branch — see CSV ExportCSV.tsx which also reads the
+ *         /responses subcollection, NOT raw.annotated_by).
+ *     (b) responseAnnotatorEmails (if supplied) filtered by liveEmails,
+ *         derived from the ACTUAL /annotations/{articleId}/responses/ subcollection.
+ *         If a callers does not pass responses (e.g. old callers/tests) we
+ *         gracefully fall back to (a) alone, preserving backward compat.
+ *   This prevents reconcileArticle from wiping a perfectly-valid 4/5 article
+ *   to 0/5 (causing the 5th annotator's submission to be treated as #1).
  */
 export function reconcileArticle(
   raw: Partial<Article> & { article_id: string },
@@ -128,22 +122,23 @@ export function reconcileArticle(
     truthAssigned.size > 0 ? [...truthAssigned] : filterLive(rawAssignedTo, liveEmails)
   );
 
-  // ── LIVE-ONLY UNION truth for annotated_by ────────────────────────────
-  // RAW article annotated_by is filtered by liveEmails (annotator
-  // deletion hygiene). Response doc annotator emails are also filtered
-  // by liveEmails. ANY response doc from a NON-live annotator is
-  // EXCLUDED (that annotator was deleted; the hard-delete flow is
-  // expected to have physically purged those response docs from
-  // /responses, but even if any survive a race we still drop
-  // them here so they never count toward annotation_count / status
-  // nor the 5-annotation scoring gate; the article becomes
-  // eligible for reassignment.)
+  // ── UNION truth for annotated_by (Issue-1 fix) ──────────────────────────
+  // RAW article annotated_by is filtered by liveEmails (annotator deletion
+  // hygiene). The responses subcollection is the TRUE ground truth of who
+  // actually annotated — ExportCSV.tsx reads these same docs directly,
+  // WITHOUT liveEmails filtering, so ANY response doc present counts for
+  // CSV human_label columns, CSV "5 annotations complete" display, and bias
+  // computation. Therefore we MUST include response annotator emails in
+  // annotated_by EVEN IF the corresponding annotator doc no longer exists.
+  // Not doing so caused reconcileArticle to wipe annotated_by to [ ] after
+  // annotator deletion, making the 5th submission be treated as #1 → never
+  // fires the scoring branch.
   const rawLiveAnnotated = filterLive(rawAnnotatedBy, liveEmails);
   const responseNormalized =
     Array.isArray(opts?.responseAnnotatorEmails)
       ? (opts!.responseAnnotatorEmails as unknown[])
           .map((e) => (typeof e === "string" ? normalizeEmail(e) : ""))
-          .filter((e) => !!e && liveEmails.has(e)) // ⭐ LIVE-FILTERED: exclude deleted annotator responses
+          .filter((e) => !!e)
       : [];
   const annotatedBy = uniqueEmails([...rawLiveAnnotated, ...responseNormalized]);
 
@@ -174,7 +169,7 @@ export function reconcileArticle(
   };
   if (needsScoreClear) {
     (articleRaw as any).bias_score = null;
-    (articleRaw as any).percent_agreement = null;
+    (articleRaw as any).fleiss_kappa = null;
     (articleRaw as any).final_label = null;
     (articleRaw as any).label = null;
   }
@@ -202,7 +197,7 @@ export function reconcileArticle(
   };
   if (needsScoreClear) {
     (updates as any).bias_score = null;
-    (updates as any).percent_agreement = null;
+    (updates as any).fleiss_kappa = null;
     (updates as any).final_label = null;
     (updates as any).label = null;
   }

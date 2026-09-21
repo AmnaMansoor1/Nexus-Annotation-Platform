@@ -7,11 +7,9 @@ import { db } from "../firebase";
 import { Annotator, Article } from "../types";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
-import { calculatePercentAgreement } from "../utils/calculateKappa";
+import { calculateFleissKappa } from "../utils/calculateKappa";
 import { ensureSummaryExists } from "../utils/stats";
 import { User, Mail, Ban, Loader2, RefreshCw, Trash2, AlertTriangle, Database } from "lucide-react";
-
-type FirestoreDocRef = ReturnType<typeof doc>;
 
 export default function AnnotatorsTable() {
   const [annotators, setAnnotators] = useState<Annotator[]>([]);
@@ -22,10 +20,7 @@ export default function AnnotatorsTable() {
     setRefreshing(true);
     try {
       const snap = await getDocs(collection(db, "annotators"));
-      // Store the REAL Firestore doc ID alongside the data so delete/update
-      // operations always use the correct path even if the email was stored
-      // with a different sanitization scheme than sanitizeEmailForDocId().
-      setAnnotators(snap.docs.map(d => ({ ...(d.data() as Annotator), firestoreDocId: d.id })));
+      setAnnotators(snap.docs.map(d => d.data() as Annotator));
     } catch (error) {
       console.error("Error loading annotators:", error);
     } finally {
@@ -40,9 +35,7 @@ export default function AnnotatorsTable() {
 
   const toggleDeactivate = async (annotator: Annotator) => {
     try {
-      // Prefer the real stored doc ID; fall back to sanitized email
-      const resolvedDocId = annotator.firestoreDocId || sanitizeEmailForDocId(annotator.email);
-      const ref = doc(db, "annotators", resolvedDocId);
+      const ref = doc(db, "annotators", sanitizeEmailForDocId(annotator.email));
       await updateDoc(ref, { deactivated: !annotator.deactivated });
       // Refresh list to show the updated state immediately
       loadAnnotators();
@@ -67,6 +60,10 @@ export default function AnnotatorsTable() {
     const email = (annotator.email || "").toLowerCase().trim();
     if (!email) return;
 
+    const completedCount = Array.isArray(annotator.completed_articles)
+      ? annotator.completed_articles.length
+      : 0;
+
     const assignedOnlyLocal = Array.isArray(annotator.assigned_articles)
       ? annotator.assigned_articles.filter(Boolean).length
       : 0;
@@ -78,13 +75,10 @@ export default function AnnotatorsTable() {
       `⚠️  PERMANENTLY DELETE annotator: ${email}\n\n` +
       `This will:\n` +
       `  • Delete their annotator profile\n` +
-      `  • ❌ PHYSICALLY DELETE ALL ${completedLocal} response docs they submitted from /annotations/*/responses\n` +
-      `  • (Plus any orphan response docs not listed in their profile)\n` +
-      `  • Remove their email from every article's annotated_by + assigned_to lists\n` +
-      `  • Rebuild annotation_count/status ONLY from LIVE-REMAINING response docs\n` +
-      `  • If status drops below 5: clear bias_score/percent_agreement/final_label/label\n` +
-      `  • If status remains exactly 5 (after other live annotators): recompute scores\n` +
+      `  • Scan ALL articles (collectionGroup query) to find every response doc — including orphans not in their profile\n` +
       `  • Free ${completedLocal} completed annotations + ${assignedOnlyLocal - completedLocal >= 0 ? (assignedOnlyLocal - completedLocal) : 0} assigned-but-unfinished slots\n` +
+      `  • Decrement annotation_count + assigned_count on every affected article\n` +
+      `  • Recompute status; bias_score/fleiss_kappa recalculated ONLY when exactly 5 labels remain\n` +
       `  • Update ALL dashboard counters (annotator count, status buckets, bias sum/avg)\n\n` +
       `THIS CANNOT BE UNDONE. Type DELETE in all caps to confirm.`;
     const userInput = prompt(msg);
@@ -94,8 +88,7 @@ export default function AnnotatorsTable() {
     }
 
     const confirm2 = confirm(
-      `LAST WARNING:\nReally REMOVE EVERY response doc submitted by ${email}?\n` +
-      `Their annotations WILL BE PURGED and WILL stop counting toward articles' 5-annotation requirement.\n` +
+      `LAST WARNING:\nReally remove every trace of ${email} from the dataset?\n` +
       `Dashboard counts will update immediately via real-time listener.`
     );
     if (!confirm2) return;
@@ -104,10 +97,7 @@ export default function AnnotatorsTable() {
     try {
       await ensureSummaryExists();
 
-      // Use the real Firestore doc ID if available (avoids silent deleteDoc miss
-      // when the stored ID differs from what sanitizeEmailForDocId() produces).
-      const docId = annotator.firestoreDocId || sanitizeEmailForDocId(email);
-      console.log(`[HardDelete:${email}] Using Firestore doc ID: "${docId}"`);
+      const docId = sanitizeEmailForDocId(email);
       const annotatorRef = doc(db, "annotators", docId);
       const statsRef = doc(db, "stats", "platform_summary");
 
@@ -119,44 +109,28 @@ export default function AnnotatorsTable() {
         : [];
       const profileKnownIds = new Set([...completedArticleIds, ...assignedArticleIds]);
 
-      // ── STEP 0: Get list of ALL live annotator emails (used below to determine
-      //    which response emails are "still valid" after deleting this one.
-      //    Only live-annotator response docs count toward annotation_count.)
-      const liveAnnotatorsSnap = await getDocs(collection(db, "annotators"));
-      const liveEmails = new Set<string>(
-        liveAnnotatorsSnap.docs
-          .map((d) => (d.data() as any)?.email as string | undefined)
-          .filter((e): e is string => typeof e === "string" && !!e)
-          .map((e) => e.toLowerCase().trim())
-          .filter((e) => e !== email) // ⭐ exclude the annotator being deleted
-      );
-
-      // ── STEP 1: collectionGroup query to find ALL response docs belonging
-      //    to this annotator. We also COLLECT THEIR DOCUMENT REFERENCES so we
-      //    can physically DELETE them all one by one. This catches orphans.
-      let allResponseDocRefs: FirestoreDocRef[] = [];
-      let affectedArticleIds = new Set<string>();
-      let orphanArticleIds: string[] = [];
+      // ── PRE-SCAN: collectionGroup query to find ALL response docs belonging
+      //    to this annotator across every article — catches orphans that are NOT
+      //    listed in their annotator profile (assigned_articles / completed_articles).
+      //    Without this, orphaned docs survive deletion and corrupt future scoring.
+      const orphanArticleIds: string[] = [];
       try {
-        console.log(`[HardDelete:${email}] Running collectionGroup("responses") pre-scan to find EVERY response...`);
+        console.log(`[HardDelete:${email}] Running collectionGroup("responses") pre-scan...`);
         const orphanQ = query(
           collectionGroup(db, "responses"),
           where("annotator_email", "==", email)
         );
         const orphanSnap = await getDocs(orphanQ);
         for (const d of orphanSnap.docs) {
-          allResponseDocRefs.push(d.ref);
+          // Path is: annotations/{articleId}/responses/{docId}
+          // d.ref.parent.parent.id === articleId
           const articleId = d.ref.parent.parent?.id;
-          if (articleId) {
-            affectedArticleIds.add(articleId);
-            if (!profileKnownIds.has(articleId)) orphanArticleIds.push(articleId);
+          if (articleId && !profileKnownIds.has(articleId)) {
+            orphanArticleIds.push(articleId);
+            console.warn(`[HardDelete:${email}] ORPHAN response doc found: annotations/${articleId}/responses/${d.id} (not in annotator profile)`);
           }
         }
-        console.log(
-          `[HardDelete:${email}] Pre-scan complete.`,
-          `Total response docs found: ${allResponseDocRefs.length}`,
-          `(orphan article IDs: ${orphanArticleIds.length})`
-        );
+        console.log(`[HardDelete:${email}] Pre-scan complete. Orphaned article IDs found: ${orphanArticleIds.length}`);
       } catch (scanErr: any) {
         const errCode = scanErr?.code || "";
         const errMsg = scanErr?.message ?? String(scanErr);
@@ -198,57 +172,31 @@ export default function AnnotatorsTable() {
         }
         console.error(
           `[HardDelete:${email}] collectionGroup pre-scan FAILED. ` +
-          `CANNOT guarantee all response docs will be deleted.`,
+          `Orphaned response docs may survive. ` +
+          `Diagnosis: ${diagnosis}`,
           scanErr
         );
-        const cont = confirm(
-          `⚠️  The "Find ALL response docs to delete" scan failed.\n\n` +
+        alert(
+          `⚠️  Warning: The "Find all orphaned response docs" scan failed.\n\n` +
           `Diagnosis:\n${diagnosis}\n\n` +
           `${actionHint}\n\n` +
-          `Proceeding with fallback: scanning ${profileKnownIds.size} articles from ${email}'s profile directly.\n` +
-          `True orphan responses (if any) in articles OUTSIDE their profile will NOT be caught.`
+          `Deletion will continue using the annotator profile lists only. ` +
+          `Orphaned response docs (if any) may need manual cleanup.`
         );
-        if (!cont) {
-          setLoading(false);
-          return;
-        }
-        // Fallback: scan each known article's /responses subcollection directly.
-        // No collectionGroup index required — just per-article getDocs reads.
-        // Filter by annotator_email field so doc ID format doesn't matter.
-        console.log(`[HardDelete:${email}] Fallback: scanning ${profileKnownIds.size} known articles individually...`);
-        for (const artId of [...profileKnownIds]) {
-          try {
-            const respSubSnap = await getDocs(collection(db, "annotations", artId, "responses"));
-            for (const rd of respSubSnap.docs) {
-              const rdEmail = typeof (rd.data() as any).annotator_email === "string"
-                ? (rd.data() as any).annotator_email.toLowerCase().trim()
-                : "";
-              if (rdEmail === email) {
-                allResponseDocRefs.push(rd.ref);
-                affectedArticleIds.add(artId);
-              }
-            }
-          } catch {
-            // Sub-read failed — fall back to doc-ID guess for this article only
-            allResponseDocRefs.push(doc(db, "annotations", artId, "responses", docId));
-            affectedArticleIds.add(artId);
-          }
-        }
-        console.log(`[HardDelete:${email}] Fallback scan done. Found ${allResponseDocRefs.length} response doc(s) to delete.`);
       }
 
-      // Profile-known assigned-only articles (they were assigned but never
-      // submitted a response). We still need to clean up assigned_to + assigned_count.
-      for (const artId of assignedArticleIds) affectedArticleIds.add(artId);
+      const articleIdsFromAnnotator = [...new Set([
+        ...profileKnownIds,
+        ...orphanArticleIds,
+      ])];
 
-      const articleIdsFromAnnotator = [...affectedArticleIds];
       const completedCount = completedArticleIds.length;
+      const assignedOnlyCount = articleIdsFromAnnotator.length - completedCount;
 
       console.log(
-        `[HardDelete:${email}]`,
-        `Response docs to DELETE: ${allResponseDocRefs.length}`,
-        `Articles to repair (counter/status reassessment without this annotator): ${articleIdsFromAnnotator.length}`,
-        `(orphan responses not in profile: ${orphanArticleIds.length})`
+        `[HardDelete:${email}] Articles to process: ${articleIdsFromAnnotator.length}`,
+        `(profile-known=${profileKnownIds.size}, orphans-from-scan=${orphanArticleIds.length},`,
+        `completed=${completedCount}, assigned-only=${assignedOnlyCount})`
       );
 
       const errors: string[] = [];
@@ -259,6 +207,7 @@ export default function AnnotatorsTable() {
       let articleBiasScoreRecomputed = 0;
 
       const BATCH_SIZE = 8;
+
       const REQUIRED_ANNOTATIONS = 5;
 
       const processArticle = async (articleId: string): Promise<{ ok: boolean }> => {
@@ -271,68 +220,51 @@ export default function AnnotatorsTable() {
           let localBiasDelta = 0;
           let oldStatus: "pending" | "partial" | "complete" = "pending";
           let newStatus: "pending" | "partial" | "complete" = "pending";
+          let articleChanged = false;
           let shouldRecomputeScores = false;
-
-          // Delete all response docs for this annotator on this specific article
-          // (there should be at most 1, but delete all to be safe)
-          const docRefsForThisArticle = allResponseDocRefs.filter(
-            (r) => r.parent.parent?.id === articleId
-          );
-          for (const r of docRefsForThisArticle) {
-            await deleteDoc(r);
-          }
-
-          // ── Rebuild ground truth: ONLY LIVE-ANNOTATOR response docs count.
-          //    After physically deleting the annotator's responses, re-read the
-          //    remaining /responses subcollection and rebuild counters/status
-          //    using ONLY the liveEmails set (the annotator being deleted was
-          //    removed from liveEmails above).
-          const responsesSnap = await getDocs(collection(db, "annotations", articleId, "responses"));
-          const liveRemainingEmails = new Set<string>();
-          for (const rd of responsesSnap.docs) {
-            const raw = rd.data() as any;
-            const em = typeof raw?.annotator_email === "string"
-              ? raw.annotator_email.toLowerCase().trim()
-              : "";
-            if (em && liveEmails.has(em)) liveRemainingEmails.add(em);
-          }
 
           await runTransaction(db, async (tx) => {
             const articleRef = doc(db, "articles", articleId);
+            const responseRef = doc(db, "annotations", articleId, "responses", docId);
+
             const articleSnap = await tx.get(articleRef);
-            if (!articleSnap.exists()) return;
+            const responseSnap = await tx.get(responseRef);
+            if (!articleSnap.exists()) {
+              if (responseSnap.exists()) tx.delete(responseRef);
+              return;
+            }
 
             const article = articleSnap.data() as Article;
             oldStatus = (article.status || "pending") as "pending" | "partial" | "complete";
+            const oldCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
+            const oldAnnotatedBy = Array.isArray(article.annotated_by) ? article.annotated_by : [];
             const oldAssignedTo = Array.isArray(article.assigned_to) ? article.assigned_to : [];
             const oldAssignedCount = typeof article.assigned_count === "number" ? article.assigned_count : 0;
 
+            const hadThisAnnotatorCounted = oldAnnotatedBy.includes(email);
             const wasThisAnnotatorAssigned = oldAssignedTo.includes(email);
+            const responseExisted = responseSnap.exists();
+
+            if (!hadThisAnnotatorCounted && !responseExisted && !wasThisAnnotatorAssigned) {
+              return;
+            }
+
+            articleChanged = true;
+            if (responseExisted) tx.delete(responseRef);
+
+            const newAnnotatedBy = hadThisAnnotatorCounted
+              ? oldAnnotatedBy.filter((e) => String(e).toLowerCase() !== email)
+              : [...oldAnnotatedBy];
+            const newCount = hadThisAnnotatorCounted ? Math.max(0, oldCount - 1) : oldCount;
+
             const newAssignedTo = wasThisAnnotatorAssigned
               ? oldAssignedTo.filter((e) => String(e).toLowerCase() !== email)
               : [...oldAssignedTo];
             const newAssignedCount = wasThisAnnotatorAssigned ? Math.max(0, oldAssignedCount - 1) : oldAssignedCount;
 
-            // annotated_by + annotation_count rebuilt from ACTUAL LIVE REMAINING
-            // response docs, NOT the old raw.annotated_by array. That way if
-            // any raw.annotated_by entries existed for the deleted annotator
-            // that failed response-doc deletion for some reason, they are
-            // still zeroed out here.
-            const newAnnotatedBy = [...liveRemainingEmails];
-            const newCount = newAnnotatedBy.length;
-
             if (newCount >= REQUIRED_ANNOTATIONS) newStatus = "complete";
             else if (newCount > 0) newStatus = "partial";
             else newStatus = "pending";
-
-            // Nothing actually changed for this article? Skip.
-            if (
-              oldStatus === newStatus &&
-              newAssignedCount === oldAssignedCount &&
-              docRefsForThisArticle.length === 0
-            ) {
-              return;
-            }
 
             const wasComplete = oldStatus === "complete";
             if (wasComplete && newStatus !== "complete") {
@@ -353,16 +285,16 @@ export default function AnnotatorsTable() {
 
             if (newCount < REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
-              updates.percent_agreement = null;
+              updates.fleiss_kappa = null;
               updates.final_label = null;
               updates.label = null;
-              if (article.bias_score !== null && article.bias_score !== undefined) localBiasCleared = true;
+              if (article.bias_score !== null) localBiasCleared = true;
             } else if (newCount === REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
-              updates.percent_agreement = null;
+              updates.fleiss_kappa = null;
               updates.final_label = null;
               updates.label = null;
-              if (article.bias_score !== null && article.bias_score !== undefined) localBiasRecomputed = true;
+              if (article.bias_score !== null) localBiasRecomputed = true;
               shouldRecomputeScores = true;
             }
 
@@ -387,17 +319,26 @@ export default function AnnotatorsTable() {
             }
           });
 
+          if (!articleChanged) return { ok: true };
+
           if (localBecameIncomplete) articleBecameIncomplete++;
           if (localBecamePartial) articleBecamePartial++;
           if (localBecamePending) articleBecamePending++;
           if (localBiasCleared) articleBiasScoreCleared++;
           if (localBiasRecomputed) articleBiasScoreRecomputed++;
 
-          if (shouldRecomputeScores) {
-            const articleSnap2 = await getDoc(doc(db, "articles", articleId));
-            if (articleSnap2.exists()) {
-              const art = articleSnap2.data() as Article;
+          const articleSnap2 = await getDoc(doc(db, "articles", articleId));
+          if (articleSnap2.exists()) {
+            const art = articleSnap2.data() as Article;
+            if (art.annotation_count === REQUIRED_ANNOTATIONS) {
               const remainingResp = await getDocs(collection(db, "annotations", articleId, "responses"));
+              // ── ISSUE-3 INTEGRITY: Build counts from EXACTLY the annotator
+              //    emails that are listed in article.annotated_by (5 emails).
+              //    If orphaned response docs exist from a previously hard-deleted
+              //    annotator, they will still be physically present (if deleted
+              //    through non-UI pathways). Filtering to annotated_by emails
+              //    ensures n===5 always, preventing wrong kappa values and
+              //    wrong tie-majority decisions when exactly 5 remain.
               const allowedEmails = new Set(
                 (Array.isArray(art.annotated_by) ? art.annotated_by : [])
                   .map((e: any) => String(e).toLowerCase().trim())
@@ -415,9 +356,15 @@ export default function AnnotatorsTable() {
               }
               const totalCounted = counts.neutral + counts.slightly + counts.highly;
 
-              if (totalCounted === REQUIRED_ANNOTATIONS) {
+              const needRecompute =
+                art.bias_score === null ||
+                art.fleiss_kappa === null ||
+                art.final_label === null ||
+                !(art.label === 0 || art.label === 1);
+
+              if (totalCounted === REQUIRED_ANNOTATIONS && needRecompute) {
                 const newScore = calculateBiasScore(counts);
-                const newPAgreement = calculatePercentAgreement(counts);
+                const newKappa = calculateFleissKappa(counts);
 
                 const entries = (Object.entries(counts) as Array<["neutral" | "slightly" | "highly", number]>);
                 entries.sort((a, b) => b[1] - a[1]);
@@ -429,18 +376,23 @@ export default function AnnotatorsTable() {
                   else if (topKey === "slightly") finalLabel = "slightly_manipulative";
                   else if (topKey === "highly") finalLabel = "highly_manipulative";
                 }
+                // ISSUE-1: Binary label — FYP locked spec: bias_score >= 2.5
+                // Equivalent to avg annotator 0-2 score >= 1.0
                 const newBinaryLabel: 0 | 1 = newScore >= 2.5 ? 1 : 0;
 
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: newScore,
-                  percent_agreement: newPAgreement,
+                  fleiss_kappa: newKappa,
                   final_label: finalLabel,
                   label: newBinaryLabel,
                 });
-              } else {
+              } else if (totalCounted !== REQUIRED_ANNOTATIONS && art.annotation_count === REQUIRED_ANNOTATIONS) {
+                // Integrity mismatch: annotated_by says 5 but only <5 valid
+                // labelled response docs match the allow-list. Clear scores
+                // instead of writing garbage values; admin can investigate.
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: null,
-                  percent_agreement: null,
+                  fleiss_kappa: null,
                   final_label: null,
                   label: null,
                 });
@@ -488,10 +440,8 @@ export default function AnnotatorsTable() {
       });
 
       const processed = articleIdsFromAnnotator.length;
-      const deletedResponses = allResponseDocRefs.length;
       console.log(`[HardDelete:${email}] DONE.`, {
         processed,
-        deletedResponses,
         errors: errors.length,
         articleBecameIncomplete,
         articleBecamePartial,
@@ -503,23 +453,19 @@ export default function AnnotatorsTable() {
       const partialToPending = Math.max(0, articleBecameIncomplete - articleBecamePartial - articleBecamePending);
       let summary =
         `✅ Deleted ${email} successfully.\n\n` +
-        `  🗑️  Response docs PHYSICALLY DELETED: ${deletedResponses}\n` +
         `  Articles touched: ${processed}` +
-          (orphanArticleIds.length > 0 ? ` (incl. ${orphanArticleIds.length} orphan response docs found via full scan)` : "") + `\n` +
+          (orphanArticleIds.length > 0 ? ` (incl. ${orphanArticleIds.length} orphaned response docs found via full scan)` : "") + `\n` +
         `  Status transitions:\n` +
         `    complete → partial: ${articleBecamePartial}\n` +
         `    complete → pending: ${articleBecamePending}\n` +
         `    partial → pending: ${partialToPending}\n` +
-        `  Counter reassessment: Every affected article rebuilt annotation_count / annotated_by\n` +
-        `  ONLY from LIVE-remaining response docs (${email} removed from liveEmails).\n` +
         `  Assignment slots freed (assigned_count decremented + email removed from assigned_to).\n` +
-        `  Bias/Fleiss scores CLEARED (${articleBiasScoreCleared} articles now have < 5 valid labels).\n` +
-        `  Bias/Fleiss RECOMPUTED over exactly 5 remaining labels: ${articleBiasScoreRecomputed}\n` +
+        `  Bias/Fleiss scores cleared (${articleBiasScoreCleared} articles now have < 5 valid labels).\n` +
+        `  Bias/Fleiss recomputed over exactly 5 remaining labels: ${articleBiasScoreRecomputed}\n` +
         `  Dashboard counters updated (annotator count, status buckets, bias sum/avg).\n` +
         `  Dashboard page will refresh automatically via real-time listener.\n\n` +
-        `  ➜ Any article that dropped below 5/5 is now PARTIAL/PENDING and ELIGIBLE\n` +
-        `    for reassignment. Next new annotator will pick up the articles closest to 5\n` +
-        `    first (annotation_count DESC then sequence_number ASC).`;
+        `  ➜ Next new annotator will pick up articles starting from the lowest sequence_number\n` +
+        `    whose assigned_count has dropped below 5 (fixes the "starts at 40-60" issue).`;
       if (errors.length > 0) {
         summary += `\n\n⚠️  Errors (${errors.length} articles):\n` + errors.slice(0, 10).join("\n");
         if (errors.length > 10) summary += `\n… +${errors.length - 10} more`;
@@ -530,7 +476,6 @@ export default function AnnotatorsTable() {
       alert("Failed to delete annotator: " + (err && err.message ? err.message : String(err)));
     } finally {
       loadAnnotators();
-      setLoading(false);
     }
   };
 
