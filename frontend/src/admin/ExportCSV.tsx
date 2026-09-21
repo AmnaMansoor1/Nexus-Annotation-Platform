@@ -112,7 +112,29 @@ export default function ExportCSV() {
           && typeof article.annotation_count === "number"
           && article.annotation_count >= REQUIRED) {
           row.bias_score = article.bias_score ?? "";
-          row.percent_agreement = article.percent_agreement ?? "";
+
+          // percent_agreement: use stored value if present (new articles),
+          // otherwise compute P_i from live response docs (pre-migration articles
+          // that still have the old fleiss_kappa field in Firestore).
+          if (article.percent_agreement != null) {
+            row.percent_agreement = article.percent_agreement;
+          } else {
+            // Compute P_i = (sumSq - n) / (n * (n-1)) from response labels
+            const counts = { neutral: 0, slightly: 0, highly: 0 };
+            for (const res of responses as any[]) {
+              const lbl = String(res.label || "");
+              if (lbl === "neutral") counts.neutral++;
+              else if (lbl === "slightly_manipulative") counts.slightly++;
+              else if (lbl === "highly_manipulative") counts.highly++;
+            }
+            const n = counts.neutral + counts.slightly + counts.highly;
+            if (n >= 2) {
+              const sumSq = counts.neutral ** 2 + counts.slightly ** 2 + counts.highly ** 2;
+              row.percent_agreement = parseFloat(((sumSq - n) / (n * (n - 1))).toFixed(4));
+            } else {
+              row.percent_agreement = "";
+            }
+          }
         } else {
           row.bias_score = "";
           row.percent_agreement = "";
