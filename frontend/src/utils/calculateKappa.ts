@@ -17,28 +17,44 @@ function calculateObservedAgreement(categories: number[]): number {
 }
 
 /**
- * Computes Fleiss' Kappa (κ) for inter-rater reliability on ONE article.
- * Uses the observed number of annotations for the article with k=3 categories
- * (neutral, slightly_manipulative, highly_manipulative).
+ * Computes P_i — the PERCENT AGREEMENT (observed pairwise agreement) for ONE article.
  *
- * FORMULA (per-article κ):
- *   (1) categories  = [N_count, SM_count, HM_count]
- *   (2) n           = sum(categories)                            ← raters per article (default 5)
- *   (3) sumSq       = N² + SM² + HM²
- *   (4) Po          = (sumSq − n) / (n × (n − 1))               ← Observed agreement
- *   (5) p_j         = each category_count / n                    ← category proportions
- *   (6) Pe          = sum( p_j² )                                ← Expected (chance) agreement
- *   (7) κ           = (Po − Pe) / (1 − Pe)                       ← final score, rounded to 3 dec
- *       If Pe = 1  → κ = 1 (perfect agreement, avoids ÷0)
- *       If n  < 2  → κ = 0 (undefined)
+ * This is the correct per-article inter-rater metric. For 5 raters / 3 categories it
+ * varies between 0.2 (maximum disagreement) and 1.0 (unanimous), making it ideal for
+ * flagging articles that need adjudication.
  *
- * INTERPRETATION (Landis & Koch, 1977):
- *   κ < 0.0  → Poor         (less than chance)
- *   0.0–0.2  → Slight
- *   0.2–0.4  → Fair
- *   0.4–0.6  → Moderate
- *   0.6–0.8  → Substantial
- *   0.8–1.0  → Almost Perfect
+ * FORMULA:
+ *   P_i = Σ_j [ n_ij × (n_ij − 1) ] / [ n × (n − 1) ]
+ *       = (Σ n_ij²  −  n) / (n × (n − 1))        ← equivalent, cheaper to compute
+ *
+ * EXAMPLE VALUES (n = 5):
+ *   (5,0,0) → 1.00  unanimous
+ *   (4,1,0) → 0.60  strong majority
+ *   (3,2,0) → 0.40  moderate split
+ *   (3,1,1) → 0.30  low agreement
+ *   (2,2,1) → 0.20  maximum disagreement (for 5 raters / 3 cats)
+ *
+ * WHY NOT PER-ARTICLE FLEISS' KAPPA?
+ *   When n = 5 and there are 3 categories, Fleiss' Kappa collapses to a
+ *   mathematical constant: κ = −0.25 for every non-unanimous vote.
+ *   Algebraically: kappa = (Po − Pe)/(1 − Pe) = −1/4 for all a+b+c=5, a<5.
+ *   It carries zero information per article and must not be stored per-article.
+ */
+export function calculatePercentAgreement(counts: BiasCounts): number {
+  const categories = toCategories(counts);
+  const Po = calculateObservedAgreement(categories);
+  return parseFloat(Po.toFixed(4));
+}
+
+/**
+ * @deprecated DO NOT use for per-article storage.
+ *
+ * For n=5 raters and 3 categories this function returns exactly −0.25 for
+ * every non-unanimous article — the chance-adjusted term cancels out and the
+ * result is a mathematical constant, not a measurement.
+ *
+ * Use calculatePercentAgreement() for per-article quality scoring.
+ * Use calculateOverallFleissKappa() for dataset-level inter-rater reliability.
  */
 export function calculateFleissKappa(counts: BiasCounts): number {
   const categories = toCategories(counts);
@@ -54,6 +70,7 @@ export function calculateFleissKappa(counts: BiasCounts): number {
   const kappa = (Po - Pe) / (1 - Pe);
   return parseFloat(kappa.toFixed(3));
 }
+
 
 /**
  * Computes DATASET-WIDE Fleiss' Kappa across all completed articles (summary level).

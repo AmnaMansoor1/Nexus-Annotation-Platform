@@ -112,10 +112,10 @@ export default function ExportCSV() {
           && typeof article.annotation_count === "number"
           && article.annotation_count >= REQUIRED) {
           row.bias_score = article.bias_score ?? "";
-          row.fleiss_kappa = article.fleiss_kappa ?? "";
+          row.percent_agreement = article.percent_agreement ?? "";
         } else {
           row.bias_score = "";
-          row.fleiss_kappa = "";
+          row.percent_agreement = "";
         }
 
         row.total_annotations = responses.length;
@@ -207,7 +207,7 @@ export default function ExportCSV() {
         summaryRow.status = "summary";
         summaryRow.label = "";
         summaryRow.bias_score = "";
-        summaryRow.fleiss_kappa = overallKappa;
+        summaryRow.percent_agreement = overallKappa; // overall dataset-level Fleiss' kappa (valid at this level)
         summaryRow.total_annotations = completedCountsArray.length;
         summaryRow.human_label = "";
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {

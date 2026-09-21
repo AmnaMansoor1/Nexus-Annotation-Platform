@@ -21,7 +21,7 @@ export interface Article {
   assigned_to: string[];
   assigned_count: number;
   bias_score: number | null;
-  fleiss_kappa: number | null;
+  percent_agreement: number | null;  // P_i: observed pairwise agreement (0.2–1.0); replaces per-article fleiss_kappa which was a constant
   label: 0 | 1 | null;
   final_label: BiasLabel | null;
   is_gold_standard: boolean;

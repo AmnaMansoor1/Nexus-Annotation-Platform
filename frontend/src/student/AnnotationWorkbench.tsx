@@ -7,7 +7,7 @@ import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
 import TimerRing from "../components/TimerRing";
 import { Check, Loader2, AlertCircle } from "lucide-react";
-import { calculateFleissKappa } from "../utils/calculateKappa";
+import { calculatePercentAgreement } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { syncBiasScoreAndStatsAtomically } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
@@ -418,7 +418,7 @@ export default function AnnotationWorkbench() {
             article_annotation_count: articleData.annotation_count,
             article_status_before: articleData.status,
             article_bias_before: articleData.bias_score,
-            article_kappa_before: articleData.fleiss_kappa,
+            article_percent_agreement_before: articleData.percent_agreement,
             article_finalLabel_before: articleData.final_label,
           });
 
@@ -600,7 +600,7 @@ export default function AnnotationWorkbench() {
             const totalCounted = allCounts.neutral + allCounts.slightly + allCounts.highly;
             if (totalCounted !== REQUIRED) {
               const msg = `[SCORING-INTEGRITY-FAIL] article=${articleId} totalCounted=${totalCounted} REQUIRED=${REQUIRED} priorResponses.length=${priorResponses.length}. ` +
-                `Refusing to compute scores with wrong rater count — would produce invalid fleiss_kappa and wrong tie detection. ` +
+                `Refusing to compute scores with wrong rater count — would produce invalid percent_agreement and wrong tie detection. ` +
                 `This means one or more prior response docs could not be resolved. Aborting transaction (no writes).`;
               console.error(msg);
               console.error(`[SCORING-INTEGRITY-FAIL] priorAnnotatedAuthoritative=`, priorAnnotatedAuthoritative);
@@ -612,7 +612,7 @@ export default function AnnotationWorkbench() {
             console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts, { totalCounted, REQUIRED });
 
             const biasScore = calculateBiasScore(allCounts);
-            const kappa = calculateFleissKappa(allCounts);
+            const pAgreement = calculatePercentAgreement(allCounts);
 
             // Map count-keys ("slightly", "highly") back to their canonical BiasLabel enum
             // values ("slightly_manipulative", "highly_manipulative") so the stored
@@ -637,7 +637,7 @@ export default function AnnotationWorkbench() {
 
             console.debug(`[DIAG-Issue1] COMPUTED SCORES:`, {
               biasScore,
-              kappa,
+              pAgreement,
               topKey, topLabel, topCount,
               secondKey: _secondKey, secondCount,
               finalLabelVal,
@@ -646,32 +646,32 @@ export default function AnnotationWorkbench() {
             });
 
             articleUpdates.bias_score = biasScore;
-            articleUpdates.fleiss_kappa = kappa;
+            articleUpdates.percent_agreement = pAgreement;
             articleUpdates.final_label = finalLabelVal;
             articleUpdates.label = binaryLabelVal;
 
             // Write to OUTER closure (see variable declaration above runTransaction)
             lastTxCompletionCounts = allCounts;
             lastTxBiasScore = biasScore;
-            lastTxKappa = kappa;
+            lastTxKappa = pAgreement;
             lastTxFinalLabel = finalLabelVal;
             lastTxBinaryLabel = binaryLabelVal;
             finalBiasScoreForStats = biasScore;
 
             const has_bias = Object.prototype.hasOwnProperty.call(articleUpdates, "bias_score");
-            const has_kappa = Object.prototype.hasOwnProperty.call(articleUpdates, "fleiss_kappa");
+            const has_pct = Object.prototype.hasOwnProperty.call(articleUpdates, "percent_agreement");
             const has_final = Object.prototype.hasOwnProperty.call(articleUpdates, "final_label");
             const has_label = Object.prototype.hasOwnProperty.call(articleUpdates, "label");
             console.debug(`[DIAG-Issue1] articleUpdates object that will be transaction.set(merge=true):`, {
               has_bias_score: has_bias,
               bias_score_value: articleUpdates.bias_score,
-              has_fleiss_kappa: has_kappa,
-              fleiss_kappa_value: articleUpdates.fleiss_kappa,
+              has_percent_agreement: has_pct,
+              percent_agreement_value: articleUpdates.percent_agreement,
               has_final_label: has_final,
               final_label_value: articleUpdates.final_label,
               has_binary_label: has_label,
               binary_label_value: articleUpdates.label,
-              ALL_FOUR_SCORE_KEYS_PRESENT: has_bias && has_kappa && has_final && has_label,
+              ALL_FOUR_SCORE_KEYS_PRESENT: has_bias && has_pct && has_final && has_label,
               annotation_count: articleUpdates.annotation_count,
               annotated_by_length: articleUpdates.annotated_by.length,
               status: articleUpdates.status,
@@ -740,12 +740,12 @@ export default function AnnotationWorkbench() {
               const biasMatch = (expectedBias == null || vd.bias_score == null)
                 ? Object.is(expectedBias, vd.bias_score)
                 : Math.abs(Number(vd.bias_score) - Number(expectedBias)) < 0.001;
-              const kappaMatch = (expectedKappa == null || vd.fleiss_kappa == null)
-                ? Object.is(expectedKappa, vd.fleiss_kappa)
-                : Math.abs(Number(vd.fleiss_kappa) - Number(expectedKappa)) < 0.001;
+              const kappaMatch = (expectedKappa == null || vd.percent_agreement == null)
+                ? Object.is(expectedKappa, vd.percent_agreement)
+                : Math.abs(Number(vd.percent_agreement) - Number(expectedKappa)) < 0.001;
               const labelMatch = Object.is(vd.final_label, lastTxFinalLabel);
               const binaryLabelMatch = Object.is(vd.label, lastTxBinaryLabel);
-              const allScoresPresent = (vd.bias_score != null) && (vd.fleiss_kappa != null) && (vd.label === 0 || vd.label === 1);
+              const allScoresPresent = (vd.bias_score != null) && (vd.percent_agreement != null) && (vd.label === 0 || vd.label === 1);
               console.debug({
                 scoreBranchEntered,
                 status: vd.status,
@@ -753,12 +753,12 @@ export default function AnnotationWorkbench() {
                 annotated_by_length: vd.annotated_by?.length ?? 0,
                 // READBACK (actual Firestore state)
                 bias_score_readback: vd.bias_score,
-                fleiss_kappa_readback: vd.fleiss_kappa,
+                percent_agreement_readback: vd.percent_agreement,
                 final_label_readback: vd.final_label,
                 binary_label_readback: vd.label,
                 // EXPECTED (closure values computed inside tx and written via merge)
                 bias_score_transaction: expectedBias,
-                fleiss_kappa_transaction: expectedKappa,
+                percent_agreement_transaction: expectedKappa,
                 final_label_transaction: lastTxFinalLabel,
                 binary_label_transaction: lastTxBinaryLabel,
                 MATCH_bias: biasMatch,

@@ -64,7 +64,7 @@ service cloud.firestore {
       allow write: if isAdmin();
       allow update: if isAuthenticated() && 
                     (request.resource.data.diff(resource.data).affectedKeys()
-                    .hasAny(['annotation_count', 'annotated_by', 'status', 'bias_score', 'fleiss_kappa', 'assigned_count', 'assigned_to']));
+                    .hasAny(['annotation_count', 'annotated_by', 'status', 'bias_score', 'percent_agreement', 'assigned_count', 'assigned_to']));
     }
 
     match /annotators/{docId} {

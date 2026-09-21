@@ -7,7 +7,7 @@ import { db } from "../firebase";
 import { Annotator, Article } from "../types";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
-import { calculateFleissKappa } from "../utils/calculateKappa";
+import { calculatePercentAgreement } from "../utils/calculateKappa";
 import { ensureSummaryExists } from "../utils/stats";
 import { User, Mail, Ban, Loader2, RefreshCw, Trash2, AlertTriangle, Database } from "lucide-react";
 
@@ -82,7 +82,7 @@ export default function AnnotatorsTable() {
       `  • (Plus any orphan response docs not listed in their profile)\n` +
       `  • Remove their email from every article's annotated_by + assigned_to lists\n` +
       `  • Rebuild annotation_count/status ONLY from LIVE-REMAINING response docs\n` +
-      `  • If status drops below 5: clear bias_score/fleiss_kappa/final_label/label\n` +
+      `  • If status drops below 5: clear bias_score/percent_agreement/final_label/label\n` +
       `  • If status remains exactly 5 (after other live annotators): recompute scores\n` +
       `  • Free ${completedLocal} completed annotations + ${assignedOnlyLocal - completedLocal >= 0 ? (assignedOnlyLocal - completedLocal) : 0} assigned-but-unfinished slots\n` +
       `  • Update ALL dashboard counters (annotator count, status buckets, bias sum/avg)\n\n` +
@@ -353,13 +353,13 @@ export default function AnnotatorsTable() {
 
             if (newCount < REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
-              updates.fleiss_kappa = null;
+              updates.percent_agreement = null;
               updates.final_label = null;
               updates.label = null;
               if (article.bias_score !== null && article.bias_score !== undefined) localBiasCleared = true;
             } else if (newCount === REQUIRED_ANNOTATIONS) {
               updates.bias_score = null;
-              updates.fleiss_kappa = null;
+              updates.percent_agreement = null;
               updates.final_label = null;
               updates.label = null;
               if (article.bias_score !== null && article.bias_score !== undefined) localBiasRecomputed = true;
@@ -417,7 +417,7 @@ export default function AnnotatorsTable() {
 
               if (totalCounted === REQUIRED_ANNOTATIONS) {
                 const newScore = calculateBiasScore(counts);
-                const newKappa = calculateFleissKappa(counts);
+                const newPAgreement = calculatePercentAgreement(counts);
 
                 const entries = (Object.entries(counts) as Array<["neutral" | "slightly" | "highly", number]>);
                 entries.sort((a, b) => b[1] - a[1]);
@@ -433,14 +433,14 @@ export default function AnnotatorsTable() {
 
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: newScore,
-                  fleiss_kappa: newKappa,
+                  percent_agreement: newPAgreement,
                   final_label: finalLabel,
                   label: newBinaryLabel,
                 });
               } else {
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: null,
-                  fleiss_kappa: null,
+                  percent_agreement: null,
                   final_label: null,
                   label: null,
                 });

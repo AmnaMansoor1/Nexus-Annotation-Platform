@@ -3,7 +3,7 @@
  *
  * Deletes all /annotations/{articleId}/responses/{docId} documents that
  * belong to a known-deleted annotator, then recomputes article metadata
- * (annotated_by, annotation_count, status, bias_score, fleiss_kappa, etc.)
+ * (annotated_by, annotation_count, status, bias_score, percent_agreement, etc.)
  * using the live annotators only.
  *
  * Usage:
@@ -65,16 +65,12 @@ function calculateBiasScore(counts) {
   const raw = (counts.highly * 2 + counts.slightly * 1) / n;
   return parseFloat((raw * 2.5).toFixed(2));
 }
-function calculateFleissKappa(counts) {
+function calculatePercentAgreement(counts) {
   const cats = [counts.neutral, counts.slightly, counts.highly];
   const n = cats.reduce((s, c) => s + c, 0);
   if (n < 2) return 0;
   const sumSq = cats.reduce((s, c) => s + c * c, 0);
-  const Po = (sumSq - n) / (n * (n - 1));
-  const pj = cats.map(c => c / n);
-  const Pe = pj.reduce((s, p) => s + p * p, 0);
-  if (Pe === 1) return 1;
-  return parseFloat(((Po - Pe) / (1 - Pe)).toFixed(3));
+  return parseFloat(((sumSq - n) / (n * (n - 1))).toFixed(4));
 }
 function finalLabel(counts) {
   const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
@@ -152,7 +148,7 @@ for (const articleDoc of articlesSnap.docs) {
   else newStatus = "pending";
 
   // Scores: recompute only if we still have enough responses
-  let newBias = null, newKappa = null, newFinalLabel = null, newLabel = null;
+  let newBias = null, newPercentAgreement = null, newFinalLabel = null, newLabel = null;
   if (newAnnotationCount === REQUIRED) {
     const counts = { neutral: 0, slightly: 0, highly: 0 };
     for (const { label } of keepEmails.slice(0, REQUIRED)) {
@@ -163,7 +159,7 @@ for (const articleDoc of articlesSnap.docs) {
     const total = counts.neutral + counts.slightly + counts.highly;
     if (total === REQUIRED) {
       newBias = calculateBiasScore(counts);
-      newKappa = calculateFleissKappa(counts);
+      newPercentAgreement = calculatePercentAgreement(counts);
       newFinalLabel = finalLabel(counts);
       newLabel = newBias >= 2.5 ? 1 : 0;
     }
@@ -176,7 +172,7 @@ for (const articleDoc of articlesSnap.docs) {
     assigned_count: newAssignedCount,
     status: newStatus,
     bias_score: newBias,
-    fleiss_kappa: newKappa,
+    percent_agreement: newPercentAgreement,
     final_label: newFinalLabel,
     label: newLabel,
   };

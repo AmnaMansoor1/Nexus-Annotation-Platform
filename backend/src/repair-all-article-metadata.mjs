@@ -116,12 +116,12 @@ for (const doc of articlesSnap.docs) {
     };
 
     // If dropping below 5 annotations, clear any stale scoring
-    if (annotationCount < REQUIRED && (a.bias_score != null || a.fleiss_kappa != null)) {
+    if (annotationCount < REQUIRED && (a.bias_score != null || a.percent_agreement != null)) {
       updates.bias_score = null;
-      updates.fleiss_kappa = null;
+      updates.percent_agreement = null;
       updates.final_label = null;
       updates.label = null;
-      console.log(`  → also clearing stale bias_score/fleiss_kappa/final_label`);
+      console.log(`  → also clearing stale bias_score/percent_agreement/final_label`);
     }
 
     batch.set(doc.ref, updates, { merge: true });

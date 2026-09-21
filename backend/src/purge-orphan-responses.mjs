@@ -6,7 +6,7 @@
  * annotator_email is NOT present in the live /annotators collection.
  *
  * After purging, rebuilds article metadata (annotated_by, annotation_count,
- * status, assigned_to, assigned_count, bias_score, fleiss_kappa,
+ * status, assigned_to, assigned_count, bias_score, percent_agreement,
  * final_label, label) from the REMAINING live-annotator responses only.
  *
  * This script is idempotent — running it twice produces the same result.
@@ -73,16 +73,14 @@ function calculateBiasScore(counts) {
   return parseFloat((raw * 2.5).toFixed(2));
 }
 
-function calculateFleissKappa(counts) {
+// P_i = observed pairwise agreement. Replaces per-article Fleiss' Kappa which
+// was algebraically fixed at -0.25 for any non-unanimous 5-rater vote.
+function calculatePercentAgreement(counts) {
   const cats = [counts.neutral, counts.slightly, counts.highly];
   const n = cats.reduce((s, c) => s + c, 0);
   if (n < 2) return 0;
   const sumSq = cats.reduce((s, c) => s + c * c, 0);
-  const Po = (sumSq - n) / (n * (n - 1));
-  const pj = cats.map(c => c / n);
-  const Pe = pj.reduce((s, p) => s + p * p, 0);
-  if (Pe === 1) return 1;
-  return parseFloat(((Po - Pe) / (1 - Pe)).toFixed(3));
+  return parseFloat(((sumSq - n) / (n * (n - 1))).toFixed(4));
 }
 
 function computeFinalLabel(counts) {
@@ -194,7 +192,7 @@ for (const articleDoc of articlesSnap.docs) {
 
   // Scores: only when exactly REQUIRED live responses remain
   let newBiasScore = null;
-  let newFleissKappa = null;
+  let newPercentAgreement = null;
   let newFinalLabel = null;
   let newLabel = null;
 
@@ -208,7 +206,7 @@ for (const articleDoc of articlesSnap.docs) {
     const total = counts.neutral + counts.slightly + counts.highly;
     if (total === REQUIRED) {
       newBiasScore = calculateBiasScore(counts);
-      newFleissKappa = calculateFleissKappa(counts);
+      newPercentAgreement = calculatePercentAgreement(counts);
       newFinalLabel = computeFinalLabel(counts);
       newLabel = newBiasScore >= 2.5 ? 1 : 0;
     }
@@ -219,7 +217,7 @@ for (const articleDoc of articlesSnap.docs) {
 
   console.log(`  📝 REBUILD: status ${oldStatus}→${newStatus}  annotation_count ${oldAnnC}→${newAnnotationCount}`);
   if (newBiasScore !== null) {
-    console.log(`  ⚡ SCORES: bias_score=${newBiasScore} fleiss_kappa=${newFleissKappa} final_label=${newFinalLabel}`);
+    console.log(`  ⚡ SCORES: bias_score=${newBiasScore} percent_agreement=${newPercentAgreement} final_label=${newFinalLabel}`);
   } else if (oldAnnC >= REQUIRED) {
     console.log(`  🚫 SCORES CLEARED (dropped below ${REQUIRED} live annotations)`);
   }
@@ -234,7 +232,7 @@ for (const articleDoc of articlesSnap.docs) {
       assigned_count: newAssignedCount,
       status: newStatus,
       bias_score: newBiasScore,
-      fleiss_kappa: newFleissKappa,
+      percent_agreement: newPercentAgreement,
       final_label: newFinalLabel,
       label: newLabel,
     }, { merge: true });

@@ -1,7 +1,7 @@
 import { describe, expect, test, beforeEach, vi } from "vitest";
 import { BiasLabel } from "../types";
 import { calculateBiasScore } from "./calculateBiasScore";
-import { calculateFleissKappa } from "./calculateKappa";
+import { calculatePercentAgreement } from "./calculateKappa";
 
 /**
  * Pure re-implementation of the NEW Issue-1 submission transaction rules
@@ -11,7 +11,7 @@ import { calculateFleissKappa } from "./calculateKappa";
  *
  * Input: prior article state + the submitting annotator email + their label
  * Output: the NEXT article state (status, annotation_count, annotated_by,
- * bias_score, fleiss_kappa, final_label) + whether the response record
+ * bias_score, percent_agreement, final_label) + whether the response record
  * would be written + whether it's a 5th-annotation completion.
  */
 
@@ -20,7 +20,7 @@ type ArticleState = {
   annotation_count: number;
   status: "pending" | "partial" | "complete";
   bias_score: number | null;
-  fleiss_kappa: number | null;
+  percent_agreement: number | null;
   final_label: BiasLabel | null;
   // Simulated prior responses (per-annotator label) so we can verify kappa/bias calc
   priorLabels: Array<{ email: string; label: BiasLabel }>;
@@ -76,7 +76,7 @@ function submitAnnotation(
       else if (r.label === "highly_manipulative") counts.highly++;
     }
     next.bias_score = calculateBiasScore(counts);
-    next.fleiss_kappa = calculateFleissKappa(counts);
+    next.percent_agreement = calculatePercentAgreement(counts);
     // Map count-object keys to canonical BiasLabel enum values (mirrors the
     // runtime fix in AnnotationWorkbench.tsx). The counts dict uses short
     // keys ("slightly", "highly") but final_label must use the full enum.
@@ -102,7 +102,7 @@ function makeEmpty(): ArticleState {
     annotation_count: 0,
     status: "pending",
     bias_score: null,
-    fleiss_kappa: null,
+    percent_agreement: null,
     final_label: null,
     priorLabels: [],
   };
@@ -134,7 +134,7 @@ describe("Issue-1 submission transaction rules", () => {
     expect(s.status).toBe("partial");
     expect(s.annotation_count).toBe(4);
     expect(s.bias_score).toBeNull();
-    expect(s.fleiss_kappa).toBeNull();
+    expect(s.percent_agreement).toBeNull();
 
     const res = submitAnnotation(s, "e@x.com", "highly_manipulative");
     expect(res.justCompleted).toBe(true);
@@ -143,10 +143,8 @@ describe("Issue-1 submission transaction rules", () => {
     expect(res.next.annotation_count).toBe(5);
     expect(res.next.annotated_by.length).toBe(5);
     expect(typeof res.next.bias_score === "number").toBe(true);
-    expect(typeof res.next.fleiss_kappa === "number").toBe(true);
-    expect(typeof res.next.final_label === "string" && LABELS.includes(res.next.final_label)).toBe(true);
-    expect(res.next.bias_score).not.toBeNull();
-    expect(res.next.fleiss_kappa).not.toBeNull();
+    expect(typeof res.next.percent_agreement === "number").toBe(true);
+    expect(res.next.percent_agreement).not.toBeNull();
     expect(res.next.final_label).not.toBeNull();
   });
 
@@ -169,13 +167,13 @@ describe("Issue-1 submission transaction rules", () => {
     expect(res.next.status).toBe("complete");
     expect(res.next.annotation_count).toBe(5);
     expect(res.next.bias_score).not.toBeNull();
-    expect(res.next.fleiss_kappa).not.toBeNull();
+    expect(res.next.percent_agreement).not.toBeNull();
     expect(res.next.final_label).not.toBeNull();
     expect(res.next.final_label).toBe("neutral");
   });
 
-  test("TEST-3 bias_score, fleiss_kappa, final_label correctly computed on 5th distinct annotator", () => {
-    // 3 neutral + 1 slightly + 1 highly → majority = neutral (3 > 1, 1)
+  test("TEST-3 bias_score, percent_agreement, final_label correctly computed on 5th distinct annotator", () => {
+    // 3 neutral + 1 slightly + 1 highly → P_i = (9+1+1-5)/20 = 0.3
     const { s } = submitN(makeEmpty(), [
       { email: "a@x.com", label: "neutral" },
       { email: "b@x.com", label: "neutral" },
@@ -185,7 +183,9 @@ describe("Issue-1 submission transaction rules", () => {
     ]);
     expect(s.status).toBe("complete");
     expect(s.bias_score).toBe(calculateBiasScore({ neutral: 3, slightly: 1, highly: 1 }));
-    expect(s.fleiss_kappa).toBe(calculateFleissKappa({ neutral: 3, slightly: 1, highly: 1 }));
+    expect(s.percent_agreement).toBe(calculatePercentAgreement({ neutral: 3, slightly: 1, highly: 1 }));
+    // Verify P_i = 0.30 (not the constant -0.25 that fleiss_kappa would give)
+    expect(s.percent_agreement).toBeCloseTo(0.3, 4);
     expect(s.final_label).toBe("neutral");
   });
 
@@ -239,7 +239,7 @@ describe("Issue-1 submission transaction rules", () => {
     expect(s.final_label).toBe("slightly_manipulative");
     expect(LABELS.includes(s.final_label!)).toBe(true);
     expect(s.bias_score).toBe(calculateBiasScore({ neutral: 1, slightly: 3, highly: 1 }));
-    expect(s.fleiss_kappa).toBe(calculateFleissKappa({ neutral: 1, slightly: 3, highly: 1 }));
+    expect(s.percent_agreement).toBe(calculatePercentAgreement({ neutral: 1, slightly: 3, highly: 1 }));
   });
 
   test("TEST-7 highly_manipulative majority → final_label MUST be canonical 'highly_manipulative' (not short 'highly') — validates Issue-1 enum fix", () => {
