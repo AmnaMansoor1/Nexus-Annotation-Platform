@@ -154,7 +154,7 @@ describe("Issue-1 submission transaction rules", () => {
       annotation_count: 3,    // STALE INCORRECT (should be 4)
       status: "partial",
       bias_score: null,
-      fleiss_kappa: null,
+      percent_agreement: null,
       final_label: null,
       priorLabels: [
         { email: "a@x.com", label: "neutral" },

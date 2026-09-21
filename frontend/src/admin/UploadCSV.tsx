@@ -118,7 +118,7 @@ export default function UploadCSV() {
             assigned_to: [],
             assigned_count: 0,
             bias_score: null,
-            fleiss_kappa: null,
+            percent_agreement: null,
             label: mlLabel,
             final_label: humanFinal,
             is_gold_standard: row.is_gold_standard === "true" || row.is_gold_standard === "1"

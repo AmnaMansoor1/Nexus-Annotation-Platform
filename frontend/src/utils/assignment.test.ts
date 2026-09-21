@@ -25,7 +25,7 @@ function mkArticle(
     assigned_to: overrides.assigned_to ?? [],
     assigned_count: overrides.assigned_count ?? 0,
     bias_score: null,
-    fleiss_kappa: null,
+    percent_agreement: null,
     label: null,
     final_label: null,
     is_gold_standard: false,

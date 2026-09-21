@@ -108,7 +108,7 @@ describe("reconcileArticle self-heal", () => {
     expect(new Set(result.article.assigned_to)).toEqual(new Set(["live1@x.com", "live2@x.com"]));
   });
 
-  test("clears bias_score / fleiss_kappa / final_label when annotation_count drops below required", () => {
+  test("clears bias_score / percent_agreement / final_label when annotation_count drops below required", () => {
     const ctx = ctxFromLive(new Set(["a@x.com"]), new Map([
       ["ART_SCORES", new Set(["a@x.com"])],
     ]));
@@ -121,7 +121,7 @@ describe("reconcileArticle self-heal", () => {
         annotation_count: 2,
         status: "complete",
         bias_score: 3.5,
-        fleiss_kappa: 0.81,
+        percent_agreement: 0.81,
         final_label: "Slightly Biased",
       } as any,
       ctx,
@@ -129,7 +129,7 @@ describe("reconcileArticle self-heal", () => {
     );
     expect(result.needsPersist).toBe(true);
     expect((result.article as any).bias_score).toBeNull();
-    expect((result.article as any).fleiss_kappa).toBeNull();
+    expect((result.article as any).percent_agreement).toBeNull();
     expect((result.article as any).final_label).toBeNull();
     expect((result.article as any).label).toBeNull();
     expect(result.article.status).toBe("pending");

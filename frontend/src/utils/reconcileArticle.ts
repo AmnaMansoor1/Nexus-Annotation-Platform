@@ -157,7 +157,7 @@ export function reconcileArticle(
 
   const needsScoreClear =
     annotationCount < requiredAnnotations &&
-    (raw.bias_score != null || raw.fleiss_kappa != null || (raw as any).final_label != null || (raw as any).label != null);
+    (raw.bias_score != null || raw.percent_agreement != null || (raw as any).final_label != null || (raw as any).label != null);
 
   const oldAssignedTo = rawAssignedTo;
   const oldAnnotatedBy = rawAnnotatedBy;
@@ -174,7 +174,7 @@ export function reconcileArticle(
   };
   if (needsScoreClear) {
     (articleRaw as any).bias_score = null;
-    (articleRaw as any).fleiss_kappa = null;
+    (articleRaw as any).percent_agreement = null;
     (articleRaw as any).final_label = null;
     (articleRaw as any).label = null;
   }
@@ -202,7 +202,7 @@ export function reconcileArticle(
   };
   if (needsScoreClear) {
     (updates as any).bias_score = null;
-    (updates as any).fleiss_kappa = null;
+    (updates as any).percent_agreement = null;
     (updates as any).final_label = null;
     (updates as any).label = null;
   }
