@@ -7,7 +7,7 @@ import { db } from "../firebase";
 import { Annotator, Article } from "../types";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
-import { calculateFleissKappa } from "../utils/calculateKappa";
+import { calculatePercentAgreement } from "../utils/calculateKappa";
 import { ensureSummaryExists } from "../utils/stats";
 import { User, Mail, Ban, Loader2, RefreshCw, Trash2, AlertTriangle, Database } from "lucide-react";
 
@@ -358,13 +358,13 @@ export default function AnnotatorsTable() {
 
               const needRecompute =
                 art.bias_score === null ||
-                art.fleiss_kappa === null ||
+                art.percent_agreement === null ||
                 art.final_label === null ||
                 !(art.label === 0 || art.label === 1);
 
               if (totalCounted === REQUIRED_ANNOTATIONS && needRecompute) {
                 const newScore = calculateBiasScore(counts);
-                const newKappa = calculateFleissKappa(counts);
+                const newPAgreement = calculatePercentAgreement(counts);
 
                 const entries = (Object.entries(counts) as Array<["neutral" | "slightly" | "highly", number]>);
                 entries.sort((a, b) => b[1] - a[1]);
@@ -382,7 +382,7 @@ export default function AnnotatorsTable() {
 
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: newScore,
-                  fleiss_kappa: newKappa,
+                  percent_agreement: newPAgreement,
                   final_label: finalLabel,
                   label: newBinaryLabel,
                 });
@@ -392,7 +392,7 @@ export default function AnnotatorsTable() {
                 // instead of writing garbage values; admin can investigate.
                 await updateDoc(doc(db, "articles", articleId), {
                   bias_score: null,
-                  fleiss_kappa: null,
+                  percent_agreement: null,
                   final_label: null,
                   label: null,
                 });
