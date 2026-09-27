@@ -155,6 +155,7 @@ export default function ExportCSV() {
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
           row[`ann_${i}_student_id`] = "";
           row[`ann_${i}_label`] = "";
+          row[`manipulation_cue_ann_${i}`] = "";
         }
 
         responses.forEach((res: any, i) => {
@@ -162,6 +163,9 @@ export default function ExportCSV() {
             const slot = i + 1;
             row[`ann_${slot}_student_id`] = res.annotator_email || "unknown";
             row[`ann_${slot}_label`] = res.label || "";
+            // manipulation_cues is an array on the response doc; join with pipe for CSV
+            const cues: string[] = Array.isArray(res.manipulation_cues) ? res.manipulation_cues : [];
+            row[`manipulation_cue_ann_${slot}`] = cues.join("|");
           }
         });
 

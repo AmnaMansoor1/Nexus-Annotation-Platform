@@ -30,11 +30,21 @@ export interface Article {
 
 export type BiasLabel = "neutral" | "slightly_manipulative" | "highly_manipulative";
 
+export type ManipulationCue =
+  | "emotional_language"
+  | "loaded_wording"
+  | "exaggeration"
+  | "omission_of_context"
+  | "unsupported_claims"
+  | "other";
+
 export interface AnnotationResponse {
   label: BiasLabel;
   timestamp: Timestamp;
   time_spent_sec: number;
   is_gold_check: boolean;
+  /** Cues selected in Q2. Empty array for neutral labels. */
+  manipulation_cues: ManipulationCue[];
 }
 
 export interface Annotator {

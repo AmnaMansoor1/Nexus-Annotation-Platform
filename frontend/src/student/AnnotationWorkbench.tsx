@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { doc, getDoc, updateDoc, setDoc, arrayUnion, increment, serverTimestamp, collection, getDocs, runTransaction, query, where } from "firebase/firestore";
 import { auth, db } from "../firebase";
-import { Article, Annotator, BiasLabel } from "../types";
+import { Article, Annotator, BiasLabel, ManipulationCue } from "../types";
 import { useArticleAssignment } from "./useArticleAssignment";
 import ProgressBar from "../components/ProgressBar";
 import TimerRing from "../components/TimerRing";
@@ -12,6 +12,16 @@ import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { syncBiasScoreAndStatsAtomically } from "../utils/stats";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
+
+// ── Manipulation-cue config (Q2) ─────────────────────────────────────────────
+const MANIPULATION_CUES: { key: ManipulationCue; label: string; description: string }[] = [
+  { key: "emotional_language",  label: "Emotional / Sensational Language", description: "The text uses emotionally charged words to provoke a reaction." },
+  { key: "loaded_wording",      label: "Loaded / One-sided Wording",      description: "The text presents only one perspective or uses words with strong implicit bias." },
+  { key: "exaggeration",        label: "Exaggeration / Clickbait",        description: "The headline or text overstates the facts to attract attention." },
+  { key: "omission_of_context", label: "Omission of Context",             description: "The text leaves out critical information that would change the reader's understanding." },
+  { key: "unsupported_claims",  label: "Unsupported Claims",              description: "The text makes strong assertions without providing evidence or reliable sources." },
+  { key: "other",               label: "Other",                           description: "" },
+];
 
 // Helper to retry async operations with exponential backoff (no generics to avoid errors)
 const retryWithBackoff = async (
@@ -81,6 +91,7 @@ export default function AnnotationWorkbench() {
 
   // Form State
   const [label, setLabel] = useState<BiasLabel | null>(null);
+  const [manipulationCues, setManipulationCues] = useState<ManipulationCue[]>([]);
 
   // Derived timer readiness (guaranteed by state OR wall-clock time elapsed >= 10s)
   const isTimerComplete = timerExpired || (startTime > 0 && Date.now() - startTime >= 10000);
@@ -97,6 +108,7 @@ export default function AnnotationWorkbench() {
     setStartTime(Date.now());
     setTimerExpired(false);
     setLabel(null);
+    setManipulationCues([]);
   }, [currentArticle?.article_id]);
 
   // Track last loaded article to prevent unnecessary reloads
@@ -237,7 +249,10 @@ export default function AnnotationWorkbench() {
   }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle, submitting]);
 
   const handleSubmit = async () => {
+    // Q2 is required when label is NOT neutral
+    const requiresCues = label !== null && label !== "neutral";
     if (!currentArticle || !label || !isTimerComplete || submitting) return;
+    if (requiresCues && manipulationCues.length === 0) return;
 
     if (!userEmail) {
       alert("Session expired. Please login again.");
@@ -259,9 +274,11 @@ export default function AnnotationWorkbench() {
     try {
       // --- 3. FIRST START THE SAVE TO DATABASE AND AWAIT IT ---
       await retryWithBackoff(async () => {
+        const savedCues = manipulationCues;
         const responseData = {
           annotator_email: userEmail,
           label: savedLabel,
+          manipulation_cues: savedLabel === "neutral" ? [] : savedCues,
           timestamp: serverTimestamp(),
           time_spent_sec: timeSpent,
           is_gold_check: !!savedCurrentArticle.is_gold_standard
@@ -997,22 +1014,26 @@ export default function AnnotationWorkbench() {
 
         {/* Right Panel: Form */}
         <div className="md:col-span-4 space-y-10">
+          {/* Q1 — Tone label */}
           <section className="space-y-5">
             <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
-              What is the tone of this excerpt?
+              Q1 — What is the tone of this excerpt?
             </h3>
             <div className="flex flex-col gap-3">
               {(["neutral", "slightly_manipulative", "highly_manipulative"] as const).map((opt) => (
                 <button
                   key={opt}
-                  onClick={() => setLabel(opt)}
+                  onClick={() => {
+                    setLabel(opt);
+                    if (opt === "neutral") setManipulationCues([]);
+                  }}
                   className={`flex items-center justify-between p-5 rounded-2xl border-2 transition-all font-bold ${
-                    label === opt 
-                      ? "border-primary bg-primary/5 text-primary shadow-sm" 
+                    label === opt
+                      ? "border-primary bg-primary/5 text-primary shadow-sm"
                       : "border-slate-100 bg-white text-slate-500 hover:border-slate-200"
                   }`}
                 >
-                  <span className="capitalize">{opt.replace("_", " ")}</span>
+                  <span className="capitalize">{opt.replace(/_/g, " ")}</span>
                   <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${
                     label === opt ? "bg-primary border-primary text-white" : "border-slate-200"
                   }`}>
@@ -1023,10 +1044,59 @@ export default function AnnotationWorkbench() {
             </div>
           </section>
 
+          {/* Q2 — Manipulation cues (shown only when label ≠ neutral) */}
+          {label !== null && label !== "neutral" && (
+            <section className="space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
+              <div>
+                <h3 className="font-black text-slate-400 uppercase tracking-[0.15em] text-[10px]">
+                  Q2 — What influenced your decision?
+                </h3>
+                <p className="text-[10px] text-slate-400 mt-1">Select all that apply</p>
+              </div>
+              <div className="flex flex-col gap-2">
+                {MANIPULATION_CUES.map(({ key, label: cueLabel, description }) => {
+                  const checked = manipulationCues.includes(key);
+                  return (
+                    <button
+                      key={key}
+                      onClick={() =>
+                        setManipulationCues(prev =>
+                          prev.includes(key) ? prev.filter(c => c !== key) : [...prev, key]
+                        )
+                      }
+                      className={`flex items-start gap-3 p-4 rounded-2xl border-2 text-left transition-all ${
+                        checked
+                          ? "border-primary bg-primary/5"
+                          : "border-slate-100 bg-white hover:border-slate-200"
+                      }`}
+                    >
+                      <div className={`mt-0.5 w-5 h-5 shrink-0 rounded border-2 flex items-center justify-center transition-all ${
+                        checked ? "bg-primary border-primary" : "border-slate-300"
+                      }`}>
+                        {checked && <Check size={12} strokeWidth={4} className="text-white" />}
+                      </div>
+                      <div>
+                        <p className={`font-bold text-xs ${ checked ? "text-primary" : "text-slate-700" }`}>{cueLabel}</p>
+                        {description && (
+                          <p className="text-[10px] text-slate-400 mt-0.5 leading-relaxed">{description}</p>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              {manipulationCues.length === 0 && (
+                <p className="text-[10px] text-amber-600 font-bold">
+                  ⚠ Please select at least one cue to continue.
+                </p>
+              )}
+            </section>
+          )}
+
           <div className="pt-4">
             <button
               onClick={handleSubmit}
-              disabled={!label || !isTimerComplete || submitting || verifyingFinalAnnotations}
+              disabled={!label || !isTimerComplete || submitting || verifyingFinalAnnotations || (label !== "neutral" && manipulationCues.length === 0)}
               className={`w-full py-4 rounded-xl font-bold text-lg transition-all shadow-lg flex items-center justify-center gap-2 ${
                 label && isTimerComplete && !submitting && !verifyingFinalAnnotations
                   ? "bg-primary text-white shadow-primary/25 hover:bg-primary/90"
@@ -1044,6 +1114,8 @@ export default function AnnotationWorkbench() {
                 <span>Wait for timer...</span>
               ) : !label ? (
                 <span>Select a tone to continue</span>
+              ) : label !== "neutral" && manipulationCues.length === 0 ? (
+                <span>Select at least one cue to continue</span>
               ) : (
                 <>
                   {completedCount >= 19 ? "Submit & Finish" : "Submit & Next"} <Check size={20} />
