@@ -1,6 +1,6 @@
 import type { AdminConfig, Article } from "../types";
 
-export const DEFAULT_REQUIRED_ANNOTATIONS = 5;
+export const DEFAULT_REQUIRED_ANNOTATIONS = 3;
 
 export function normalizeRequiredAnnotations(value: unknown): number {
   const parsed = Number(value);
