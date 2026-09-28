@@ -7,13 +7,6 @@
         { "fieldPath": "status", "order": "ASCENDING" },
         { "fieldPath": "sequence_number", "order": "ASCENDING" }
       ]
-    },
-    {
-      "collectionGroup": "responses",
-      "queryScope": "COLLECTION_GROUP",
-      "fields": [
-        { "fieldPath": "annotator_email", "order": "ASCENDING" }
-      ]
     }
   ],
   "fieldOverrides": []

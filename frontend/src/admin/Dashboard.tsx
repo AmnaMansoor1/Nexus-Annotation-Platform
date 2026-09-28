@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch, enableNetwork, enablePersistence } from "firebase/firestore";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch, enableNetwork } from "firebase/firestore";
 import Papa from "papaparse";
 import { db } from "../firebase";
 import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
