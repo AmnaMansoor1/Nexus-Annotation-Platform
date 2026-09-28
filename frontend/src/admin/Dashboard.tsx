@@ -18,6 +18,7 @@ import {
   Loader2,
   RefreshCw,
   ShieldAlert,
+  AlertTriangle,
   ListOrdered
 } from "lucide-react";
 
@@ -424,9 +425,54 @@ export default function Dashboard() {
 
   if (error) {
     return (
-      <div className="bg-red-50 p-6 rounded-2xl border border-red-200 text-red-700 space-y-2">
-        <h2 className="text-lg font-bold">Admin Dashboard Unavailable</h2>
-        <p className="text-sm">{error}</p>
+      <div className="space-y-4 animate-in fade-in duration-500">
+        <div className="bg-red-50 p-6 rounded-2xl border border-red-200 text-red-700 space-y-3">
+          <h2 className="text-lg font-bold">Admin Dashboard Unavailable</h2>
+          <p className="text-sm">{error}</p>
+        </div>
+
+        <div className="bg-white p-6 rounded-2xl border border-slate-200 space-y-4">
+          <div className="flex items-start gap-3">
+            <div className="bg-amber-100 w-9 h-9 rounded-xl flex items-center justify-center shrink-0">
+              <AlertTriangle className="text-amber-600" size={18} />
+            </div>
+            <div className="space-y-1">
+              <h3 className="font-bold text-slate-800">Recovery Procedure</h3>
+              <p className="text-sm text-slate-600 leading-relaxed">
+                Click <span className="font-semibold text-slate-800">Run Sync &amp; Repair</span> below once.
+                This will (1) rebuild every article's <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs font-mono">status / annotation_count / assigned_count / bias_score / percent_agreement / final_label</code> metadata
+                against live annotators using the current <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs font-mono">annotators_per_article</code> setting
+                (e.g. 3 default, or whatever per-article override you configured in Settings),
+                and (2) write the missing <code className="bg-slate-100 px-1.5 py-0.5 rounded text-xs font-mono">stats/platform_summary</code> document.
+                After the process completes (~10–60 seconds), the dashboard will automatically switch to the normal live view.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={handleSyncStats}
+              disabled={syncing}
+              className="flex items-center gap-2 bg-red-600 px-5 py-3 rounded-xl text-white font-bold text-sm hover:bg-red-700 transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw size={16} className={syncing ? "animate-spin" : ""} />
+              {syncing ? "Running Sync & Repair — do not close the tab..." : "Run Sync & Repair (fixes missing stats + article metadata)"}
+            </button>
+            <button
+              onClick={() => window.location.reload()}
+              className="flex items-center gap-2 bg-white px-4 py-3 rounded-xl border border-slate-200 text-slate-600 font-bold text-sm hover:bg-slate-50 transition-all shadow-sm"
+            >
+              Refresh Page
+            </button>
+          </div>
+
+          {syncing && (
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-3 font-medium">
+              <Loader2 size={12} className="animate-spin inline mr-2" />
+              Repairing {stats.totalArticles || "~1,493"} articles, validating annotator reverse-indexes, recomputing scores for articles at exactly N labels...
+            </div>
+          )}
+        </div>
       </div>
     );
   }

@@ -219,16 +219,53 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
       try {
         annotatorDoc = await getDoc(annotatorRef);
       } catch (fetchErr: any) {
-        const msg = (fetchErr && fetchErr.message) || "";
-        const isPerm = (fetchErr && (fetchErr.code === "permission-denied" ||
-          fetchErr.code === "firestore/permission-denied")) ||
+        const msg = (fetchErr && fetchErr.message) || String(fetchErr);
+        const code = (fetchErr && fetchErr.code) ? String(fetchErr.code) : "";
+        const isPerm =
+          code === "permission-denied" ||
+          code === "firestore/permission-denied" ||
           /permission|insufficient/i.test(msg);
+        const isTransient =
+          code === "unavailable" ||
+          code === "deadline-exceeded" ||
+          code === "aborted" ||
+          code === "resource-exhausted" ||
+          code === "internal" ||
+          code === "data-loss" ||
+          /network|timeout|offline|transient|connection|quota/i.test(msg);
+
         if (isPerm) {
           console.warn("[useArticleAssignment] getDoc annotator returned PERMISSION_DENIED — treating as MISSING doc and creating one.");
           annotatorDoc = { exists: () => false } as any;
+        } else if (isTransient) {
+          console.warn(`[useArticleAssignment] Transient Firestore error (${code || "unknown"}) reading annotator doc. First retry in 750ms...`, fetchErr);
+          try {
+            await new Promise(res => setTimeout(res, 750));
+            annotatorDoc = await getDoc(annotatorRef);
+          } catch (retryErr: any) {
+            const code2 = String((retryErr && retryErr.code) || "");
+            const msg2 = String((retryErr && retryErr.message) || retryErr);
+            const isPerm2 = code2 === "permission-denied" || code2 === "firestore/permission-denied" || /permission|insufficient/i.test(msg2);
+            if (isPerm2) {
+              console.warn("[useArticleAssignment] Retry got PERMISSION_DENIED — treating as missing doc.");
+              annotatorDoc = { exists: () => false } as any;
+            } else {
+              console.error(`[useArticleAssignment] Annotator doc read failed even after retry. code=${code2}. This might be a rule-evaluation error, a missing composite index on an unrelated query, or Firestore service disruption. Telling user to click "Try Loading Articles Again".`, retryErr);
+              setError(
+                `Could not reach your profile (Firestore: ${code2 || msg2.slice(0, 80)}). ` +
+                `This is usually temporary. Click "Try Loading Articles Again" below, or logout & back in. ` +
+                `If it keeps failing, ask admin to check DevTools console and verify firestore.rules were deployed.`
+              );
+              return;
+            }
+          }
         } else {
-          console.error("[useArticleAssignment] FAILURE fetching annotator doc (security rules / network?):", fetchErr);
-          setError("Could not load your profile. Please check permissions and login again.");
+          console.error(`[useArticleAssignment] FAILURE fetching annotator doc. code=${code}. This is NOT a permission error or known transient class.`, fetchErr);
+          setError(
+            `Could not load your profile (Firestore: ${code || msg.slice(0, 80)}). ` +
+            `Click "Try Loading Articles Again" below; if it still fails, contact admin. ` +
+            `Hint: if you just changed required annotators from 5 to 3, ask admin to run Sync & Repair on the dashboard first.`
+          );
           return;
         }
       }
