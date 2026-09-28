@@ -454,24 +454,14 @@ export default function ConsentGate() {
               <span className="cg-eta">
                 Estimated time: 8–10 minutes &nbsp;·&nbsp; 20 excerpts per batch
               </span>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  className="cg-button cg-button-outline"
-                  onClick={logout}
-                  disabled={submitting}
-                  type="button"
-                >
-                  Cancel / Logout
-                </button>
-                <button
-                  className="cg-button"
-                  onClick={handleSubmit}
-                  disabled={!canSubmit || submitting}
-                  type="button"
-                >
-                  {submitting ? "Recording consent…" : "Accept, confirm & begin →"}
-                </button>
-              </div>
+              <button
+                className="cg-button"
+                onClick={handleSubmit}
+                disabled={!canSubmit || submitting}
+                type="button"
+              >
+                {submitting ? "Recording consent…" : "Accept, confirm & begin →"}
+              </button>
             </div>
 
             <p className="cg-contact">
