@@ -4,11 +4,12 @@ import {
   runTransaction, increment, query, where
 } from "firebase/firestore";
 import { db } from "../firebase";
-import { Annotator, Article } from "../types";
+import { Annotator, Article, AdminConfig } from "../types";
 import { sanitizeEmailForDocId } from "../utils/sanitizeEmail";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { calculatePercentAgreement } from "../utils/calculateKappa";
 import { ensureSummaryExists } from "../utils/stats";
+import { getRequiredAnnotations, DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
 import { User, Mail, Ban, Loader2, RefreshCw, Trash2, AlertTriangle, Database } from "lucide-react";
 
 export default function AnnotatorsTable() {
@@ -78,7 +79,7 @@ export default function AnnotatorsTable() {
       `  • Scan ALL articles (collectionGroup query) to find every response doc — including orphans not in their profile\n` +
       `  • Free ${completedLocal} completed annotations + ${assignedOnlyLocal - completedLocal >= 0 ? (assignedOnlyLocal - completedLocal) : 0} assigned-but-unfinished slots\n` +
       `  • Decrement annotation_count + assigned_count on every affected article\n` +
-      `  • Recompute status; bias_score/fleiss_kappa recalculated ONLY when exactly 5 labels remain\n` +
+      `  • Recompute status; bias_score/percent_agreement recalculated ONLY when exactly the article's required label count remains\n` +
       `  • Update ALL dashboard counters (annotator count, status buckets, bias sum/avg)\n\n` +
       `THIS CANNOT BE UNDONE. Type DELETE in all caps to confirm.`;
     const userInput = prompt(msg);
@@ -96,6 +97,14 @@ export default function AnnotatorsTable() {
     setLoading(true);
     try {
       await ensureSummaryExists();
+
+      let adminConfig: AdminConfig | null = null;
+      try {
+        const adminDoc = await getDoc(doc(db, "admin_config", "settings"));
+        if (adminDoc.exists()) adminConfig = adminDoc.data() as AdminConfig;
+      } catch (acErr) {
+        console.warn("[AnnotatorsTable] Could not load admin_config, using per-article defaults only:", acErr);
+      }
 
       const docId = sanitizeEmailForDocId(email);
       const annotatorRef = doc(db, "annotators", docId);
@@ -208,8 +217,6 @@ export default function AnnotatorsTable() {
 
       const BATCH_SIZE = 8;
 
-      const REQUIRED_ANNOTATIONS = 5;
-
       const processArticle = async (articleId: string): Promise<{ ok: boolean }> => {
         try {
           let localBecameIncomplete = false;
@@ -222,6 +229,7 @@ export default function AnnotatorsTable() {
           let newStatus: "pending" | "partial" | "complete" = "pending";
           let articleChanged = false;
           let shouldRecomputeScores = false;
+          let requiredForArticle: number = DEFAULT_REQUIRED_ANNOTATIONS;
 
           await runTransaction(db, async (tx) => {
             const articleRef = doc(db, "articles", articleId);
@@ -235,6 +243,7 @@ export default function AnnotatorsTable() {
             }
 
             const article = articleSnap.data() as Article;
+            requiredForArticle = getRequiredAnnotations(article, adminConfig);
             oldStatus = (article.status || "pending") as "pending" | "partial" | "complete";
             const oldCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
             const oldAnnotatedBy = Array.isArray(article.annotated_by) ? article.annotated_by : [];
@@ -262,7 +271,7 @@ export default function AnnotatorsTable() {
               : [...oldAssignedTo];
             const newAssignedCount = wasThisAnnotatorAssigned ? Math.max(0, oldAssignedCount - 1) : oldAssignedCount;
 
-            if (newCount >= REQUIRED_ANNOTATIONS) newStatus = "complete";
+            if (newCount >= requiredForArticle) newStatus = "complete";
             else if (newCount > 0) newStatus = "partial";
             else newStatus = "pending";
 
@@ -283,13 +292,13 @@ export default function AnnotatorsTable() {
               status: newStatus,
             };
 
-            if (newCount < REQUIRED_ANNOTATIONS) {
+            if (newCount < requiredForArticle) {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
               updates.final_label = null;
               updates.label = null;
               if (article.bias_score !== null) localBiasCleared = true;
-            } else if (newCount === REQUIRED_ANNOTATIONS) {
+            } else if (newCount === requiredForArticle) {
               updates.bias_score = null;
               updates.fleiss_kappa = null;
               updates.final_label = null;
@@ -330,15 +339,15 @@ export default function AnnotatorsTable() {
           const articleSnap2 = await getDoc(doc(db, "articles", articleId));
           if (articleSnap2.exists()) {
             const art = articleSnap2.data() as Article;
-            if (art.annotation_count === REQUIRED_ANNOTATIONS) {
+            if (art.annotation_count === requiredForArticle) {
               const remainingResp = await getDocs(collection(db, "annotations", articleId, "responses"));
               // ── ISSUE-3 INTEGRITY: Build counts from EXACTLY the annotator
-              //    emails that are listed in article.annotated_by (5 emails).
+              //    emails that are listed in article.annotated_by (N emails, N = required).
               //    If orphaned response docs exist from a previously hard-deleted
               //    annotator, they will still be physically present (if deleted
               //    through non-UI pathways). Filtering to annotated_by emails
-              //    ensures n===5 always, preventing wrong kappa values and
-              //    wrong tie-majority decisions when exactly 5 remain.
+              //    ensures n===required always, preventing wrong kappa values and
+              //    wrong tie-majority decisions when exactly N remain.
               const allowedEmails = new Set(
                 (Array.isArray(art.annotated_by) ? art.annotated_by : [])
                   .map((e: any) => String(e).toLowerCase().trim())
@@ -362,7 +371,7 @@ export default function AnnotatorsTable() {
                 art.final_label === null ||
                 !(art.label === 0 || art.label === 1);
 
-              if (totalCounted === REQUIRED_ANNOTATIONS && needRecompute) {
+              if (totalCounted === requiredForArticle && needRecompute) {
                 const newScore = calculateBiasScore(counts);
                 const newPAgreement = calculatePercentAgreement(counts);
 
@@ -386,8 +395,8 @@ export default function AnnotatorsTable() {
                   final_label: finalLabel,
                   label: newBinaryLabel,
                 });
-              } else if (totalCounted !== REQUIRED_ANNOTATIONS && art.annotation_count === REQUIRED_ANNOTATIONS) {
-                // Integrity mismatch: annotated_by says 5 but only <5 valid
+              } else if (totalCounted !== requiredForArticle && art.annotation_count === requiredForArticle) {
+                // Integrity mismatch: annotated_by says N but only <N valid
                 // labelled response docs match the allow-list. Clear scores
                 // instead of writing garbage values; admin can investigate.
                 await updateDoc(doc(db, "articles", articleId), {
