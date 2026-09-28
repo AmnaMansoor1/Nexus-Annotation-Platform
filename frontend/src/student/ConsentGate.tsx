@@ -1,55 +1,23 @@
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 const STORAGE_KEY = "nexus_consent_seen_v1";
 
-interface CalibrationPair {
-  id: "A" | "B";
-  neutral: { urdu: string; translation: string };
-  high: { urdu: string; translation: string };
-  expectedHigh: "B";
-  observations: string[];
-}
-
-const CALIBRATION_PAIRS: CalibrationPair[] = [
-  {
-    id: "A",
-    expectedHigh: "B",
-    neutral: {
-      urdu: "حکومت نے نئے قانون کی منظوری دے دی، جس پر مختلف حلقوں کی جانب سے ملا جلا ردعمل سامنے آیا۔",
-      translation: "The government approved the new law, which drew a mixed response from various circles.",
-    },
-    high: {
-      urdu: "حکومت نے عوام کی مرضی کے خلاف متنازعہ قانون زبردستی مسلط کر دیا، جس سے ملک بھر میں شدید غم و غصہ پھیل گیا۔",
-      translation:
-        "The government forcibly imposed the controversial law against the people's will, sparking intense outrage nationwide.",
-    },
-    observations: [
-      "Loaded verb: زبردستی مسلط (forcibly imposed) asserts force rather than reporting approval.",
-      "Unverified scope: عوام کی مرضی کے خلاف claims to speak for public consensus.",
-      "Emotional scope: ملک بھر میں شدید غم و غصہ is not attributed to named sources.",
-    ],
+const EXAMPLE = {
+  neutral: {
+    urdu: "حکومت نے نئے قانون کی منظوری دے دی، جس پر مختلف حلقوں کی جانب سے ملا جلا ردعمل سامنے آیا۔",
+    translation: "The government approved the new law, which drew a mixed response from various circles.",
   },
-  {
-    id: "B",
-    expectedHigh: "B",
-    neutral: {
-      urdu: "معیشت میں نئی پالیسیوں کے بعد نرخِ سرمایہ کاری میں معمولی اضافہ دیکھا گیا ہے۔",
-      translation:
-        "After the new economic policies, a modest increase in the investment rate has been observed.",
-    },
-    high: {
-      urdu: "ماہرین کا واضح کہنا ہے کہ پالیسیوں نے معیشت کو تباہ کر دیا ہے اور ملک کو گہرے تباہی کی دہلیز پر کھڑا کر دیا ہے۔",
-      translation:
-        "Experts clearly state that the policies have destroyed the economy and placed the country on the brink of deep ruin.",
-    },
-    observations: [
-      "Unnamed expert appeal: ماہرین کا کہنا (experts say) — no identifiable sources given.",
-      "Catastrophic framing: تباہ کر دیا (destroyed), گہرے تباہی کی دہلیز (brink of deep ruin).",
-      "Sweeping scope claim: implied national consensus of disaster without evidence.",
-    ],
+  high: {
+    urdu: "حکومت نے عوام کی مرضی کے خلاف متنازعہ قانون زبردستی مسلط کر دیا، جس سے ملک بھر میں شدید غم و غصہ پھیل گیا۔",
+    translation: "The government forcibly imposed the controversial law against the people's will, sparking intense outrage nationwide.",
   },
-];
+  observations: [
+    "Loaded verb: زبردستی مسلط (forcibly imposed) asserts force rather than reporting approval.",
+    "Unverified scope: عوام کی مرضی کے خلاف claims to speak for public consensus.",
+    "Emotional scope: ملک بھر میں شدید غم و غصہ is not attributed to named sources.",
+  ],
+};
 
 interface Cue {
   num: string;
@@ -97,46 +65,19 @@ const MANIPULATION_CUES: Cue[] = [
   },
 ];
 
-type CalibrationSelection = Record<string, "A" | "B" | null>;
-
 export default function ConsentGate() {
   const navigate = useNavigate();
   const session = JSON.parse(localStorage.getItem("nexus_user_session") || "{}");
   const userEmail = (session.email || "").toLowerCase().trim();
 
   const [agreeChecked, setAgreeChecked] = useState(false);
-  const [calibration, setCalibration] = useState<CalibrationSelection>({
-    A: null,
-    B: null,
-  });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showHint, setShowHint] = useState<null | string>(null);
 
-  const calibrationScore = useMemo(() => {
-    let score = 0;
-    for (const pair of CALIBRATION_PAIRS) {
-      if (calibration[pair.id] === pair.expectedHigh) score++;
-    }
-    return score;
-  }, [calibration]);
-
-  const allCalibrationDone = CALIBRATION_PAIRS.every((p) => calibration[p.id] != null);
-  const canSubmit =
-    agreeChecked &&
-    allCalibrationDone &&
-    calibrationScore >= 1 &&
-    !!userEmail;
+  const canSubmit = agreeChecked && !!userEmail;
 
   const handleSubmit = async () => {
-    if (!canSubmit) {
-      if (calibrationScore < 1) {
-        setShowHint(
-          "You need at least 1 of 2 calibration examples correct before real articles are assigned. Review the scale and guidance above, then try again."
-        );
-      }
-      return;
-    }
+    if (!canSubmit) return;
     setShowHint(null);
     setError(null);
     setSubmitting(true);
@@ -148,7 +89,6 @@ export default function ConsentGate() {
           email: userEmail,
           accepted: true,
           at: Date.now(),
-          calibration: calibrationScore,
         })
       );
       navigate("/welcome");
@@ -164,10 +104,6 @@ export default function ConsentGate() {
   const logout = () => {
     localStorage.removeItem("nexus_user_session");
     window.location.href = "/";
-  };
-
-  const calibrateSelect = (pairId: "A" | "B", choice: "A" | "B") => {
-    setCalibration((prev) => ({ ...prev, [pairId]: choice }));
   };
 
   return (
@@ -424,74 +360,48 @@ export default function ConsentGate() {
             </div>
           </section>
 
-          {/* ───────── CALIBRATION PAIRED EXAMPLES (ATTENTION GATE) ───────── */}
+          {/* ───────── ILLUSTRATIVE EXAMPLE ───────── */}
           <section className="cg-panel cg-calibration">
             <div className="cg-cal-head">
               <div>
-                <h2>Calibration: identify the manipulative framing (attention check)</h2>
+                <h2>Example: neutral vs. manipulative framing</h2>
                 <p>
-                  For each pair below, click the version that is <em>more</em> manipulative. Both
-                  pairs are written for training and are <strong>not</strong> drawn from the live
-                  dataset. You must identify correctly at least 1 of 2 before real articles are
-                  assigned.
+                  Below is a fictional training example showing what neutral and manipulative
+                  writing look like side by side. Version B is manipulative.
                 </p>
               </div>
               <span className="cg-training">Illustrative only</span>
             </div>
 
-            {CALIBRATION_PAIRS.map((pair, pairIdx) => (
-              <div key={pair.id} style={{ marginBottom: pairIdx < CALIBRATION_PAIRS.length - 1 ? "18px" : 0 }}>
-                <div style={{ fontSize: 11, fontWeight: 800, color: "#46577a", letterSpacing: ".06em", marginBottom: 7 }}>
-                  PAIR {pair.id} &nbsp;·&nbsp; Click the <em>more manipulative</em> version
+            <div className="cg-pair">
+              {/* Version A — neutral */}
+              <div className="cg-example" style={{ cursor: "default" }}>
+                <div className="cg-badge">
+                  <span className="cg-score">A</span>
+                  &nbsp;Version A &nbsp;·&nbsp;
+                  <span style={{ color: "#26714d", fontWeight: 800 }}>Neutral</span>
                 </div>
-                <div className="cg-pair">
-                  {(["A", "B"] as const).map((letter) => {
-                    const item = letter === "A" ? pair.neutral : pair.high;
-                    const isHigh = letter === "B";
-                    const sel = calibration[pair.id] === letter;
-                    return (
-                      <div
-                        key={letter}
-                        onClick={() => calibrateSelect(pair.id, letter)}
-                        className={
-                          "cg-example " +
-                          (sel ? "cg-example-selected " : "") +
-                          (isHigh ? "cg-example-high " : "")
-                        }
-                      >
-                        <div
-                          className={
-                            "cg-badge " + (isHigh ? "cg-high-badge " : "") + " "
-                          }
-                        >
-                          <span
-                            className={
-                              "cg-score " + (isHigh ? "cg-high-score " : "")
-                            }
-                          >
-                            {letter}
-                          </span>
-                          &nbsp;{letter === "A" ? "Version A" : "Version B"}
-                          {sel && isHigh && " · candidate"}
-                          {sel && !isHigh && " · candidate"}
-                        </div>
-                        <p className="cg-urdu" lang="ur">
-                          {item.urdu}
-                        </p>
-                        <p className="cg-translation">{item.translation}</p>
-                      </div>
-                    );
-                  })}
-                </div>
-                {calibration[pair.id] === pair.expectedHigh && (
-                  <ul className="cg-observations">
-                    {pair.observations.map((o, i) => (
-                      <li key={i}>{o}</li>
-                    ))}
-                  </ul>
-                )}
+                <p className="cg-urdu" lang="ur">{EXAMPLE.neutral.urdu}</p>
+                <p className="cg-translation">{EXAMPLE.neutral.translation}</p>
               </div>
-            ))}
+
+              {/* Version B — manipulative */}
+              <div className="cg-example cg-example-high cg-example-selected" style={{ cursor: "default" }}>
+                <div className="cg-badge cg-high-badge">
+                  <span className="cg-score cg-high-score">B</span>
+                  &nbsp;Version B &nbsp;·&nbsp;
+                  <span style={{ color: "#a24141", fontWeight: 800 }}>Manipulative ✔</span>
+                </div>
+                <p className="cg-urdu" lang="ur">{EXAMPLE.high.urdu}</p>
+                <p className="cg-translation">{EXAMPLE.high.translation}</p>
+              </div>
+            </div>
+
+            <ul className="cg-observations">
+              {EXAMPLE.observations.map((o, i) => (
+                <li key={i}>{o}</li>
+              ))}
+            </ul>
           </section>
 
           {/* ───────── SCALE DESCRIPTION ───────── */}
@@ -513,30 +423,6 @@ export default function ConsentGate() {
             </div>
           </section>
 
-          {/* ───────── CALIBRATION PROGRESS ───────── */}
-          <section className="cg-panel cg-quiz">
-            <div className="cg-progress">
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <span
-                  className={
-                    "cg-chip " +
-                    (calibrationScore >= 2
-                      ? "cg-chip-ok"
-                      : calibrationScore >= 1
-                      ? "cg-chip-warn"
-                      : "cg-chip-bad")
-                  }
-                >
-                  Calibration: {calibrationScore} / {CALIBRATION_PAIRS.length}
-                  {"  "}
-                  {calibrationScore >= 1 ? "✓ passed" : "below threshold"}
-                </span>
-              </div>
-              <div style={{ fontSize: 10, color: "#75849b", whiteSpace: "nowrap" }}>
-                Minimum: &nbsp;≥ 1 calibration correct
-              </div>
-            </div>
-          </section>
 
           {/* ───────── CONSENT CHECKBOX + SUBMIT ───────── */}
           <section className="cg-panel cg-consent">
