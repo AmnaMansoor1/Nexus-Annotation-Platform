@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch, enableNetwork } from "firebase/firestore";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch, enableNetwork, disableNetwork } from "firebase/firestore";
 import Papa from "papaparse";
 import { db } from "../firebase";
 import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
@@ -49,21 +49,22 @@ export default function Dashboard() {
   const seqCsvInputRef = useRef<HTMLInputElement | null>(null);
 
   // ─────────────────────────────────────────────────────────────────────
-  // Retry wrapper: handles `unavailable` (offline) and other transient
-  // Firestore errors with exponential backoff. Used for every batch
-  // commit and every top-level collection fetch inside Sync & Repair.
+  // Retry wrapper: detects transient Firestore errors with exponential
+  // backoff. Every 2nd failed attempt, cycles disableNetwork/enableNetwork
+  // to force the WebChannel/gRPC transport to fully reconnect (fixes
+  // "client is offline" after Wi-Fi or proxy drops the stream for >10s).
   // ─────────────────────────────────────────────────────────────────────
   async function runWithRetries<T>(
     label: string,
     fn: () => Promise<T>,
     opts: { attempts?: number; baseDelayMs?: number } = {}
   ): Promise<T> {
-    const attempts = opts.attempts ?? 4;
-    const baseDelay = opts.baseDelayMs ?? 1000;
+    const attempts = opts.attempts ?? 8;
+    const baseDelay = opts.baseDelayMs ?? 2000;
     let lastErr: unknown;
     for (let i = 0; i < attempts; i++) {
       try {
-        if (i > 0) console.warn(`[SyncStats] ${label}: retry ${i}/${attempts - 1} after ${baseDelay * Math.pow(2, i - 1)} ms`);
+        if (i > 0) console.warn(`[SyncStats] ${label}: retry ${i}/${attempts - 1}`);
         const out = await fn();
         if (i > 0) console.log(`[SyncStats] ${label}: retry ${i} succeeded.`);
         return out;
@@ -77,15 +78,23 @@ export default function Dashboard() {
           code === "aborted" ||
           code === "resource-exhausted" ||
           code === "internal" ||
-          /offline|network|timeout|connection/i.test(msg);
+          code === "data-loss" ||
+          code === "cancelled" ||
+          /offline|network|timeout|connection|socket|reset|rpc|channel/i.test(msg);
         if (!transient || i === attempts - 1) {
-          console.error(`[SyncStats] ${label}: fatal (non-transient or attempts exhausted) after ${i + 1} tries. code=${code}`, e);
+          console.error(`[SyncStats] ${label}: fatal after ${i + 1} tries. code=${code}. transient=${transient}`, e);
           throw e;
         }
-        const delay = baseDelay * Math.pow(2, i);
-        console.warn(`[SyncStats] ${label}: transient error code=${code}. Sleeping ${delay} ms before retry...`);
-        await new Promise(res => setTimeout(res, delay));
+        const delay = baseDelay * Math.pow(1.6, i);
+        const clamped = Math.min(delay, 20000);
+        console.warn(`[SyncStats] ${label}: transient code=${code}. attempt=${i + 1}/${attempts}. sleeping ${clamped}ms then full SDK network-cycle.`);
+        await new Promise(res => setTimeout(res, clamped));
+        // Every retry, cycle disableNetwork→enableNetwork to guarantee the
+        // Firestore SDK drops its dead WebChannel and re-opens a fresh one.
+        try { await disableNetwork(db); } catch (_) { /* swallow */ }
+        await new Promise(res => setTimeout(res, 250));
         try { await enableNetwork(db); } catch (_) { /* swallow */ }
+        await new Promise(res => setTimeout(res, 500));
       }
     }
     throw lastErr;
