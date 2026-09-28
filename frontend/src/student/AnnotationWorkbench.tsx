@@ -65,14 +65,16 @@ export default function AnnotationWorkbench() {
   const userEmail = (session.email || "").toLowerCase().trim();
   console.log("[AnnotationWorkbench] User email from session:", userEmail);
   const [assignmentRefresh, setAssignmentRefresh] = useState(0);
+  const [targetAnnotations, setTargetAnnotations] = useState<number>(20);
   // Destructure all returns from useArticleAssignment!
-  const { 
-    assignedArticles, 
-    loading: assignmentLoading, 
-    error: assignmentError, 
-    loadAssignment 
+  const {
+    assignedArticles,
+    targetAnnotations: targetFromHook,
+    loading: assignmentLoading,
+    error: assignmentError,
+    loadAssignment
   } = useArticleAssignment(userEmail, assignmentRefresh);
-  console.log("[AnnotationWorkbench] useArticleAssignment returned: assignedArticles=", assignedArticles, "assignmentLoading=", assignmentLoading);
+  console.log("[AnnotationWorkbench] useArticleAssignment returned: assignedArticles=", assignedArticles, "targetAnnotations=", targetFromHook, "assignmentLoading=", assignmentLoading);
   
   // Add state for assignedArticles to store locally!
   const [assignedArticlesState, setAssignedArticlesState] = useState<string[]>([]);
@@ -131,6 +133,13 @@ export default function AnnotationWorkbench() {
     setAssignedArticlesState(assignedArticles);
   }, [assignedArticles]);
 
+  // Sync local targetAnnotations with hook value (updates when user clicks "Annotate 20 more?")
+  useEffect(() => {
+    if (typeof targetFromHook === "number" && targetFromHook >= 20) {
+      setTargetAnnotations(targetFromHook);
+    }
+  }, [targetFromHook]);
+
   // Load article from cache or Firestore
   // Uses articlesCacheRef for lookups (stable) instead of articlesCache state (churns deps).
   // Prevents infinite useEffect re-triggering when cache updates during loadArticle().
@@ -181,8 +190,12 @@ export default function AnnotationWorkbench() {
         if (annotatorDoc.exists()) {
           const data = annotatorDoc.data() as Annotator;
           const completed = data.completed_articles || [];
+          const target = typeof data.target_annotations === "number" && data.target_annotations >= 20
+            ? data.target_annotations
+            : 20;
+          setTargetAnnotations(target);
           setCompletedArticles(completed);
-          setCompletedCount(Math.min(completed.length, 20));
+          setCompletedCount(Math.min(completed.length, target));
         }
       } catch (err) {
         console.error("Error loading annotator:", err);
@@ -207,7 +220,7 @@ export default function AnnotationWorkbench() {
       const firstPendingIndex = assignedArticlesState.findIndex(id => !completedArticles.includes(id));
       
       if (firstPendingIndex === -1) {
-        if (!assignmentLoading && completedArticles.length >= 20) {
+        if (!assignmentLoading && completedArticles.length >= targetAnnotations) {
           navigate("/done");
         } else if (!assignmentLoading) {
           setLoading(false);
@@ -246,7 +259,7 @@ export default function AnnotationWorkbench() {
     if (!assignmentLoading && !submitting) {
       loadArticle();
     }
-  }, [assignedArticlesState, assignmentLoading, completedArticles, navigate, loadArticleFromCacheOrDB, preloadNextArticle, submitting]);
+  }, [assignedArticlesState, assignmentLoading, completedArticles, targetAnnotations, navigate, loadArticleFromCacheOrDB, preloadNextArticle, submitting]);
 
   const handleSubmit = async () => {
     // Q2 is required when label is NOT neutral
@@ -828,11 +841,15 @@ export default function AnnotationWorkbench() {
         console.warn("[AnnotationWorkbench] Soft post-save reads failed — falling back to local state:", readErr);
       }
 
-      // --- 6. If completed count reached 20 (or annotator is marked completed), go to done screen!
-      const isTargetReached = latestCompletedArticles.length >= 20 || (latestAnnotator && latestAnnotator.completed);
+      // --- 6. If completed count reached PERSONAL TARGET (default 20, raised via "Annotate 20 more?"), go to done screen!
+      //     The permanent "mission accomplished" flag (annotator.completed) still fires at exactly 20 — this gate is for the raised target.
+      const dynamicTarget = (latestAnnotator && typeof latestAnnotator.target_annotations === "number" && latestAnnotator.target_annotations >= 20)
+        ? latestAnnotator.target_annotations
+        : targetAnnotations;
+      const isTargetReached = latestCompletedArticles.length >= dynamicTarget;
       if (isTargetReached) {
         setCompletedArticles(latestCompletedArticles);
-        setCompletedCount(20);
+        setCompletedCount(Math.min(latestCompletedArticles.length, dynamicTarget));
         setSubmitting(false);
         navigate("/done");
         return;
@@ -841,8 +858,8 @@ export default function AnnotationWorkbench() {
       // Find next pending index using the LATEST data
       let nextPendingIndex = latestAssignedArticles.findIndex(id => !latestCompletedArticles.includes(id) && id !== articleId);
 
-      // If we still don't have a next article, and haven't reached 20 completed, try to load more!
-      if (nextPendingIndex === -1 && latestCompletedArticles.length < 20) {
+      // If we still don't have a next article, and haven't reached personal target, try to load more!
+      if (nextPendingIndex === -1 && latestCompletedArticles.length < dynamicTarget) {
         setAssignmentRefresh(prev => prev + 1);
         await loadAssignment();
         
@@ -861,15 +878,15 @@ export default function AnnotationWorkbench() {
       // ── SINGLE SOURCE OF TRUTH: Update local state after successful commit. ──
       setAssignedArticlesState(latestAssignedArticles);
       setCompletedArticles(latestCompletedArticles);
-      setCompletedCount(Math.min(latestCompletedArticles.length, 20));
+      setCompletedCount(Math.min(latestCompletedArticles.length, dynamicTarget));
 
       if (nextPendingIndex === -1) {
         setSubmitting(false);
-        if (latestCompletedArticles.length >= 20) {
+        if (latestCompletedArticles.length >= dynamicTarget) {
           navigate("/done");
         } else {
-          console.warn("[AnnotationWorkbench] No next article, but we haven't completed 20 yet—waiting!");
-          alert("You've annotated all available articles! Please check back later for more to reach your 20-article target.");
+          console.warn("[AnnotationWorkbench] No next article, but we haven't completed target=" + dynamicTarget + " yet—waiting!");
+          alert(`You've annotated all available articles! Please check back later for more to reach your ${dynamicTarget}-article target.`);
         }
       } else {
         const nextArticleId = latestAssignedArticles[nextPendingIndex];
@@ -960,7 +977,10 @@ export default function AnnotationWorkbench() {
       <header className="bg-white border-b border-slate-200 p-6 sticky top-0 z-10 shadow-sm">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div className="w-72">
-            <ProgressBar current={completedCount + 1} total={20} />
+            <ProgressBar current={Math.min(completedCount + 1, targetAnnotations)} total={targetAnnotations} />
+            <p className="mt-2 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">
+              Article {Math.min(completedCount + 1, targetAnnotations)} of {targetAnnotations}
+            </p>
           </div>
           <div className="text-primary font-black text-3xl tracking-tighter">NEXUS</div>
           <div className="w-72 flex justify-end">

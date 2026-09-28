@@ -30,6 +30,7 @@ interface AssignmentCache {
   email: string;
   assigned_articles: string[];
   completed_articles: string[];
+  target_annotations: number;
   cachedAt: number;
 }
 
@@ -46,6 +47,7 @@ function readCache(email: string): AssignmentCache | null {
     if (parsed.email !== email) return null;
     if (!Array.isArray(parsed.assigned_articles)) return null;
     if (!Array.isArray(parsed.completed_articles)) return null;
+    if (typeof parsed.target_annotations !== "number" || parsed.target_annotations < 20) return null;
     return parsed as AssignmentCache;
   } catch (e) {
     console.warn("[useArticleAssignment] Failed to read cache:", e);
@@ -53,12 +55,13 @@ function readCache(email: string): AssignmentCache | null {
   }
 }
 
-function writeCache(email: string, assigned: string[], completed: string[]): void {
+function writeCache(email: string, assigned: string[], completed: string[], target: number): void {
   try {
     const payload: AssignmentCache = {
       email,
       assigned_articles: [...assigned],
       completed_articles: [...completed],
+      target_annotations: target,
       cachedAt: Date.now(),
     };
     localStorage.setItem(getCacheKey(email), JSON.stringify(payload));
@@ -193,6 +196,7 @@ async function lightSelfHeal(
 
 export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
   const [assignedArticles, setAssignedArticles] = useState<string[]>([]);
+  const [targetAnnotations, setTargetAnnotations] = useState<number>(20);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const loadAssignmentRunningRef = useRef(false);
@@ -274,23 +278,31 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
 
       let currentAssignment: string[] = [];
       let completed: string[] = [];
+      let target = 20;
 
       if (annotatorDoc.exists()) {
         clearLegacyCache(email);
         const data = annotatorDoc.data() as Annotator;
         currentAssignment = Array.isArray(data.assigned_articles) ? data.assigned_articles.filter(Boolean) : [];
         completed = Array.isArray(data.completed_articles) ? data.completed_articles.filter(Boolean) : [];
+        const rawTarget = typeof data.target_annotations === "number" && data.target_annotations >= 20
+          ? data.target_annotations
+          : 20;
+        target = rawTarget;
+        setTargetAnnotations(target);
         console.log("[useArticleAssignment] Annotator server state:", {
           assigned_count: currentAssignment.length,
           completed_count: completed.length,
+          target_annotations: target,
         });
 
         const cache = readCache(email);
-        if (cache && currentAssignment.length >= 20) {
+        const targetMatch = cache && typeof cache.target_annotations === "number" && cache.target_annotations === target;
+        if (cache && targetMatch && currentAssignment.length >= target) {
           const assignedMatch = arraysEqualAsSets(cache.assigned_articles, currentAssignment);
           const completedMatch = arraysEqualAsSets(cache.completed_articles, completed);
           if (assignedMatch && completedMatch && currentAssignment.length > 0) {
-            console.log(`[useArticleAssignment] CACHE HIT (≥20 branch). assigned=${currentAssignment.length}. Running lightSelfHeal to keep counts healthy while returning authoritative list.`);
+            console.log(`[useArticleAssignment] CACHE HIT (≥target branch). assigned=${currentAssignment.length}, target=${target}. Running lightSelfHeal to keep counts healthy while returning authoritative list.`);
             try {
               void lightSelfHeal(email, currentAssignment, completed);
             } catch (_) { /* fire-and-forget */ }
@@ -298,12 +310,12 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
             setLoading(false);
             return;
           }
-          console.log(`[useArticleAssignment] CACHE MISS ≥20 branch (assignedMatch=${assignedMatch}, completedMatch=${completedMatch}). Will NOT skip — running lightSelfHeal + returning server list.`);
-        } else if (cache && currentAssignment.length < 20) {
+          console.log(`[useArticleAssignment] CACHE MISS ≥target branch (assignedMatch=${assignedMatch}, completedMatch=${completedMatch}, target=${target}). Will NOT skip — running lightSelfHeal + returning server list.`);
+        } else if (cache && currentAssignment.length < target) {
           const assignedMatch = arraysEqualAsSets(cache.assigned_articles, currentAssignment);
           const completedMatch = arraysEqualAsSets(cache.completed_articles, completed);
           if (assignedMatch && completedMatch && currentAssignment.length > 0) {
-            console.log(`[useArticleAssignment] CACHE HIT (<20 branch) but assigned < 20 — WILL IGNORE CACHE and run assignment query to fetch remaining articles. READS SAVED on subsequent login after 20 reached.`);
+            console.log(`[useArticleAssignment] CACHE HIT (<target branch) but assigned < target=${target} — WILL IGNORE CACHE and run assignment query to fetch remaining articles.`);
           }
         }
       } else {
@@ -314,6 +326,7 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
           completed: false,
           completed_articles: [],
           assigned_articles: [],
+          target_annotations: 20,
           reliability_score: 0,
           gold_total_count: 0,
           gold_correct_count: 0,
@@ -329,16 +342,18 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
         }
         currentAssignment = [];
         completed = [];
+        target = 20;
+        setTargetAnnotations(20);
       }
 
-      console.log("[useArticleAssignment] Current assigned count:", currentAssignment.length, "Current completed:", completed.length);
+      console.log("[useArticleAssignment] Current assigned count:", currentAssignment.length, "Current completed:", completed.length, "Target:", target);
 
-      if (currentAssignment.length < 20) {
-        console.log("[useArticleAssignment] Need more articles. Calling assignArticlesForAnnotator...");
-        console.log("[useArticleAssignment] READ #2 (Strategy A index): ~100 reads expected on composite index (status+sequence_number ASC). READ #3 (Strategy B fallback): up to 500 reads if Strategy A returns <20. WRITES: 20x setDoc merge (assigned_count increment + arrayUnion) via batch.");
+      if (currentAssignment.length < target) {
+        console.log("[useArticleAssignment] Need more articles (assigned:", currentAssignment.length, "< target:", target, "). Calling assignArticlesForAnnotator...");
+        console.log(`[useArticleAssignment] READ #2 (Strategy A index): ~100 reads expected on composite index (status+sequence_number ASC). READ #3 (Strategy B fallback): up to 500 reads if Strategy A returns <${target}. WRITES: up to ${target}x setDoc merge via batch.`);
         let moreArticles: string[] = [];
         try {
-          moreArticles = await assignArticlesForAnnotator(email);
+          moreArticles = await assignArticlesForAnnotator(email, target);
         } catch (assignErr) {
           console.error("[useArticleAssignment] assignArticlesForAnnotator THREW EXCEPTION:", assignErr);
           setError("Article assignment failed. Click 'Try Again' to retry.");
@@ -346,8 +361,8 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
         console.log("[useArticleAssignment] assignArticlesForAnnotator returned:", moreArticles.length, "articles:", moreArticles);
 
         if (moreArticles.length > 0) {
-          const mergedAssignment = moreArticles.slice(0, 20);
-          console.log("[useArticleAssignment] Authoritative assignment (", mergedAssignment.length, "):", mergedAssignment);
+          const mergedAssignment = moreArticles.slice(0, target);
+          console.log("[useArticleAssignment] Authoritative assignment (", mergedAssignment.length, "/ target:", target, "):", mergedAssignment);
 
           const assignmentChanged = mergedAssignment.length !== currentAssignment.length
             || mergedAssignment.some((v, i) => v !== currentAssignment[i]);
@@ -365,24 +380,24 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
             }
           }
           setAssignedArticles(mergedAssignment);
-          writeCache(email, mergedAssignment, completed);
+          writeCache(email, mergedAssignment, completed, target);
         } else {
           console.log("[useArticleAssignment] assignArticles returned empty list. Keeping current assignment:", currentAssignment);
           if (currentAssignment.length > 0) {
             setAssignedArticles(currentAssignment);
-            writeCache(email, currentAssignment, completed);
+            writeCache(email, currentAssignment, completed, target);
           } else {
             setAssignedArticles([]);
             setError("No articles could be assigned. Make sure articles exist in Firestore with status=pending.");
           }
         }
       } else {
-        console.log("[useArticleAssignment] Already have", currentAssignment.length, "articles (>= 20). Light self-heal kicked off; returning server-authoritative list.");
+        console.log("[useArticleAssignment] Already have", currentAssignment.length, "articles (>= target:", target, "). Light self-heal kicked off; returning server-authoritative list.");
         try {
           void lightSelfHeal(email, currentAssignment, completed);
         } catch (_) { /* fire-and-forget */ }
         setAssignedArticles(currentAssignment);
-        writeCache(email, currentAssignment, completed);
+        writeCache(email, currentAssignment, completed, target);
       }
 
     } catch (err) {
@@ -399,5 +414,5 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
     loadAssignment();
   }, [email, refreshTrigger, loadAssignment]);
 
-  return { assignedArticles, loading, error, loadAssignment };
+  return { assignedArticles, targetAnnotations, loading, error, loadAssignment };
 }

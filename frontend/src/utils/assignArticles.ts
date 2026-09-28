@@ -82,8 +82,8 @@ export function selectArticlesSequentially(
   return { selected, skipped_inconsistent };
 }
 
-export async function assignArticlesForAnnotator(email: string): Promise<string[]> {
-  console.log("[assignArticlesForAnnotator] Starting for email:", email);
+export async function assignArticlesForAnnotator(email: string, targetCount: number = 20): Promise<string[]> {
+  console.log("[assignArticlesForAnnotator] Starting for email:", email, "targetCount:", targetCount);
   await randomDelay(100, 500);
 
   let adminConfig: AdminConfig | null = null;
@@ -161,8 +161,8 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
     }
 
     candidates.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
-    eligibleArticles = candidates.slice(0, 20);
-    console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates");
+    eligibleArticles = candidates.slice(0, targetCount);
+    console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates (target:", targetCount, ")");
   } catch (err) {
     console.warn("[assignArticlesForAnnotator] Strategy A failed (index missing?):", err);
   }
@@ -172,9 +172,9 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   // orderBy(sequence_number, asc) + limit(500). Filter client-side.
   // NEVER falls back to article_id/doc-name ordering.
   // ─────────────────────────────────────────────────────────────────
-  if (eligibleArticles.length < 20) {
+  if (eligibleArticles.length < targetCount) {
     try {
-      console.log("[assignArticlesForAnnotator] Running Strategy B (fallback: sequence_number order, client-side filter)");
+      console.log("[assignArticlesForAnnotator] Running Strategy B (fallback: sequence_number order, client-side filter, target:", targetCount, ")");
       const fallbackQ = query(articlesRef, orderBy("sequence_number", "asc"), limit(500));
       const fallbackSnap = await getDocs(fallbackQ);
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
@@ -184,7 +184,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
       const alreadySeen = new Set(eligibleArticles.map(a => a.article_id));
       const inconsistencies: string[] = [];
       for (const article of healedFallback) {
-        if (eligibleArticles.length >= 20) break;
+        if (eligibleArticles.length >= targetCount) break;
         if (alreadySeen.has(article.article_id)) continue;
         const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
         const check = isEligible(article, email, requiredAnnotations);
@@ -257,12 +257,12 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
   const alreadyMineSet = new Set(alreadyMineIds);
 
   eligibleArticles.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
-  const newSlotsNeeded = Math.max(0, 20 - alreadyMineIds.length);
+  const newSlotsNeeded = Math.max(0, targetCount - alreadyMineIds.length);
   const newToAssign = eligibleArticles
     .filter((a) => !alreadyMineSet.has(a.article_id))
     .slice(0, newSlotsNeeded);
 
-  const selectedArticles = [...alreadyMineArticles, ...newToAssign].slice(0, 20);
+  const selectedArticles = [...alreadyMineArticles, ...newToAssign].slice(0, targetCount);
   const selectedIds = selectedArticles.map((a) => a.article_id);
   const idsNeedingWrite = newToAssign.map((a) => a.article_id);
 
@@ -330,7 +330,7 @@ export async function assignArticlesForAnnotator(email: string): Promise<string[
         }
       }
       console.log("[assignArticlesForAnnotator] Fallback wrote", successCount, "new slot(s)");
-      return successfulIds.slice(0, 20);
+      return successfulIds.slice(0, targetCount);
     }
   }
 

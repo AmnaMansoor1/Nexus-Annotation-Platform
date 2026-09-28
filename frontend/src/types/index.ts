@@ -56,6 +56,8 @@ export interface Annotator {
   completed_articles: string[];
   assigned_articles: string[];
   reliability_score: number;
+  /** Personal target: starts at 20. Each "Annotate 20 more?" click adds 20. */
+  target_annotations?: number;
   // Performance metrics
   gold_total_count?: number;
   gold_correct_count?: number;
