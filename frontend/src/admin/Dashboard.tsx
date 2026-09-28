@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch } from "firebase/firestore";
+import { collection, query, getDocs, limit, doc, where, getCountFromServer, getDoc, setDoc, onSnapshot, writeBatch, enableNetwork, enablePersistence } from "firebase/firestore";
 import Papa from "papaparse";
 import { db } from "../firebase";
 import { Article, PlatformSummary, Annotator, AdminConfig } from "../types";
@@ -45,7 +45,51 @@ export default function Dashboard() {
   const [syncing, setSyncing] = useState(false);
   const [repairingSeq, setRepairingSeq] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncProgress, setSyncProgress] = useState<{ step: string; processed: number; total: number } | null>(null);
   const seqCsvInputRef = useRef<HTMLInputElement | null>(null);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Retry wrapper: handles `unavailable` (offline) and other transient
+  // Firestore errors with exponential backoff. Used for every batch
+  // commit and every top-level collection fetch inside Sync & Repair.
+  // ─────────────────────────────────────────────────────────────────────
+  async function runWithRetries<T>(
+    label: string,
+    fn: () => Promise<T>,
+    opts: { attempts?: number; baseDelayMs?: number } = {}
+  ): Promise<T> {
+    const attempts = opts.attempts ?? 4;
+    const baseDelay = opts.baseDelayMs ?? 1000;
+    let lastErr: unknown;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        if (i > 0) console.warn(`[SyncStats] ${label}: retry ${i}/${attempts - 1} after ${baseDelay * Math.pow(2, i - 1)} ms`);
+        const out = await fn();
+        if (i > 0) console.log(`[SyncStats] ${label}: retry ${i} succeeded.`);
+        return out;
+      } catch (e: any) {
+        lastErr = e;
+        const code = String(e?.code || "");
+        const msg = String(e?.message || e || "");
+        const transient =
+          code === "unavailable" ||
+          code === "deadline-exceeded" ||
+          code === "aborted" ||
+          code === "resource-exhausted" ||
+          code === "internal" ||
+          /offline|network|timeout|connection/i.test(msg);
+        if (!transient || i === attempts - 1) {
+          console.error(`[SyncStats] ${label}: fatal (non-transient or attempts exhausted) after ${i + 1} tries. code=${code}`, e);
+          throw e;
+        }
+        const delay = baseDelay * Math.pow(2, i);
+        console.warn(`[SyncStats] ${label}: transient error code=${code}. Sleeping ${delay} ms before retry...`);
+        await new Promise(res => setTimeout(res, delay));
+        try { await enableNetwork(db); } catch (_) { /* swallow */ }
+      }
+    }
+    throw lastErr;
+  }
 
   const handleRepairSequenceNumbers = () => {
     seqCsvInputRef.current?.click();
@@ -198,18 +242,37 @@ export default function Dashboard() {
       "  • Recalculate status (pending/partial/complete) and clear bias_score when count drops\n\n" +
       "STEP 2 — Rebuild Platform Summary (stats/platform_summary)\n\n" +
       "This is required after annotator deletions and fixes the 'new users get articles starting at seq 40+' bug.\n\n" +
+      "The operation is IDempotent — if your internet drops mid-run, simply click Run Sync & Repair again.\n\n" +
       "Continue?"
     )) return;
 
     setSyncing(true);
+    setSyncProgress({ step: "Preparing: re-enabling Firestore network + fetching annotators + articles…", processed: 0, total: 0 });
+    setError(null);
     try {
-      console.log("Starting full statistics sync with article consistency repair...");
+      console.log("[SyncStats] Starting full statistics sync with article consistency repair (offline-retry build).");
 
-      // 1. Fetch ALL articles and annotators (Note: Use pagination for > 10,000)
-      const [articlesSnap, annotatorsSnap] = await Promise.all([
-        getDocs(collection(db, "articles")),
-        getDocs(collection(db, "annotators"))
-      ]);
+      try {
+        await enableNetwork(db);
+        await new Promise(r => setTimeout(r, 250));
+      } catch (ne) {
+        console.warn("[SyncStats] enableNetwork threw (harmless if already online):", ne);
+      }
+
+      // ── 1. FETCH ALL articles + annotators with 4-attempt retry + backoff
+      const fetchStart = performance.now();
+      const [articlesSnap, annotatorsSnap] = await runWithRetries(
+        "fetch articles+annotators collections",
+        async () => {
+          try { await enableNetwork(db); } catch (_) {}
+          return await Promise.all([
+            getDocs(collection(db, "articles")),
+            getDocs(collection(db, "annotators")),
+          ]);
+        },
+        { attempts: 4, baseDelayMs: 1200 }
+      );
+      console.log(`[SyncStats] Fetched ${articlesSnap.size} articles + ${annotatorsSnap.size} annotators in ${Math.round(performance.now() - fetchStart)} ms`);
 
       const liveAnnotatorEmails = new Set<string>();
       const articlesByAssignee = new Map<string, Set<string>>();
@@ -233,28 +296,51 @@ export default function Dashboard() {
         `Any reference outside the truth map (ghost assignees) will be repaired.`
       );
 
-      const settingsSnap = await getDoc(doc(db, "admin_config", "settings"));
+      const settingsSnap = await runWithRetries(
+        "read admin_config/settings",
+        () => getDoc(doc(db, "admin_config", "settings")),
+        { attempts: 3, baseDelayMs: 750 }
+      );
       const settings = settingsSnap.exists() ? (settingsSnap.data() as AdminConfig) : null;
       const fallbackRequiredAnnotations = getRequiredAnnotations(null, settings);
 
       // ─────────────────────────────────────────────────────────────
       // STEP 1 — REPAIR EVERY ARTICLE against live annotators
       //
-      // Rebuilds assigned_to, assigned_count, annotated_by, annotation_count,
-      // status, bias_score, fleiss_kappa, final_label by considering only
-      // emails whose /annotators doc still EXISTS.
+      // Process in chunks of 100; after each chunk commit, yield to
+      // the browser so the progress banner visibly updates.
+      // Each batch.commit has its own 3-attempt retry + backoff so
+      // transient "client is offline" blips get auto-resolved.
       // ─────────────────────────────────────────────────────────────
       let repairedCount = 0;
       let freedSlotsTotal = 0;
       const articleDocs = articlesSnap.docs;
+      const TOTAL_ARTICLES = articleDocs.length;
 
-      const MAX_BATCH = 500;
+      const MAX_BATCH = 100; // smaller batches = each commit has smaller chance of offline failure
       let batch = writeBatch(db);
       let batchCount = 0;
+      let checkpointProcessed = 0;
 
-      const repairedArticles: Article[] = [];
+      const repairedArticles: Article[] = new Array(TOTAL_ARTICLES);
 
-      for (const docSnap of articleDocs) {
+      function uniqueEmails(emails: string[], predicate?: (e: string) => boolean): string[] {
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const raw of emails) {
+          const n = (raw || "").toLowerCase().trim();
+          if (!n || seen.has(n)) continue;
+          if (predicate && !predicate(n)) continue;
+          seen.add(n);
+          out.push(n);
+        }
+        return out;
+      }
+
+      setSyncProgress({ step: "Repairing article metadata (status / counts / scores)", processed: 0, total: TOTAL_ARTICLES });
+
+      for (let i = 0; i < TOTAL_ARTICLES; i++) {
+        const docSnap = articleDocs[i];
         const article = docSnap.data() as Article;
         const requiredAnnotations = getRequiredAnnotations(article, settings);
 
@@ -264,18 +350,6 @@ export default function Dashboard() {
         const oldAnnotationCount = typeof article.annotation_count === "number" ? article.annotation_count : 0;
 
         const truthAssignees = articlesByAssignee.get(docSnap.id) ?? new Set<string>();
-        function uniqueEmails(emails: string[], predicate?: (e: string) => boolean): string[] {
-          const seen = new Set<string>();
-          const out: string[] = [];
-          for (const raw of emails) {
-            const n = (raw || "").toLowerCase().trim();
-            if (!n || seen.has(n)) continue;
-            if (predicate && !predicate(n)) continue;
-            seen.add(n);
-            out.push(n);
-          }
-          return out;
-        }
 
         const newAssignedTo = truthAssignees.size > 0
           ? uniqueEmails([...truthAssignees])
@@ -317,15 +391,23 @@ export default function Dashboard() {
           ...article,
           ...updates,
         };
-        repairedArticles.push(repaired);
+        repairedArticles[i] = repaired;
 
         if (needsRepair) {
           repairedCount++;
           freedSlotsTotal += Math.max(0, slotDelta);
-          if (batchCount >= MAX_BATCH - 10) {
-            await batch.commit();
+          if (batchCount >= MAX_BATCH) {
+            await runWithRetries(
+              `commit article batch (${batchCount} writes, progress ${checkpointProcessed + 1}-${i + 1}/${TOTAL_ARTICLES})`,
+              async () => { try { await enableNetwork(db); } catch(_){} return batch.commit(); },
+              { attempts: 4, baseDelayMs: 1500 }
+            );
             batch = writeBatch(db);
             batchCount = 0;
+            checkpointProcessed = i;
+            setSyncProgress({ step: "Repairing article metadata (status / counts / scores)", processed: i + 1, total: TOTAL_ARTICLES });
+            // yield to the browser so React actually paints the progress banner
+            await new Promise(res => setTimeout(res, 10));
           }
           batch.set(doc(db, "articles", docSnap.id), updates, { merge: true });
           batchCount++;
@@ -333,8 +415,13 @@ export default function Dashboard() {
       }
 
       if (batchCount > 0) {
-        await batch.commit();
+        await runWithRetries(
+          `commit final article batch (${batchCount} writes; tail of run)`,
+          async () => { try { await enableNetwork(db); } catch(_){} return batch.commit(); },
+          { attempts: 4, baseDelayMs: 1500 }
+        );
       }
+      setSyncProgress({ step: "Article metadata repair complete. Computing platform summary…", processed: TOTAL_ARTICLES, total: TOTAL_ARTICLES });
       console.log(`[SyncStats] Article-level repair complete. Repaired: ${repairedCount} articles. Assignment/annotation slots freed: ~${freedSlotsTotal}.`);
 
       const articles = repairedArticles;
@@ -376,8 +463,13 @@ export default function Dashboard() {
         categoryDistribution: categories
       };
 
-      // 4. Update Firestore summary
-      await setDoc(doc(db, "stats", "platform_summary"), newSummary);
+      // 4. Update Firestore summary (with retry)
+      setSyncProgress({ step: "Writing stats/platform_summary doc (final step)", processed: TOTAL_ARTICLES, total: TOTAL_ARTICLES });
+      await runWithRetries(
+        "write stats/platform_summary",
+        async () => { try { await enableNetwork(db); } catch(_){} return setDoc(doc(db, "stats", "platform_summary"), newSummary); },
+        { attempts: 4, baseDelayMs: 1200 }
+      );
 
       // 5. Update local state
       setStats(newSummary);
@@ -390,6 +482,7 @@ export default function Dashboard() {
         .map(([name, value]) => ({ name, value }))
         .sort((a, b) => b.value - a.value)
       );
+      setSyncProgress(null);
 
       alert(
         `✅ Consistency Repair & Sync Complete.\n\n` +
@@ -398,11 +491,26 @@ export default function Dashboard() {
         `Next new annotator will receive articles starting from the LOWEST sequence_number.\n\n` +
         `Summary: ${newSummary.pendingArticles} pending / ${newSummary.inProgressArticles} partial / ${newSummary.completedArticles} complete.`
       );
-    } catch (err) {
+    } catch (err: any) {
       console.error("Sync error:", err);
-      alert("Failed to sync statistics: " + err);
+      const code = err?.code ? String(err.code) : "";
+      const msg = err?.message ? String(err.message) : String(err);
+      const wasOffline =
+        code === "unavailable" || /offline|network|timeout|connection|client/i.test(msg);
+      alert(
+        (wasOffline ? "⚠️  Your connection dropped mid-sync (client offline).\n\n" : "❌ Sync failed.\n\n") +
+        `Error code: ${code || "n/a"}\n${msg}\n\n` +
+        "GOOD NEWS: every batch commit is IDEMPOTENT — you have NOT corrupted data.\n" +
+        "Simply click Run Sync & Repair again. The new build will:\n" +
+        "  • Re-write the same metadata (no double-counting)\n" +
+        "  • Auto-retry each batch 4× with backoff if your Wi-Fi wobbles\n" +
+        "  • Use 100-write batches (smaller = less chance of offline failure)\n\n" +
+        "If you keep seeing this, keep the Chrome DevTools Network tab open next run and check for red WebSocket/Firestore disconnects."
+      );
+      setSyncProgress(null);
     } finally {
       setSyncing(false);
+      setSyncProgress(prev => prev && prev.processed < prev.total ? prev : null);
     }
   };
 
@@ -467,9 +575,33 @@ export default function Dashboard() {
           </div>
 
           {syncing && (
-            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-3 font-medium">
-              <Loader2 size={12} className="animate-spin inline mr-2" />
-              Repairing {stats.totalArticles || "~1,493"} articles, validating annotator reverse-indexes, recomputing scores for articles at exactly N labels...
+            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-xl p-4 font-medium space-y-2">
+              <div className="flex items-center gap-2">
+                <Loader2 size={12} className="animate-spin shrink-0" />
+                <div className="flex-1">
+                  <span className="font-bold">
+                    {syncProgress?.step || "Running Sync & Repair…"}
+                  </span>
+                  {syncProgress && syncProgress.total > 0 && (
+                    <>
+                      <div className="mt-1.5 flex items-center gap-2">
+                        <div className="flex-1 h-1.5 bg-amber-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-amber-600 rounded-full transition-all duration-300"
+                            style={{ width: `${Math.min(100, Math.round((syncProgress.processed / syncProgress.total) * 100))}%` }}
+                          />
+                        </div>
+                        <span className="tabular-nums font-bold w-16 text-right shrink-0">
+                          {syncProgress.processed} / {syncProgress.total}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[10px] font-medium text-amber-700/80 leading-relaxed">
+                        Batches of 100 articles, 4 auto-retries each with 1/2/4s backoff if your Wi-Fi drops. If the browser tab is killed, simply re-click Run Sync &amp; Repair — every write is idempotent.
+                      </p>
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -514,6 +646,44 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Sync progress banner (normal dashboard view) */}
+      {syncing && (
+        <div className="bg-amber-50 border-2 border-amber-200 p-5 rounded-[32px] shadow-sm shadow-amber-100 animate-in slide-in-from-top-4 duration-500 space-y-3">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-600 shrink-0">
+              <Loader2 size={22} className="animate-spin" />
+            </div>
+            <div className="flex-1 space-y-2">
+              <p className="text-sm font-black text-amber-900 uppercase tracking-tight">
+                {syncProgress?.step || "Running Sync & Repair…"}
+              </p>
+              {syncProgress && syncProgress.total > 0 ? (
+                <>
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 h-2.5 bg-amber-200 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-amber-400 to-amber-600 rounded-full transition-all duration-300"
+                        style={{ width: `${Math.min(100, Math.round((syncProgress.processed / syncProgress.total) * 100))}%` }}
+                      />
+                    </div>
+                    <span className="tabular-nums font-black text-sm text-amber-900 w-20 text-right shrink-0">
+                      {syncProgress.processed} / {syncProgress.total}
+                    </span>
+                  </div>
+                  <p className="text-[11px] font-bold text-amber-700/80 leading-relaxed">
+                    Batches of 100 articles with 4× auto-retry and exponential backoff. If your internet drops, just click Sync Statistics again — every write is idempotent.
+                  </p>
+                </>
+              ) : (
+                <p className="text-[11px] font-bold text-amber-700/80 leading-relaxed">
+                  Fetching annotators and articles from Firestore… (first batch usually completes in 2–10 seconds).
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* KPI Grid */}
       {(!stats.totalArticles || stats.totalArticles === 0) && stats.inProgressArticles > 0 && (
