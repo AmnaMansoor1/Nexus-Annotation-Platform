@@ -51,40 +51,6 @@ const CALIBRATION_PAIRS: CalibrationPair[] = [
   },
 ];
 
-interface Question {
-  id: string;
-  prompt: string;
-  options: string[];
-  correctIndex: number;
-}
-
-const COMPREHENSION_QUESTIONS: Question[] = [
-  {
-    id: "q1",
-    prompt:
-      "You are annotating an Urdu news excerpt. The text uses the loaded phrase عوام دشمن فیصلہ (anti-people decision) without attributing it to any source. What should you do?",
-    options: [
-      "Ignore the wording and rate based only on whether you personally agree with the decision.",
-      "Count the loaded, unattributed wording as part of the text's manipulative framing.",
-      "Translate the phrase literally into English and treat it as a neutral fact-report.",
-      "Skip the article and request a replacement, because articles with Urdu phrases are invalid.",
-    ],
-    correctIndex: 1,
-  },
-  {
-    id: "q2",
-    prompt:
-      "Which statement best describes the minimum reading time requirement (10 s) and the one-way (no-go-back) flow?",
-    options: [
-      "They are arbitrary technical limitations that will be removed in the next release.",
-      "Each decision is final and the timer encourages careful reading; you cannot return to a submitted article.",
-      "The timer is a visual decoration and you may submit immediately if you are a fast reader.",
-      "You may go back and change earlier ratings as long as you have not logged out.",
-    ],
-    correctIndex: 1,
-  },
-];
-
 interface Cue {
   num: string;
   title: string;
@@ -132,7 +98,6 @@ const MANIPULATION_CUES: Cue[] = [
 ];
 
 type CalibrationSelection = Record<string, "A" | "B" | null>;
-type QSelection = Record<string, number | null>;
 
 export default function ConsentGate() {
   const navigate = useNavigate();
@@ -143,10 +108,6 @@ export default function ConsentGate() {
   const [calibration, setCalibration] = useState<CalibrationSelection>({
     A: null,
     B: null,
-  });
-  const [answers, setAnswers] = useState<QSelection>({
-    q1: null,
-    q2: null,
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,29 +121,18 @@ export default function ConsentGate() {
     return score;
   }, [calibration]);
 
-  const comprehensionScore = useMemo(() => {
-    let score = 0;
-    for (const q of COMPREHENSION_QUESTIONS) {
-      if (answers[q.id] === q.correctIndex) score++;
-    }
-    return score;
-  }, [answers]);
-
   const allCalibrationDone = CALIBRATION_PAIRS.every((p) => calibration[p.id] != null);
-  const allQDone = COMPREHENSION_QUESTIONS.every((q) => answers[q.id] != null);
   const canSubmit =
     agreeChecked &&
     allCalibrationDone &&
-    allQDone &&
     calibrationScore >= 1 &&
-    comprehensionScore >= 1 &&
     !!userEmail;
 
   const handleSubmit = async () => {
     if (!canSubmit) {
-      if (calibrationScore < 1 || comprehensionScore < 1) {
+      if (calibrationScore < 1) {
         setShowHint(
-          "You need at least 1 of 2 calibration examples correct and at least 1 of 2 comprehension questions correct before real articles are assigned. Review the scale and guidance above, then try again."
+          "You need at least 1 of 2 calibration examples correct before real articles are assigned. Review the scale and guidance above, then try again."
         );
       }
       return;
@@ -199,7 +149,6 @@ export default function ConsentGate() {
           accepted: true,
           at: Date.now(),
           calibration: calibrationScore,
-          comprehension: comprehensionScore,
         })
       );
       navigate("/welcome");
@@ -219,10 +168,6 @@ export default function ConsentGate() {
 
   const calibrateSelect = (pairId: "A" | "B", choice: "A" | "B") => {
     setCalibration((prev) => ({ ...prev, [pairId]: choice }));
-  };
-
-  const questionSelect = (qid: string, idx: number) => {
-    setAnswers((prev) => ({ ...prev, [qid]: idx }));
   };
 
   return (
@@ -568,40 +513,8 @@ export default function ConsentGate() {
             </div>
           </section>
 
-          {/* ───────── COMPREHENSION / MANIPULATION-DETECTION QUIZ ───────── */}
+          {/* ───────── CALIBRATION PROGRESS ───────── */}
           <section className="cg-panel cg-quiz">
-            <h2>Quick comprehension check</h2>
-            <p style={{ fontSize: 12, color: "#586b89", margin: "-6px 0 12px" }}>
-              Answer both questions. At least 1 of 2 must be correct before real articles are
-              assigned to you. This helps ensure attentive and consistent ratings across the study.
-            </p>
-            <div className="cg-quiz-section">
-              {COMPREHENSION_QUESTIONS.map((q) => (
-                <div className="cg-quiz-q" key={q.id}>
-                  <p>{q.prompt}</p>
-                  <div className="cg-quiz-options">
-                    {q.options.map((opt, idx) => {
-                      const sel = answers[q.id] === idx;
-                      return (
-                        <label
-                          key={idx}
-                          className={"cg-quiz-opt " + (sel ? "cg-quiz-opt-sel" : "")}
-                        >
-                          <input
-                            type="radio"
-                            name={q.id}
-                            checked={sel}
-                            onChange={() => questionSelect(q.id, idx)}
-                          />
-                          <span>{opt}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
-
             <div className="cg-progress">
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <span
@@ -618,23 +531,9 @@ export default function ConsentGate() {
                   {"  "}
                   {calibrationScore >= 1 ? "✓ passed" : "below threshold"}
                 </span>
-                <span
-                  className={
-                    "cg-chip " +
-                    (comprehensionScore >= 2
-                      ? "cg-chip-ok"
-                      : comprehensionScore >= 1
-                      ? "cg-chip-warn"
-                      : "cg-chip-bad")
-                  }
-                >
-                  Comprehension: {comprehensionScore} / {COMPREHENSION_QUESTIONS.length}
-                  {"  "}
-                  {comprehensionScore >= 1 ? "✓ passed" : "below threshold"}
-                </span>
               </div>
               <div style={{ fontSize: 10, color: "#75849b", whiteSpace: "nowrap" }}>
-                Minimum: &nbsp;≥ 1 calibration correct &nbsp;and&nbsp; ≥ 1 comprehension correct
+                Minimum: &nbsp;≥ 1 calibration correct
               </div>
             </div>
           </section>
@@ -644,9 +543,8 @@ export default function ConsentGate() {
             <h2>Your consent</h2>
             <p>
               Please confirm that you have read and understood the information above. You may stop
-              participating at any point without penalty. Your consent, calibration score, and
-              comprehension score are stored with your annotator document (see Confidentiality
-              above).
+              participating at any point without penalty. Your consent and calibration score are
+              stored with your annotator document (see Confidentiality above).
             </p>
             <label
               className="cg-checkline"
