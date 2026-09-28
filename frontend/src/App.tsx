@@ -6,6 +6,7 @@ import { auth } from "./firebase";
 // Student Components (Lazy Loaded)
 const Login = lazy(() => import("./student/Login"));
 const Welcome = lazy(() => import("./student/Welcome"));
+const ConsentGate = lazy(() => import("./student/ConsentGate"));
 const AnnotationWorkbench = lazy(() => import("./student/AnnotationWorkbench"));
 const Completion = lazy(() => import("./student/Completion"));
 
@@ -134,9 +135,24 @@ function App() {
             <Route 
               path="/" 
               element={
-                session?.role === "annotator" ? <Navigate to="/annotate" /> : <Login />
+                session?.role === "annotator"
+                  ? (() => {
+                      // Check consent before deciding where to land
+                      try {
+                        const raw = localStorage.getItem("nexus_consent_seen_v1");
+                        const parsed = raw ? JSON.parse(raw) : null;
+                        const email = session.email.toLowerCase().trim();
+                        const ageDays = parsed?.at ? (Date.now() - parsed.at) / (1000 * 60 * 60 * 24) : 999;
+                        const hasConsent = parsed?.email === email && parsed?.accepted && ageDays < 30;
+                        return <Navigate to={hasConsent ? "/welcome" : "/consent"} />;
+                      } catch {
+                        return <Navigate to="/consent" />;
+                      }
+                    })()
+                  : <Login />
               } 
             />
+            <Route path="/consent" element={isStudent ? <ConsentGate /> : <Navigate to="/" />} />
             <Route path="/welcome" element={isStudent ? <Welcome /> : <Navigate to="/" />} />
             <Route path="/annotate" element={isStudent ? <AnnotationWorkbench /> : <Navigate to="/" />} />
             <Route path="/done" element={isStudent ? <Completion /> : <Navigate to="/" />} />
