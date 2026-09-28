@@ -382,14 +382,32 @@ describe('isEligible consistency checks', () => {
     expect(result.reason).toBe('already-assigned-to-me');
   });
 
-  test('rejects assigned_count>=5', () => {
+  test('assigned_count at cap but annotation still needed -> allowed up to buffer (cap+2)', () => {
     const art = mkArticle({
       sequence_number: 4, article_id: 'FULL', status: 'partial',
       annotation_count: 4, assigned_count: 5,
     });
     const result = isEligible(art, STUDENT_A, 5);
+    expect(result.ok).toBe(true);
+  });
+
+  test('assigned_count past buffer even with annotations needed -> rejected', () => {
+    const art = mkArticle({
+      sequence_number: 4, article_id: 'OVER', status: 'partial',
+      annotation_count: 4, assigned_count: 7,
+    });
+    const result = isEligible(art, STUDENT_A, 5);
     expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/assigned_count.*>=/);
+    expect(result.reason).toMatch(/assigned_count.*>=cap=7/);
+  });
+
+  test('assigned_count>=5 AND annotation_count>=5 -> rejected (inconsistent or truly full)', () => {
+    const art = mkArticle({
+      sequence_number: 6, article_id: 'TRULY_FULL', status: 'partial',
+      annotation_count: 5, assigned_count: 5,
+    });
+    const result = isEligible(art, STUDENT_A, 5);
+    expect(result.ok).toBe(false);
   });
 
   test('rejects status=complete', () => {

@@ -22,6 +22,16 @@ function normalizeArticle(data: any): Article {
   } as Article;
 }
 
+function priorityCmp(a: Article, b: Article): number {
+  const aStatus = a.status === "partial" ? 0 : a.status === "pending" ? 1 : 2;
+  const bStatus = b.status === "partial" ? 0 : b.status === "pending" ? 1 : 2;
+  if (aStatus !== bStatus) return aStatus - bStatus;
+  if ((b.annotation_count ?? 0) !== (a.annotation_count ?? 0)) {
+    return (b.annotation_count ?? 0) - (a.annotation_count ?? 0);
+  }
+  return ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0);
+}
+
 export function isEligible(article: Article, email: string, requiredAnnotations: number): { ok: boolean; reason?: string } {
   const okStatus = article.status === "pending" || article.status === "partial";
   if (!okStatus) return { ok: false, reason: `status=${article.status}` };
@@ -36,7 +46,12 @@ export function isEligible(article: Article, email: string, requiredAnnotations:
     return { ok: false, reason: `consistency-err: status=pending but annotation_count=${article.annotation_count}>0` };
   }
 
-  if (article.assigned_count >= requiredAnnotations) return { ok: false, reason: `assigned_count=${article.assigned_count}>=${requiredAnnotations}` };
+  const NON_RESPONSIVE_BUFFER = 2;
+  const annStillNeeded = article.annotation_count < requiredAnnotations;
+  const hardCap = annStillNeeded ? requiredAnnotations + NON_RESPONSIVE_BUFFER : requiredAnnotations;
+  if (article.assigned_count >= hardCap) {
+    return { ok: false, reason: `assigned_count=${article.assigned_count}>=cap=${hardCap}` };
+  }
   
   const emailNorm = email.toLowerCase().trim();
   const assignedList = Array.isArray(article.assigned_to) ? article.assigned_to.map(e => String(e).toLowerCase().trim()) : [];
@@ -62,9 +77,7 @@ export function selectArticlesSequentially(
   const skipped_inconsistent: string[] = [];
   const eligible: Article[] = [];
 
-  const sorted = [...articles].sort(
-    (a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0)
-  );
+  const sorted = [...articles].sort(priorityCmp);
 
   for (const article of sorted) {
     const check = isEligible(article, email, requiredAnnotations);
@@ -102,11 +115,18 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
   const allHealedById = new Map<string, Article>();
   const emailNorm = email.toLowerCase().trim();
 
+  // #region debug-point H3:articles-read-smoke-test
+  (async()=>{try{const smokeQ=query(articlesRef,limit(1));const smoke=await getDocs(smokeQ);fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:smoke-read",msg:"[DEBUG] ARTICLES read smoke test: simple unfiltered limit(1) list query",data:{ok:true,size:smoke.size,first_doc:smoke.size>0?smoke.docs[0].id:null},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})}catch(e){fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:smoke-read",msg:"[DEBUG] ARTICLES read smoke test FAILED",data:{ok:false,error_code:(e as any)?.code,error_message:(e as any)?.message?.slice(0,200)??String(e).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})}})();
+  // #endregion
+
   let annotatorCtx: AnnotatorContext;
   try {
     annotatorCtx = await fetchAnnotatorContext();
     console.log("[assignArticlesForAnnotator] Live annotators for self-heal:", annotatorCtx.liveEmails.size,
       "Truth-assignees populated for", annotatorCtx.articlesByAssignee.size, "articles.");
+    // #region debug-point H1,H4:annotator-ctx-for-email
+    (()=>{const articlesWithEmail = [...annotatorCtx.articlesByAssignee.entries()].filter(([,emails])=>emails.has(emailNorm));const emailInLive=annotatorCtx.liveEmails.has(emailNorm);fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H1",location:"assignArticles.ts:ctx-scan",msg:"[DEBUG] annotatorCtx scan for email + articlesByAssignee already-assigned count",data:{email:email.slice(0,15)+"…",emailNorm,email_in_liveEmails:emailInLive,liveEmails_size:annotatorCtx.liveEmails.size,articles_with_this_assignee_count:articlesWithEmail.length,articlesByAssignee_total:annotatorCtx.articlesByAssignee.size,sample_article_ids:articlesWithEmail.slice(0,5).map(([id])=>id)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
+    // #endregion
   } catch (err) {
     console.warn("[assignArticlesForAnnotator] Could not load live annotators; skipping self-heal.", err);
     annotatorCtx = { liveEmails: new Set(), articlesByAssignee: new Map() };
@@ -160,10 +180,17 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
       console.warn("[assignArticlesForAnnotator] Strategy A skipped", inconsistencies.length, "inconsistent articles:", inconsistencies.slice(0, 5));
     }
 
-    candidates.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
+    // #region debug-point H3,H5:strategyA-iseligible-breakdown
+    (()=>{const counts: Record<string,number>={};for(const article of healedBatch){const requiredAnnotations = getRequiredAnnotations(article, adminConfig);const check = isEligible(article, email, requiredAnnotations);if(!check.ok){const k=check.reason||"unknown";counts[k]=(counts[k]||0)+1}}fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyA",msg:"[DEBUG] Strategy A isEligible reason breakdown",data:{strategyA_docs:strategyASnap.size,healed:healedBatch.length,candidates_len:candidates.length,eligible_len_before_slice:eligibleArticles.length||candidates.length,reason_counts:counts,targetCount},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
+    // #endregion
+
+    candidates.sort(priorityCmp);
     eligibleArticles = candidates.slice(0, targetCount);
     console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates (target:", targetCount, ")");
   } catch (err) {
+    // #region debug-point H3,H5:strategyA-exception
+    fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyA-catch",msg:"[DEBUG] Strategy A threw EXCEPTION",data:{error_name:(err as any)?.name,error_code:(err as any)?.code,error_message:(err as any)?.message?.slice(0,200)??String(err).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{});
+    // #endregion
     console.warn("[assignArticlesForAnnotator] Strategy A failed (index missing?):", err);
   }
 
@@ -180,6 +207,9 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
 
       const healedFallback = await healDocSnaps(fallbackSnap.docs);
+      // #region debug-point H3,H5:strategyB-iseligible-breakdown
+      (()=>{const counts: Record<string,number>={};const statusCounts: Record<string,number>={};for(const article of healedFallback){const s=(article as any).status??"__MISSING__";statusCounts[s]=(statusCounts[s]||0)+1;const requiredAnnotations = getRequiredAnnotations(article, adminConfig);const check = isEligible(article, email, requiredAnnotations);if(!check.ok){const k=check.reason||"unknown";counts[k]=(counts[k]||0)+1}}fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyB",msg:"[DEBUG] Strategy B isEligible reason breakdown + status distribution",data:{fallback_size:fallbackSnap.size,healed_len:healedFallback.length,status_counts:statusCounts,reason_counts:counts,already_eligible_from_A:eligibleArticles.length,targetCount},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
+      // #endregion
       for (const a of healedFallback) allHealedById.set(a.article_id, a);
       const alreadySeen = new Set(eligibleArticles.map(a => a.article_id));
       const inconsistencies: string[] = [];
@@ -203,6 +233,9 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
       }
       console.log("[assignArticlesForAnnotator] Strategy B total eligible now:", eligibleArticles.length);
     } catch (err2) {
+      // #region debug-point H3,H5:strategyB-exception
+      fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyB-catch",msg:"[DEBUG] Strategy B threw EXCEPTION",data:{error_name:(err2 as any)?.name,error_message:(err2 as any)?.message?.slice(0,200)??String(err2).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{});
+      // #endregion
       console.warn("[assignArticlesForAnnotator] Strategy B also failed:", err2);
     }
   }
@@ -256,7 +289,7 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
   const alreadyMineIds = alreadyMineArticles.map((a) => a.article_id);
   const alreadyMineSet = new Set(alreadyMineIds);
 
-  eligibleArticles.sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
+  eligibleArticles.sort(priorityCmp);
   const newSlotsNeeded = Math.max(0, targetCount - alreadyMineIds.length);
   const newToAssign = eligibleArticles
     .filter((a) => !alreadyMineSet.has(a.article_id))
