@@ -364,23 +364,37 @@ export default function ConsentGate() {
           <section className="cg-panel cg-calibration">
             <div className="cg-cal-head">
               <div>
-                <h2>Example: manipulative framing</h2>
+                <h2>Example: neutral vs. manipulative framing</h2>
                 <p>
-                  Below is a fictional training example of manipulative writing.
-                  Notice the loaded language, unattributed claims, and emotional scope.
+                  Below is a fictional training example showing what neutral and manipulative
+                  writing look like side by side.
                 </p>
               </div>
               <span className="cg-training">Illustrative only</span>
             </div>
 
-            {/* Version B — manipulative (only one shown) */}
-            <div className="cg-example cg-example-high cg-example-selected" style={{ cursor: "default", marginTop: 10 }}>
-              <div className="cg-badge cg-high-badge">
-                <span className="cg-score cg-high-score">✕</span>
-                &nbsp;Manipulative framing
+            <div className="cg-pair">
+              {/* Version A — neutral */}
+              <div className="cg-example" style={{ cursor: "default" }}>
+                <div className="cg-badge">
+                  <span className="cg-score">A</span>
+                  &nbsp;Version A &nbsp;·&nbsp;
+                  <span style={{ color: "#26714d", fontWeight: 800 }}>Neutral</span>
+                </div>
+                <p className="cg-urdu" lang="ur">{EXAMPLE.neutral.urdu}</p>
+                <p className="cg-translation">{EXAMPLE.neutral.translation}</p>
               </div>
-              <p className="cg-urdu" lang="ur">{EXAMPLE.high.urdu}</p>
-              <p className="cg-translation">{EXAMPLE.high.translation}</p>
+
+              {/* Version B — manipulative */}
+              <div className="cg-example cg-example-high cg-example-selected" style={{ cursor: "default" }}>
+                <div className="cg-badge cg-high-badge">
+                  <span className="cg-score cg-high-score">B</span>
+                  &nbsp;Version B &nbsp;·&nbsp;
+                  <span style={{ color: "#a24141", fontWeight: 800 }}>Manipulative</span>
+                </div>
+                <p className="cg-urdu" lang="ur">{EXAMPLE.high.urdu}</p>
+                <p className="cg-translation">{EXAMPLE.high.translation}</p>
+              </div>
             </div>
 
             <ul className="cg-observations">
