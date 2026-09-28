@@ -237,39 +237,78 @@ export async function healArticles(
   ctx: Set<string> | AnnotatorContext,
   adminConfig?: { annotators_per_article?: number } | null
 ): Promise<Article[]> {
-  // ── Issue-1: rebuild annotated_by from the ACTUAL responses subcollection.
-  // Annotator deletion + filterLive() used to wipe annotated_by to [ ] while
-  // the response docs still existed physically. Doing this one-shot read per
-  // article (getDocs on /responses) is cheap compared to the wrong counter
-  // cascade that followed (never reaching 5/5, no scoring written).
-  const rawsWithResponses = await Promise.all(
-    raws.map(async (raw) => {
-      let responseEmails: string[] = [];
-      try {
-        const snaps = await getDocs(collection(db, "annotations", raw.article_id, "responses"));
-        snaps.forEach((d) => {
-          const em = (d.data() as any)?.annotator_email;
-          if (typeof em === "string") responseEmails.push(em);
-        });
-      } catch (readErr: any) {
-        // Rules or transient — skip the truth enrichment. reconcileArticle
-        // falls back to raw.annotated_by + liveEmail filter (old behavior),
-        // so we never silently double-count on error.
-        console.warn(
-          `[healArticles] Could not read responses for article=${raw.article_id} (rules/transient?). ` +
-          `Using raw.annotated_by only as fallback. code=${readErr?.code ?? "NO_CODE"}`,
-          readErr
-        );
-      }
-      return { raw, responseEmails };
-    })
-  );
+  const { liveEmails } = toAnnotatorContext(ctx);
+
+  // ── Responses subcollection reads ─────────────────────────────────────────
+  // ONLY read /responses for articles that have known counter drift OR
+  // whose annotated_by would be wiped to [] by filterLive (i.e. all their
+  // annotated_by emails are from deleted annotators).
+  // This avoids 500 concurrent reads on large corpora which exhausted quota.
+  // Cap concurrent reads at 20 using a simple semaphore.
+  const CONCURRENCY = 20;
+
+  function needsResponseRead(raw: Partial<Article> & { article_id: string }): boolean {
+    const required = getRequiredAnnotations(raw, adminConfig);
+    const rawAnnotated = Array.isArray(raw.annotated_by) ? raw.annotated_by : [];
+    const liveAnnotated = rawAnnotated.filter(
+      (e) => typeof e === "string" && liveEmails.has(normalizeEmail(e))
+    );
+    // If live annotators < stored annotation_count, responses may have more truth
+    const counterMismatch = liveAnnotated.length < (typeof raw.annotation_count === "number" ? raw.annotation_count : 0);
+    // If article is nearly complete by live count, verify via responses
+    const nearComplete = liveAnnotated.length >= required - 1;
+    // Always read if status is complete (need to verify scores are still valid)
+    const isComplete = raw.status === "complete";
+    return counterMismatch || nearComplete || isComplete;
+  }
+
+  async function readResponseEmails(articleId: string): Promise<string[]> {
+    try {
+      const snaps = await getDocs(collection(db, "annotations", articleId, "responses"));
+      const emails: string[] = [];
+      snaps.forEach((d) => {
+        const em = (d.data() as any)?.annotator_email;
+        if (typeof em === "string") emails.push(em);
+      });
+      return emails;
+    } catch (readErr: any) {
+      console.warn(
+        `[healArticles] Could not read responses for article=${articleId}. ` +
+        `Falling back to raw.annotated_by. code=${readErr?.code ?? "NO_CODE"}`
+      );
+      return [];
+    }
+  }
+
+  // Run up to CONCURRENCY reads in parallel
+  async function runBatched<T>(items: T[], fn: (item: T) => Promise<void>): Promise<void> {
+    let i = 0;
+    async function next(): Promise<void> {
+      if (i >= items.length) return;
+      const item = items[i++];
+      await fn(item);
+      return next();
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, next));
+  }
+
+  const responseEmailsMap = new Map<string, string[]>();
+  const articlesNeedingRead = raws.filter(needsResponseRead);
+
+  if (articlesNeedingRead.length > 0) {
+    console.log(`[healArticles] Reading /responses for ${articlesNeedingRead.length}/${raws.length} articles (others skipped — no drift suspected)`);
+    await runBatched(articlesNeedingRead, async (raw) => {
+      const emails = await readResponseEmails(raw.article_id);
+      responseEmailsMap.set(raw.article_id, emails);
+    });
+  }
 
   const repairs: Array<{ articleId: string; updates: Partial<Article> }> = [];
   const healed: Article[] = [];
 
-  for (const { raw, responseEmails } of rawsWithResponses) {
+  for (const raw of raws) {
     const required = getRequiredAnnotations(raw, adminConfig);
+    const responseEmails = responseEmailsMap.get(raw.article_id) ?? null;
     const result = reconcileArticle(raw, ctx, required, { responseAnnotatorEmails: responseEmails });
     healed.push(result.article);
     if (result.needsPersist && result.updates) {
