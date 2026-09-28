@@ -8,6 +8,9 @@ export default defineConfig(({ mode }) => ({
     react(),
     ...(mode !== 'test' ? [tailwindcss()] : []),
   ],
+  build: {
+    chunkSizeWarningLimit: 1000,
+  },
   test: {
     globals: true,
     environment: 'node',
