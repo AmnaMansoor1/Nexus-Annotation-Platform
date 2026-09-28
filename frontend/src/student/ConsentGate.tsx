@@ -90,7 +90,7 @@ export default function ConsentGate() {
           at: Date.now(),
         })
       );
-      navigate("/welcome");
+      navigate("/annotate");
     } catch (e: any) {
       console.error("[ConsentGate] Save failed:", e);
       setError(

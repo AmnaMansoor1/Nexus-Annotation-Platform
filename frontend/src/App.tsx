@@ -144,7 +144,7 @@ function App() {
                         const email = session.email.toLowerCase().trim();
                         const ageDays = parsed?.at ? (Date.now() - parsed.at) / (1000 * 60 * 60 * 24) : 999;
                         const hasConsent = parsed?.email === email && parsed?.accepted && ageDays < 30;
-                        return <Navigate to={hasConsent ? "/welcome" : "/consent"} />;
+                        return <Navigate to={hasConsent ? "/annotate" : "/consent"} />;
                       } catch {
                         return <Navigate to="/consent" />;
                       }
