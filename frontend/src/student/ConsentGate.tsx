@@ -78,7 +78,6 @@ export default function ConsentGate() {
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
-    setShowHint(null);
     setError(null);
     setSubmitting(true);
 
