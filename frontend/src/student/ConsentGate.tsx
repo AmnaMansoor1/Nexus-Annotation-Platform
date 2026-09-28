@@ -364,37 +364,23 @@ export default function ConsentGate() {
           <section className="cg-panel cg-calibration">
             <div className="cg-cal-head">
               <div>
-                <h2>Example: neutral vs. manipulative framing</h2>
+                <h2>Example: manipulative framing</h2>
                 <p>
-                  Below is a fictional training example showing what neutral and manipulative
-                  writing look like side by side. Version B is manipulative.
+                  Below is a fictional training example of manipulative writing.
+                  Notice the loaded language, unattributed claims, and emotional scope.
                 </p>
               </div>
               <span className="cg-training">Illustrative only</span>
             </div>
 
-            <div className="cg-pair">
-              {/* Version A — neutral */}
-              <div className="cg-example" style={{ cursor: "default" }}>
-                <div className="cg-badge">
-                  <span className="cg-score">A</span>
-                  &nbsp;Version A &nbsp;·&nbsp;
-                  <span style={{ color: "#26714d", fontWeight: 800 }}>Neutral</span>
-                </div>
-                <p className="cg-urdu" lang="ur">{EXAMPLE.neutral.urdu}</p>
-                <p className="cg-translation">{EXAMPLE.neutral.translation}</p>
+            {/* Version B — manipulative (only one shown) */}
+            <div className="cg-example cg-example-high cg-example-selected" style={{ cursor: "default", marginTop: 10 }}>
+              <div className="cg-badge cg-high-badge">
+                <span className="cg-score cg-high-score">✕</span>
+                &nbsp;Manipulative framing
               </div>
-
-              {/* Version B — manipulative */}
-              <div className="cg-example cg-example-high cg-example-selected" style={{ cursor: "default" }}>
-                <div className="cg-badge cg-high-badge">
-                  <span className="cg-score cg-high-score">B</span>
-                  &nbsp;Version B &nbsp;·&nbsp;
-                  <span style={{ color: "#a24141", fontWeight: 800 }}>Manipulative ✔</span>
-                </div>
-                <p className="cg-urdu" lang="ur">{EXAMPLE.high.urdu}</p>
-                <p className="cg-translation">{EXAMPLE.high.translation}</p>
-              </div>
+              <p className="cg-urdu" lang="ur">{EXAMPLE.high.urdu}</p>
+              <p className="cg-translation">{EXAMPLE.high.translation}</p>
             </div>
 
             <ul className="cg-observations">
@@ -429,8 +415,7 @@ export default function ConsentGate() {
             <h2>Your consent</h2>
             <p>
               Please confirm that you have read and understood the information above. You may stop
-              participating at any point without penalty. Your consent and calibration score are
-              stored with your annotator document (see Confidentiality above).
+              participating at any point without penalty.
             </p>
             <label
               className="cg-checkline"
@@ -450,7 +435,6 @@ export default function ConsentGate() {
               </span>
             </label>
 
-            {showHint && <div className="cg-hint">{showHint}</div>}
             {error && <div className="cg-error">{error}</div>}
 
             <div className="cg-actions">
