@@ -436,7 +436,10 @@ export default function AnnotatorsTable() {
           ? Math.round((totalBiasSumAfter / completedArticlesAfter) * 100) / 100
           : 0;
 
-        const wasCompletedAnnotator = annotator.completed === true || completedCount >= 20;
+        const annotatorTarget = (typeof annotator.target_annotations === "number" && annotator.target_annotations >= 20)
+          ? annotator.target_annotations
+          : 20;
+        const wasCompletedAnnotator = annotator.completed === true || completedCount >= annotatorTarget;
         const updates: any = {
           totalAnnotators: Math.max(0, totalAnnotatorsBefore - 1),
           avgBiasScore: newAvg,
@@ -524,12 +527,17 @@ export default function AnnotatorsTable() {
       
       // Now update annotator document in Firestore
       const annotatorRef = doc(db, "annotators", sanitizeEmailForDocId(annotator.email));
+      const annDocSnap = await getDoc(annotatorRef);
+      const annDocData = annDocSnap.exists() ? annDocSnap.data() : {};
+      const currentTarget = (typeof (annDocData as any).target_annotations === "number" && (annDocData as any).target_annotations >= 20)
+        ? (annDocData as any).target_annotations
+        : 20;
       await updateDoc(annotatorRef, {
         completed_articles: actualCompleted,
-        completed: actualCompleted.length >= 20
+        completed: actualCompleted.length >= currentTarget
       });
       
-      alert(`Progress recalculated! Completed articles: ${actualCompleted.length}/20`);
+      alert(`Progress recalculated! Completed articles: ${actualCompleted.length}/${currentTarget}`);
     } catch (err) {
       console.error("[Recalculate] Error:", err);
       alert("Error recalculating progress: " + err);
@@ -592,7 +600,12 @@ export default function AnnotatorsTable() {
               ) : (
                 annotators.map((ann) => {
                   const completedCount = ann.completed_articles?.length || 0;
-                  const progress = (completedCount / 20) * 100;
+                  // Use the annotator's personal target (incremented by 20 per "Annotate 20 more?" click).
+                  // Falls back to 20 for annotators who were created before target_annotations was added.
+                  const target = (typeof ann.target_annotations === "number" && ann.target_annotations >= 20)
+                    ? ann.target_annotations
+                    : 20;
+                  const progress = Math.min((completedCount / target) * 100, 100);
 
                   return (
                     <tr key={ann.email} className={`hover:bg-slate-50/50 transition-colors group ${ann.deactivated ? "opacity-50" : ""}`}>
@@ -614,7 +627,7 @@ export default function AnnotatorsTable() {
                       </td>
                       <td className="px-6 py-4">
                         <div className="flex flex-col items-center gap-1">
-                          <span className="text-sm font-bold text-slate-700">{completedCount}/20</span>
+                          <span className="text-sm font-bold text-slate-700">{completedCount}/{target}</span>
                           <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                             <div 
                               className={`h-full transition-all duration-500 ${ann.completed ? "bg-green-500" : "bg-primary"}`}

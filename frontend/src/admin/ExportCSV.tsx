@@ -4,7 +4,8 @@ import { db } from "../firebase";
 import { Article } from "../types";
 import { downloadCSV } from "../utils/csvExport";
 import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
-import { calculateOverallFleissKappa, BiasCounts } from "../utils/calculateKappa";
+import { calculateOverallFleissKappa, calculatePercentAgreement, BiasCounts } from "../utils/calculateKappa";
+import { calculateBiasScore } from "../utils/calculateBiasScore";
 import { Download, Loader2, FileJson, Table } from "lucide-react";
 
 
@@ -14,121 +15,119 @@ export default function ExportCSV() {
   const handleExport = async () => {
     setLoading(true);
     try {
-      // Canonical annotator count comes from a single shared constant in annotationConfig.ts.
-      // To change for the whole platform: edit DEFAULT_REQUIRED_ANNOTATIONS, rebuild, redeploy via CLI.
-      // No runtime admin config for this value — keeps it simple and consistent.
       const ANNOTATOR_COLUMNS = DEFAULT_REQUIRED_ANNOTATIONS;
 
-      // ── B-OPTION 1: Deleted annotator filtering ──────────────────────────────
+      // ── B-OPTION 1: Deleted annotator filtering ───────────────────────────
       // Fetch the set of annotator emails whose /annotators doc still EXISTS.
-      // An annotator deleted (hard-deleted) via AnnotatorsTable no longer has a
-      // doc here, so their labels are excluded from the exported dataset entirely.
-      // This matches the requirement: "if I delete any annotator from db then it
-      // should be deleted from exported csv too."
       const annotatorsSnap = await getDocs(collection(db, "annotators"));
       const liveAnnotatorEmails = new Set<string>();
       annotatorsSnap.forEach((d) => {
         const dEmail = (d.data() as any)?.email;
         if (typeof dEmail === "string") liveAnnotatorEmails.add(dEmail.toLowerCase().trim());
       });
-      console.log(`[ExportCSV] Live annotators in /annotators: ${liveAnnotatorEmails.size}. Annotations from any other email will be excluded.`);
+      console.log(`[ExportCSV] Live annotators: ${liveAnnotatorEmails.size}.`);
 
       const q = query(collection(db, "articles"), orderBy("sequence_number"));
       const snap = await getDocs(q);
       const articles = snap.docs.map(d => d.data() as Article);
 
       const exportData = await Promise.all(articles.map(async (article) => {
-        const responsesSnap = await getDocs(collection(db, "annotations", article.article_id, "responses"));
+        const responsesSnap = await getDocs(
+          collection(db, "annotations", article.article_id, "responses")
+        );
         const allResponses = responsesSnap.docs.map(d => d.data());
 
-        // ── Filter out deleted annotators ────────────────────────────────────
-        // Only responses whose annotator_email still has a live /annotators doc
-        // are written to the CSV. Deleted annotators' contributions are excluded
-        // from BOTH the student_id/label slots AND the total_annotations count.
+        // Filter out deleted annotators
         const responses = allResponses.filter((res: any) => {
           const rEmail = typeof res.annotator_email === "string"
             ? res.annotator_email.toLowerCase().trim()
             : null;
-          if (!rEmail) return false; // malformed response — drop
-          if (!liveAnnotatorEmails.has(rEmail)) return false; // annotator deleted — skip
-          return true;
+          if (!rEmail) return false;
+          return liveAnnotatorEmails.has(rEmail);
         });
-        const droppedCount = allResponses.length - responses.length;
-        if (droppedCount > 0) {
-          console.log(`[ExportCSV] Article ${article.article_id}: excluded ${droppedCount} response(s) from deleted/unknown annotators.`);
-        }
-
-        const row: any = {};
-        if (typeof (article as any).sequence_number === "number") {
-          row.sequence_number = (article as any).sequence_number;
-        } else {
-          row.sequence_number = "";
-        }
-        row.article_id = article.article_id || "";
-        row.headline = article.headline || "";
-        row.source = article.source || "";
-        row.author = article.author || "";
-        row.date_published = article.date_published || "";
-        row.url = article.url || "";
-        row.category = article.category || "";
-        row.article_type = article.article_type || "";
-        row.word_count = article.word_count || 0;
-        row.display_text = article.display_text || "";
-        row.status = article.status || "";
-
-        if (article.label === 0 || article.label === 1) {
-          row.label = article.label;
-        } else {
-          row.label = "";
+        if (allResponses.length > responses.length) {
+          console.log(`[ExportCSV] Article ${article.article_id}: excluded ${allResponses.length - responses.length} response(s) from deleted annotators.`);
         }
 
         const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
-        if (article.status === "complete"
-          && typeof article.annotation_count === "number"
-          && article.annotation_count >= REQUIRED) {
-          row.bias_score = article.bias_score ?? "";
 
-          // percent_agreement: use stored value if present (new articles),
-          // otherwise compute P_i from live response docs (pre-migration articles
-          // that still have the old fleiss_kappa field in Firestore).
-          if (article.percent_agreement != null) {
-            row.percent_agreement = article.percent_agreement;
-          } else {
-            // Compute P_i = (sumSq - n) / (n * (n-1)) from response labels
-            const counts = { neutral: 0, slightly: 0, highly: 0 };
-            for (const res of responses as any[]) {
-              const lbl = String(res.label || "");
-              if (lbl === "neutral") counts.neutral++;
-              else if (lbl === "slightly_manipulative") counts.slightly++;
-              else if (lbl === "highly_manipulative") counts.highly++;
-            }
-            const n = counts.neutral + counts.slightly + counts.highly;
-            if (n >= 2) {
-              const sumSq = counts.neutral ** 2 + counts.slightly ** 2 + counts.highly ** 2;
-              row.percent_agreement = parseFloat(((sumSq - n) / (n * (n - 1))).toFixed(4));
+        const row: any = {};
+        row.sequence_number = typeof (article as any).sequence_number === "number"
+          ? (article as any).sequence_number : "";
+        row.article_id   = article.article_id || "";
+        row.headline     = article.headline || "";
+        row.source       = article.source || "";
+        row.author       = article.author || "";
+        row.date_published = article.date_published || "";
+        row.url          = article.url || "";
+        row.category     = article.category || "";
+        row.article_type = article.article_type || "";
+        row.word_count   = article.word_count || 0;
+        row.display_text = article.display_text || "";
+        row.status       = article.status || "";
+
+        // ── Scoring block ──────────────────────────────────────────────────
+        // For complete articles we ALWAYS derive scores from live filtered
+        // responses when stored Firestore values are null/stale (happens when
+        // bias_score was never written, or was cleared by a repair pass that
+        // forgot to recompute).
+        if (
+          article.status === "complete" &&
+          typeof article.annotation_count === "number" &&
+          article.annotation_count >= REQUIRED
+        ) {
+          const liveCounts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
+          for (const res of responses as any[]) {
+            const lbl = String(res.label || "");
+            if (lbl === "neutral")               liveCounts.neutral++;
+            else if (lbl === "slightly_manipulative") liveCounts.slightly++;
+            else if (lbl === "highly_manipulative")   liveCounts.highly++;
+          }
+          const liveN = liveCounts.neutral + liveCounts.slightly + liveCounts.highly;
+
+          if (liveN >= REQUIRED) {
+            // bias_score: stored value preferred; recompute when null
+            row.bias_score = (article.bias_score != null)
+              ? article.bias_score
+              : calculateBiasScore(liveCounts);
+
+            // percent_agreement: stored value preferred; recompute when null
+            row.percent_agreement = (article.percent_agreement != null)
+              ? article.percent_agreement
+              : calculatePercentAgreement(liveCounts);
+
+            // label (binary 0/1): stored value preferred; derive from bias_score when null
+            if (article.label === 0 || article.label === 1) {
+              row.label = article.label;
             } else {
-              row.percent_agreement = "";
+              row.label = (row.bias_score as number) >= 2.5 ? 1 : 0;
             }
+          } else {
+            // Fewer live responses than REQUIRED after filtering deleted annotators
+            row.bias_score        = "";
+            row.percent_agreement = "";
+            row.label             = "";
           }
         } else {
-          row.bias_score = "";
+          // Article not complete yet
+          row.bias_score        = "";
           row.percent_agreement = "";
+          row.label             = (article.label === 0 || article.label === 1) ? article.label : "";
         }
 
         row.total_annotations = responses.length;
 
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
-          row[`ann_${i}_student_id`] = "";
-          row[`ann_${i}_label`] = "";
+          row[`ann_${i}_student_id`]       = "";
+          row[`ann_${i}_label`]            = "";
           row[`manipulation_cue_ann_${i}`] = "";
         }
 
         responses.forEach((res: any, i) => {
           if (i < ANNOTATOR_COLUMNS) {
             const slot = i + 1;
-            row[`ann_${slot}_student_id`] = res.annotator_email || "unknown";
-            row[`ann_${slot}_label`] = res.label || "";
-            // manipulation_cues is an array on the response doc; join with pipe for CSV
+            row[`ann_${slot}_student_id`]       = res.annotator_email || "unknown";
+            row[`ann_${slot}_label`]            = res.label || "";
             const cues: string[] = Array.isArray(res.manipulation_cues) ? res.manipulation_cues : [];
             row[`manipulation_cue_ann_${slot}`] = cues.join("|");
           }
@@ -137,81 +136,70 @@ export default function ExportCSV() {
         return row;
       }));
 
-      // ── ISSUE-2b: Dataset-wide Fleiss' Kappa summary row ──────────────────
-      // Compute overall κ dynamically from ONLY the articles currently stored
-      // as "complete" with the required annotation count — no assumption of
-      // the full 1,493 corpus target. Uses the standard pooling formula
-      // (aggregate observed agreement + marginal category proportions) that
-      // is statistically correct for unequal completion rates mid-experiment.
+      // ── Dataset-wide Fleiss' Kappa summary row ─────────────────────────────
       const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
       const completedCountsArray: BiasCounts[] = [];
       for (const article of articles) {
         if (article.status !== "complete") continue;
         if (typeof article.annotation_count !== "number" || article.annotation_count < REQUIRED) continue;
-        // Use the article's stored bias/label fields to reconstruct counts:
-        // We need exact per-category counts to pool correctly. The article
-        // doc does not cache counts, so we must derive them from the same
-        // live-filtered responses we used for the rows. We already have the
-        // article → article index correspondence via the outer Promise.all
-        // so we do a second lightweight response fetch only for complete
-        // articles (bounded by how many are complete at export time).
         try {
-          const rSnap = await getDocs(collection(db, "annotations", article.article_id, "responses"));
+          const rSnap = await getDocs(
+            collection(db, "annotations", article.article_id, "responses")
+          );
           const liveFiltered = rSnap.docs
             .map(d => d.data() as any)
             .filter((res: any) => {
               const e = typeof res.annotator_email === "string"
-                ? res.annotator_email.toLowerCase().trim()
-                : "";
+                ? res.annotator_email.toLowerCase().trim() : "";
               return !!e && liveAnnotatorEmails.has(e);
             });
           const counts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
           for (const res of liveFiltered) {
             const lbl = String(res?.label || "");
-            if (lbl === "neutral") counts.neutral++;
+            if (lbl === "neutral")                   counts.neutral++;
             else if (lbl === "slightly_manipulative") counts.slightly++;
-            else if (lbl === "highly_manipulative") counts.highly++;
+            else if (lbl === "highly_manipulative")   counts.highly++;
           }
-          // Only include articles that have exactly REQUIRED live annotators
-          // — this matches the per-article scoring gate. Otherwise overall
-          // kappa will be mathematically corrupted by partial inputs.
           const n = counts.neutral + counts.slightly + counts.highly;
           if (n === REQUIRED) completedCountsArray.push(counts);
         } catch (e) {
-          console.warn(`[ExportCSV] Skipping overall-kappa counts for ${article.article_id}:`, e);
+          console.warn(`[ExportCSV] Skipping kappa for ${article.article_id}:`, e);
         }
       }
+
       const overallKappa = calculateOverallFleissKappa(completedCountsArray);
       if (completedCountsArray.length > 0) {
         const summaryRow: any = {};
-        summaryRow.sequence_number = "";
-        summaryRow.article_id = "OVERALL_DATASET_KAPPA";
-        summaryRow.headline = `Dataset-wide Fleiss' Kappa across ${completedCountsArray.length} currently complete articles (n=${DEFAULT_REQUIRED_ANNOTATIONS} raters each)`;
-        summaryRow.source = "";
-        summaryRow.author = "";
-        summaryRow.date_published = "";
-        summaryRow.url = "";
-        summaryRow.category = "";
-        summaryRow.article_type = "";
-        summaryRow.word_count = completedCountsArray.length;
-        summaryRow.display_text = "";
-        summaryRow.status = "summary";
-        summaryRow.label = "";
-        summaryRow.bias_score = "";
-        summaryRow.percent_agreement = overallKappa; // overall dataset-level Fleiss' kappa (valid at this level)
+        summaryRow.sequence_number   = "";
+        summaryRow.article_id        = "OVERALL_DATASET_KAPPA";
+        summaryRow.headline          = `Dataset-wide Fleiss' Kappa across ${completedCountsArray.length} complete articles (n=${DEFAULT_REQUIRED_ANNOTATIONS} raters each)`;
+        summaryRow.source            = "";
+        summaryRow.author            = "";
+        summaryRow.date_published    = "";
+        summaryRow.url               = "";
+        summaryRow.category          = "";
+        summaryRow.article_type      = "";
+        summaryRow.word_count        = completedCountsArray.length;
+        summaryRow.display_text      = "";
+        summaryRow.status            = "summary";
+        summaryRow.bias_score        = "";
+        summaryRow.percent_agreement = "";
+        summaryRow.label             = "";
+        // Overall dataset Fleiss' kappa in its own clearly-named column
+        summaryRow.fleiss_kappa      = overallKappa;
         summaryRow.total_annotations = completedCountsArray.length;
-        summaryRow.human_label = "";
         for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
-          summaryRow[`ann_${i}_student_id`] = "";
-          summaryRow[`ann_${i}_label`] = "";
+          summaryRow[`ann_${i}_student_id`]       = "";
+          summaryRow[`ann_${i}_label`]            = "";
+          summaryRow[`manipulation_cue_ann_${i}`] = "";
         }
         exportData.push(summaryRow);
-        console.log(`[ExportCSV] Overall dataset Fleiss' kappa = ${overallKappa}, computed from ${completedCountsArray.length} complete articles.`);
+        console.log(`[ExportCSV] Overall Fleiss kappa = ${overallKappa} from ${completedCountsArray.length} articles.`);
       } else {
-        console.log(`[ExportCSV] No complete articles with exactly ${REQUIRED} live raters — skipping overall kappa summary row.`);
+        console.log(`[ExportCSV] No complete articles with exactly ${REQUIRED} live raters — skipping kappa row.`);
       }
 
-      downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split('T')[0]}.csv`);
+      downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split("T")[0]}.csv`);
     } catch (err) {
       alert("Export failed: " + err);
     } finally {
@@ -234,7 +222,7 @@ export default function ExportCSV() {
           <div className="space-y-2">
             <h3 className="text-xl font-bold text-slate-800">Full Dataset (CSV)</h3>
             <p className="text-slate-500 text-sm leading-relaxed">
-              Export all articles including their original metadata, processed scores (Bias Score, Fleiss' Kappa), 
+              Export all articles including their original metadata, processed scores (Bias Score, Fleiss&#39; Kappa),
               and individual labels from exactly {DEFAULT_REQUIRED_ANNOTATIONS} annotators per article.
               <span className="block mt-1 text-xs opacity-70">
                 (Constant defined in <code>annotationConfig.ts</code>. Change via CLI: edit constant, rebuild, redeploy.)
