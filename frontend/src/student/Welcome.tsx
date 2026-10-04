@@ -1,8 +1,50 @@
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, Loader2 } from "lucide-react";
+
+const STORAGE_KEY = "nexus_consent_seen_v1";
+
+function hasClientConsent(userEmail: string): boolean {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    if (parsed?.email !== userEmail.toLowerCase().trim()) return false;
+    if (!parsed?.accepted) return false;
+    const ageDays = (Date.now() - (parsed.at || 0)) / (1000 * 60 * 60 * 24);
+    return ageDays < 30;
+  } catch {
+    return false;
+  }
+}
 
 export default function Welcome() {
   const navigate = useNavigate();
+  const session = JSON.parse(localStorage.getItem("nexus_user_session") || "{}");
+  const userEmail = (session.email || "").toLowerCase().trim();
+  const [checking, setChecking] = useState<boolean>(!!userEmail);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (userEmail && hasClientConsent(userEmail)) {
+        navigate("/annotate", { replace: true });
+      } else {
+        navigate("/consent", { replace: true });
+      }
+    }, 0); // immediate — no visible flash
+    return () => clearTimeout(timer);
+  }, [navigate, userEmail]);
+
+  if (checking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg-student p-6">
+        <div className="flex items-center gap-3 text-slate-500 font-bold">
+          <Loader2 className="animate-spin" size={22} />
+          Loading…
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-bg-student p-6 relative overflow-hidden">
