@@ -43,6 +43,7 @@ export default function Dashboard() {
   ]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [staleSummary, setStaleSummary] = useState(false);
   const [repairingSeq, setRepairingSeq] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [syncProgress, setSyncProgress] = useState<{ step: string; processed: number; total: number } | null>(null);
@@ -193,14 +194,35 @@ export default function Dashboard() {
   };
 
   const applyStatsData = useCallback((data: PlatformSummary) => {
-    if ((!data.totalArticles || data.totalArticles === 0) && (data.inProgressArticles > 0 || data.completedArticles > 0)) {
-      console.warn("Impossible stats detected. Summary document is out of sync.");
+    // Clamp all counts to ≥ 0 — a negative stored value means the summary
+    // doc is stale/corrupted and needs a Sync. Show 0 instead of a negative.
+    const safe = (v: any) => Math.max(0, typeof v === "number" && Number.isFinite(v) ? v : 0);
+    const clamped: PlatformSummary = {
+      ...data,
+      totalArticles:      safe(data.totalArticles),
+      completedArticles:  safe(data.completedArticles),
+      inProgressArticles: safe(data.inProgressArticles),
+      pendingArticles:    safe(data.pendingArticles),
+      totalAnnotators:    safe(data.totalAnnotators),
+      completedAnnotators: safe(data.completedAnnotators),
+      avgBiasScore:       safe(data.avgBiasScore),
+      needsReview:        safe(data.needsReview),
+    };
+    if (data.completedArticles < 0 || data.inProgressArticles < 0 || data.pendingArticles < 0) {
+      console.warn(
+        "[Dashboard] Negative stat detected in platform_summary doc \u2014 doc is stale. " +
+        `completedArticles=${data.completedArticles}, inProgress=${data.inProgressArticles}, pending=${data.pendingArticles}. ` +
+        "Run Sync Statistics to rebuild."
+      );
+      setStaleSummary(true);
+    } else {
+      setStaleSummary(false);
     }
-    setStats(data);
+    setStats(clamped);
     setStatusData([
-      { name: "Completed", value: data.completedArticles || 0, color: "#16a34a" },
-      { name: "In Progress", value: data.inProgressArticles || 0, color: "#eab308" },
-      { name: "Pending", value: data.pendingArticles || 0, color: "#94a3b8" }
+      { name: "Completed", value: clamped.completedArticles, color: "#16a34a" },
+      { name: "In Progress", value: clamped.inProgressArticles, color: "#eab308" },
+      { name: "Pending", value: clamped.pendingArticles, color: "#94a3b8" }
     ]);
     if (data.categoryDistribution) {
       setCategoryData(Object.entries(data.categoryDistribution)
@@ -454,21 +476,26 @@ export default function Dashboard() {
       const avgBiasScore = completedArticlesArr.length > 0
         ? Math.round((totalBiasScoreSum / completedArticlesArr.length) * 100) / 100
         : 0;
+      const totalA = articles.length;
+      const completedA = Math.max(0, completedArticlesArr.length);
+      const inProgressA = Math.max(0, articles.filter(a => a.status === "partial").length);
+      const pendingA = Math.max(0, totalA - completedA - inProgressA);
+
       const newSummary: PlatformSummary = {
-        totalArticles: articles.length,
-        completedArticles: completedArticlesArr.length,
-        inProgressArticles: articles.filter(a => a.status === "partial").length,
-        pendingArticles: articles.filter(a => a.status === "pending").length,
+        totalArticles: totalA,
+        completedArticles: completedA,
+        inProgressArticles: inProgressA,
+        pendingArticles: pendingA,
         totalAnnotators: annotators.length,
         completedAnnotators: completedAnnotatorCount,
         avgBiasScore,
         totalBiasScoreSum,
-        needsReview: articles.filter(a => {
+        needsReview: Math.max(0, articles.filter(a => {
           const requiredAnnotations = getRequiredAnnotations(a, {
             annotators_per_article: fallbackRequiredAnnotations,
           });
           return a.status === "partial" && a.annotation_count >= requiredAnnotations;
-        }).length,
+        }).length),
         categoryDistribution: categories
       };
 
@@ -695,15 +722,20 @@ export default function Dashboard() {
       )}
 
       {/* KPI Grid */}
-      {(!stats.totalArticles || stats.totalArticles === 0) && stats.inProgressArticles > 0 && (
+      {(staleSummary || ((!stats.totalArticles || stats.totalArticles === 0) && stats.inProgressArticles > 0)) && (
         <div className="bg-amber-50 border-2 border-amber-200 p-6 rounded-[32px] flex items-center justify-between gap-6 animate-in slide-in-from-top-4 duration-500">
           <div className="flex items-center gap-4">
             <div className="w-12 h-12 rounded-2xl bg-amber-100 flex items-center justify-center text-amber-600">
               <ShieldAlert size={24} />
             </div>
             <div>
-              <p className="text-sm font-black text-amber-900 uppercase tracking-tight">Database Out of Sync</p>
-              <p className="text-xs font-bold text-amber-600/80">Your dashboard is showing incorrect counts because the summary document hasn't been initialized.</p>
+              <p className="text-sm font-black text-amber-900 uppercase tracking-tight">Statistics Out of Sync</p>
+              <p className="text-xs font-bold text-amber-600/80">
+                {staleSummary
+                  ? "The stored summary document has invalid values (e.g. negative counts). Click \"Fix Statistics Now\" to recompute from live data."
+                  : "Your dashboard is showing incorrect counts because the summary document hasn't been initialized."
+                }
+              </p>
             </div>
           </div>
           <button
