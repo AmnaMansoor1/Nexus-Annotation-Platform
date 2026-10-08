@@ -101,6 +101,26 @@ export default function Dashboard() {
     throw lastErr;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Timeout wrapper: races a promise against a deadline. If the promise
+  // doesn't resolve within `ms` milliseconds it rejects with a timeout
+  // error. This is critical for getDocs() on large collections — the
+  // Firestore SDK can silently hang (promise never resolves OR rejects)
+  // if the underlying WebChannel is stuck, which defeats the retry loop.
+  // ─────────────────────────────────────────────────────────────────────
+  function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`[Timeout] ${label} timed out after ${ms / 1000}s — network cycle will retry`)),
+          ms
+        )
+      ),
+    ]);
+  }
+
+
   const handleRepairSequenceNumbers = () => {
     seqCsvInputRef.current?.click();
   };
@@ -290,20 +310,34 @@ export default function Dashboard() {
         console.warn("[SyncStats] enableNetwork threw (harmless if already online):", ne);
       }
 
-      // ── 1. FETCH ALL articles + annotators with 4-attempt retry + backoff
+      // ── 1. FETCH ALL articles + annotators
+      // withTimeout(45s) is critical: getDocs on a large collection can silently
+      // hang in the browser (promise never resolves OR rejects) if the Firestore
+      // WebChannel is stuck. The timeout forces a rejection so the retry loop
+      // can cycle disableNetwork→enableNetwork and re-open a fresh connection.
       const fetchStart = performance.now();
-      const [articlesSnap, annotatorsSnap] = await runWithRetries(
-        "fetch articles+annotators collections",
+      setSyncProgress({ step: "Fetching annotators from Firestore…", processed: 0, total: 0 });
+      const annotatorsSnap = await runWithRetries(
+        "fetch annotators",
         async () => {
           try { await enableNetwork(db); } catch (_) {}
-          return await Promise.all([
-            getDocs(collection(db, "articles")),
-            getDocs(collection(db, "annotators")),
-          ]);
+          return withTimeout(getDocs(collection(db, "annotators")), 45_000, "annotators fetch");
         },
-        { attempts: 4, baseDelayMs: 1200 }
+        { attempts: 6, baseDelayMs: 3000 }
       );
-      console.log(`[SyncStats] Fetched ${articlesSnap.size} articles + ${annotatorsSnap.size} annotators in ${Math.round(performance.now() - fetchStart)} ms`);
+      console.log(`[SyncStats] Fetched ${annotatorsSnap.size} annotators in ${Math.round(performance.now() - fetchStart)} ms`);
+
+      setSyncProgress({ step: `Fetching ${1493} articles from Firestore — this may take 10–30 s on a slow connection…`, processed: 0, total: 0 });
+      const articlesFetchStart = performance.now();
+      const articlesSnap = await runWithRetries(
+        "fetch articles collection",
+        async () => {
+          try { await enableNetwork(db); } catch (_) {}
+          return withTimeout(getDocs(collection(db, "articles")), 60_000, "articles fetch");
+        },
+        { attempts: 6, baseDelayMs: 3000 }
+      );
+      console.log(`[SyncStats] Fetched ${articlesSnap.size} articles in ${Math.round(performance.now() - articlesFetchStart)} ms`);
 
       const liveAnnotatorEmails = new Set<string>();
       const articlesByAssignee = new Map<string, Set<string>>();
