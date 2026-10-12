@@ -23,29 +23,54 @@ export async function ensureSummaryExists() {
   }
 }
 
-export async function updatePlatformStats(updates: Partial<{
-  totalArticles: number;
-  completedArticles: number;
-  pendingArticles: number;
-  inProgressArticles: number;
-  totalAnnotators: number;
-  completedAnnotators: number;
-  avgBiasScore: number;
-  totalBiasScoreSum: number;
-  needsReview: number;
-  categoryDistribution?: Record<string, number>;
-}>) {
+export async function updatePlatformStats(
+  updates: Partial<{
+    totalArticles: number;
+    completedArticles: number;
+    pendingArticles: number;
+    inProgressArticles: number;
+    totalAnnotators: number;
+    completedAnnotators: number;
+    avgBiasScore: number;
+    totalBiasScoreSum: number;
+    needsReview: number;
+    categoryDistribution?: Record<string, number>;
+  }>,
+  replaceStats = false
+) {
   const ref = doc(db, SUMMARY_PATH);
-  const firebaseUpdates: any = {};
-  
+
   // Sanitize category names to remove invalid Firestore field path characters
-  const sanitizeCategory = (category: string) => {
-    return category.replace(/[~*/[\]]/g, "_");
-  };
-  
+  const sanitizeCategory = (category: string) =>
+    category.replace(/[~*/[\]]/g, "_");
+
+  if (replaceStats) {
+    // ── Full replace mode (used after a fresh CSV upload) ──────────────────
+    // Write exact values so stats accurately reflect the new dataset.
+    const sanitizedCategoryDistribution: Record<string, number> = {};
+    for (const [cat, count] of Object.entries(updates.categoryDistribution ?? {})) {
+      sanitizedCategoryDistribution[sanitizeCategory(cat)] = count as number;
+    }
+
+    const { categoryDistribution: _cd, ...rest } = updates as any;
+    await setDoc(ref, {
+      completedArticles: 0,
+      inProgressArticles: 0,
+      totalAnnotators: 0,
+      completedAnnotators: 0,
+      avgBiasScore: 0,
+      totalBiasScoreSum: 0,
+      needsReview: 0,
+      ...rest,
+      categoryDistribution: sanitizedCategoryDistribution,
+    });
+    return;
+  }
+
+  // ── Incremental mode (normal runtime updates) ──────────────────────────
+  const firebaseUpdates: any = {};
   for (const [key, value] of Object.entries(updates)) {
     if (key === "categoryDistribution" && typeof value === "object") {
-      // For category distribution, we use dot notation to increment specific keys
       for (const [category, count] of Object.entries(value)) {
         const sanitizedCategory = sanitizeCategory(category);
         firebaseUpdates[`categoryDistribution.${sanitizedCategory}`] = increment(count as number);

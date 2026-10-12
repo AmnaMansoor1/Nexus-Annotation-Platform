@@ -29,8 +29,13 @@ dist-ssr
 # Trae AI files
 .trae/
 
-# Datasets (optional)
+# Datasets (large CSV files — import via backend/src/replace-articles.mjs)
 annotation_dataset_v6.csv
+1500art_final_annotation_dataset.csv
+*.csv
+
+# Debug folders
+.dbg/
 
 # Firebase Admin secrets (NEVER commit)
 service-account.json

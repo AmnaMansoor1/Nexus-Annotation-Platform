@@ -1,6 +1,6 @@
 import { useState } from "react";
 import Papa from "papaparse";
-import { collection, doc, setDoc, getDoc, writeBatch } from "firebase/firestore";
+import { collection, doc, setDoc, getDoc, writeBatch, getDocs, deleteDoc, query, limit } from "firebase/firestore";
 import { db } from "../firebase";
 import { AdminConfig, Article } from "../types";
 import { updatePlatformStats } from "../utils/stats";
@@ -48,39 +48,41 @@ export default function UploadCSV() {
       const adminConfigSnap = await getDoc(doc(db, "admin_config", "settings"));
       const adminConfig = adminConfigSnap.exists() ? (adminConfigSnap.data() as AdminConfig) : null;
 
-      // Use batches for efficiency (Firestore limit is 500 per batch)
+      // ── STEP 1: Delete ALL existing articles so the new CSV fully replaces them ──
+      console.log("🗑️ Deleting all existing articles before import...");
+      setProgress(0);
+      const articlesCol = collection(db, "articles");
+      let deletedTotal = 0;
+      while (true) {
+        const snap = await getDocs(query(articlesCol, limit(400)));
+        if (snap.empty) break;
+        const delBatch = writeBatch(db);
+        snap.docs.forEach((d) => delBatch.delete(d.ref));
+        await delBatch.commit();
+        deletedTotal += snap.size;
+        console.log(`Deleted ${deletedTotal} old articles so far...`);
+      }
+      console.log(`✔ Deleted ${deletedTotal} old articles from Firestore.`);
+
+      // ── STEP 2: Import every row from the new CSV ──────────────────────────────
       const batchSize = 100;
+      const categoryDistribution: Record<string, number> = {};
+
       for (let i = 0; i < data.length; i += batchSize) {
         const batch = writeBatch(db);
         const chunk = data.slice(i, i + batchSize);
         let chunkImported = 0;
 
-        console.log(`Processing chunk ${i / batchSize + 1}, rows:`, chunk);
+        for (let chunkIdx = 0; chunkIdx < chunk.length; chunkIdx++) {
+          const row = chunk[chunkIdx];
+          const articleId = row.article_id?.trim();
+          if (!articleId) { skipped++; continue; }
 
-        // 1. Pre-check which articles already exist in this chunk (Parallelized)
-        const existenceChecks = await Promise.all(chunk.map(async (row) => {
-          const articleId = row.article_id;
-          if (!articleId) return { row, exists: true }; // Skip empty IDs
-          const docSnap = await getDoc(doc(db, "articles", articleId));
-          return { row, exists: docSnap.exists() };
-        }));
-
-        for (let chunkIdx = 0; chunkIdx < existenceChecks.length; chunkIdx++) {
-          const { row, exists } = existenceChecks[chunkIdx];
-          if (exists) {
-            skipped++;
-            continue;
-          }
-
-          const articleId = row.article_id;
           const docRef = doc(db, "articles", articleId);
           // Global CSV row index (0-based) → sequence_number (1-based).
-          // This GUARANTEES sequence_number order == CSV row order, so
-          // ART7014F5A8 (row 0 in data) → seq=1, next article seq=2, ...
           const globalRowIndex = i + chunkIdx;
           const sequenceNumber = globalRowIndex + 1;
 
-          // Build article object, only include gold_expected_label if it exists
           const requiredAnnotations = getRequiredAnnotations(
             {
               required_annotations: row.required_annotations ? parseInt(row.required_annotations, 10) : undefined,
@@ -99,6 +101,9 @@ export default function UploadCSV() {
             humanFinal = row.final_label;
           }
 
+          const cat = row.category || "Uncategorized";
+          categoryDistribution[cat] = (categoryDistribution[cat] || 0) + 1;
+
           const article: Article = {
             article_id: articleId,
             headline: row.headline || "",
@@ -107,7 +112,7 @@ export default function UploadCSV() {
             author: row.author || "",
             date_published: row.date_published || "",
             url: row.url || "",
-            category: row.category || "",
+            category: cat,
             article_type: (row.article_type as any) || "News Article",
             word_count: parseInt(row.word_count) || 0,
             sequence_number: sequenceNumber,
@@ -126,35 +131,26 @@ export default function UploadCSV() {
           if (row.gold_expected_label) {
             article.gold_expected_label = row.gold_expected_label;
           }
-          console.log("Adding article to batch:", articleId);
+
           batch.set(docRef, article);
           chunkImported++;
         }
 
         await batch.commit();
-        console.log(`Committed chunk ${i / batchSize + 1}, imported ${chunkImported}`);
         imported += chunkImported;
         setProgress(Math.min(100, Math.round(((i + batchSize) / data.length) * 100)));
-        
-        // Update platform stats for this chunk
-        if (chunkImported > 0) {
-          // Calculate category distribution for this chunk
-          const categories = chunk.reduce((acc: Record<string, number>, row) => {
-            const cat = row.category || "Uncategorized";
-            acc[cat] = (acc[cat] || 0) + 1;
-            return acc;
-          }, {});
-
-          await updatePlatformStats({
-            totalArticles: chunkImported,
-            pendingArticles: chunkImported,
-            categoryDistribution: categories
-          });
-        }
+        console.log(`Committed chunk ${Math.ceil(i / batchSize) + 1}, imported ${chunkImported}`);
       }
 
+      // ── STEP 3: Set platform stats fresh from this import ─────────────────────
+      await updatePlatformStats({
+        totalArticles: imported,
+        pendingArticles: imported,
+        categoryDistribution,
+      }, true /* replaceStats */);
+
       setStats({ imported, skipped });
-      console.log("Import complete:", { imported, skipped });
+      console.log("✅ Import complete:", { imported, skipped });
     } catch (err: any) {
       console.error("Error importing articles:", err);
       alert("Error importing articles: " + (err.message || JSON.stringify(err)));
