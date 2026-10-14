@@ -5,7 +5,7 @@ import { getFirestore } from "firebase-admin/firestore";
 import { fileURLToPath } from "url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const REQUIRED = 5;
+const REQUIRED = 3; // matches DEFAULT_REQUIRED_ANNOTATIONS in annotationConfig.ts
 const DRY_RUN = process.argv.includes("--dry-run");
 
 const sa = JSON.parse(fs.readFileSync(path.join(root, "service-account.json"), "utf8"));
