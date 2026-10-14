@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { collection, getDocs, query, orderBy } from "firebase/firestore";
+import Papa from "papaparse";
 import { db } from "../firebase";
 import { Article } from "../types";
-import { downloadCSV } from "../utils/csvExport";
 import { DEFAULT_REQUIRED_ANNOTATIONS } from "../utils/annotationConfig";
 import { calculateOverallFleissKappa, calculatePercentAgreement, BiasCounts } from "../utils/calculateKappa";
 import { calculateBiasScore } from "../utils/calculateBiasScore";
@@ -94,7 +94,6 @@ export default function ExportCSV() {
             row.percent_agreement = (article.percent_agreement != null)
               ? article.percent_agreement
               : calculatePercentAgreement(liveCounts);
-            row.fleiss_kappa = ""; // populated only on the summary row
             if (article.label === 0 || article.label === 1) {
               row.label = article.label;
             } else {
@@ -115,13 +114,11 @@ export default function ExportCSV() {
           } else {
             row.bias_score        = "";
             row.percent_agreement = "";
-            row.fleiss_kappa      = ""; // populated only on the summary row
             row.label             = "";
           }
         } else {
           row.bias_score        = "";
           row.percent_agreement = "";
-          row.fleiss_kappa      = ""; // populated only on the summary row
           row.label             = (article.label === 0 || article.label === 1) ? article.label : "";
         }
 
@@ -182,7 +179,32 @@ export default function ExportCSV() {
         console.log(`[ExportCSV] No complete articles with exactly ${REQUIRED} live raters — skipping kappa row.`);
       }
 
-      downloadCSV(exportData, `NEXUS_Export_${new Date().toISOString().split("T")[0]}.csv`);
+      // ── Build explicit column list so Papa.unparse never re-orders them ───
+      // fleiss_kappa only has a value on the summary row, but by listing it
+      // explicitly here it stays in the right position for every row.
+      const annCols: string[] = [];
+      for (let i = 1; i <= ANNOTATOR_COLUMNS; i++) {
+        annCols.push(`ann_${i}_student_id`, `ann_${i}_label`, `manipulation_cue_ann_${i}`);
+      }
+      const fields = [
+        "sequence_number", "article_id", "headline", "source", "author",
+        "date_published", "url", "category", "article_type", "word_count",
+        "display_text", "status",
+        "bias_score", "percent_agreement", "fleiss_kappa", "label",
+        "total_annotations",
+        ...annCols,
+      ];
+
+      const csv = Papa.unparse({ fields, data: exportData });
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url  = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.setAttribute("href", url);
+      link.setAttribute("download", `NEXUS_Export_${new Date().toISOString().split("T")[0]}.csv`);
+      link.style.visibility = "hidden";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (err) {
       alert("Export failed: " + err);
     } finally {
