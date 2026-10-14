@@ -94,6 +94,7 @@ export default function ExportCSV() {
             row.percent_agreement = (article.percent_agreement != null)
               ? article.percent_agreement
               : calculatePercentAgreement(liveCounts);
+            row.fleiss_kappa = ""; // populated only on the summary row
             if (article.label === 0 || article.label === 1) {
               row.label = article.label;
             } else {
@@ -114,11 +115,13 @@ export default function ExportCSV() {
           } else {
             row.bias_score        = "";
             row.percent_agreement = "";
+            row.fleiss_kappa      = ""; // populated only on the summary row
             row.label             = "";
           }
         } else {
           row.bias_score        = "";
           row.percent_agreement = "";
+          row.fleiss_kappa      = ""; // populated only on the summary row
           row.label             = (article.label === 0 || article.label === 1) ? article.label : "";
         }
 
