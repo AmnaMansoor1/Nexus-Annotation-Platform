@@ -1,11 +1,14 @@
-import { collection, query, where, getDocs, doc, getDoc, limit, orderBy, runTransaction, increment, arrayUnion, writeBatch } from "firebase/firestore";
+import { collection, query, where, getDocs, doc, getDoc, limit, orderBy, runTransaction, increment, arrayUnion } from "firebase/firestore";
 import { db } from "../firebase";
 import { Article, AdminConfig } from "../types";
 import { getRequiredAnnotations } from "./annotationConfig";
 import { fetchAnnotatorContext, healArticles, AnnotatorContext } from "./reconcileArticle";
 
-const randomDelay = (min: number = 100, max: number = 1000) =>
+// Spread concurrent logins across a random window to reduce Firestore contention
+const randomDelay = (min = 100, max = 800) =>
   new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1) + min)));
+
+const NON_RESPONSIVE_BUFFER = 2;
 
 function normalizeArticle(data: any): Article {
   const statusVal = data?.status;
@@ -46,18 +49,19 @@ export function isEligible(article: Article, email: string, requiredAnnotations:
     return { ok: false, reason: `consistency-err: status=pending but annotation_count=${article.annotation_count}>0` };
   }
 
-  const NON_RESPONSIVE_BUFFER = 2;
   const annStillNeeded = article.annotation_count < requiredAnnotations;
   const hardCap = annStillNeeded ? requiredAnnotations + NON_RESPONSIVE_BUFFER : requiredAnnotations;
   if (article.assigned_count >= hardCap) {
     return { ok: false, reason: `assigned_count=${article.assigned_count}>=cap=${hardCap}` };
   }
-  
+
   const emailNorm = email.toLowerCase().trim();
-  const assignedList = Array.isArray(article.assigned_to) ? article.assigned_to.map(e => String(e).toLowerCase().trim()) : [];
+  const assignedList = Array.isArray(article.assigned_to)
+    ? article.assigned_to.map(e => String(e).toLowerCase().trim()) : [];
   if (assignedList.includes(emailNorm)) return { ok: false, reason: "already-assigned-to-me" };
 
-  const annotatedList = Array.isArray(article.annotated_by) ? article.annotated_by.map(e => String(e).toLowerCase().trim()) : [];
+  const annotatedList = Array.isArray(article.annotated_by)
+    ? article.annotated_by.map(e => String(e).toLowerCase().trim()) : [];
   if (annotatedList.includes(emailNorm)) return { ok: false, reason: "already-annotated-by-me" };
 
   return { ok: true };
@@ -76,7 +80,6 @@ export function selectArticlesSequentially(
 ): SequentialSelectionResult {
   const skipped_inconsistent: string[] = [];
   const eligible: Article[] = [];
-
   const sorted = [...articles].sort(priorityCmp);
 
   for (const article of sorted) {
@@ -95,38 +98,74 @@ export function selectArticlesSequentially(
   return { selected, skipped_inconsistent };
 }
 
-export async function assignArticlesForAnnotator(email: string, targetCount: number = 20): Promise<string[]> {
-  console.log("[assignArticlesForAnnotator] Starting for email:", email, "targetCount:", targetCount);
-  await randomDelay(100, 500);
+/**
+ * Atomically claims an assignment slot for one article.
+ *
+ * Uses runTransaction so the READ + eligibility-check + WRITE are a single
+ * atomic operation. Two users racing on the same article will serialize:
+ * the second writer re-reads after the first commit and only writes if the
+ * slot is still open (assigned_count still below cap).
+ *
+ * Returns true when the slot was successfully claimed, false when the article
+ * was already full by the time the transaction ran (caller should skip it).
+ */
+async function claimAssignmentSlot(
+  articleId: string,
+  email: string,
+  adminConfig: AdminConfig | null
+): Promise<boolean> {
+  const articleRef = doc(db, "articles", articleId);
+  try {
+    return await runTransaction(db, async (tx) => {
+      const snap = await tx.get(articleRef);
+      if (!snap.exists()) return false;
 
+      const current = normalizeArticle(snap.data());
+      const required = getRequiredAnnotations(current, adminConfig);
+      const check = isEligible(current, email, required);
+      if (!check.ok) {
+        // Slot gone by the time we got here — don't write
+        console.log(`[claimSlot] ${articleId} no longer eligible (${check.reason}), skipping.`);
+        return false;
+      }
+
+      tx.update(articleRef, {
+        assigned_count: increment(1),
+        assigned_to: arrayUnion(email),
+      });
+      return true;
+    });
+  } catch (err) {
+    console.warn(`[claimSlot] Transaction failed for ${articleId}:`, err);
+    return false;
+  }
+}
+
+export async function assignArticlesForAnnotator(email: string, targetCount = 20): Promise<string[]> {
+  console.log("[assignArticlesForAnnotator] Starting for email:", email, "targetCount:", targetCount);
+
+  // Spread concurrent logins to reduce Firestore read contention
+  await randomDelay(100, 800);
+
+  const emailNorm = email.toLowerCase().trim();
   let adminConfig: AdminConfig | null = null;
   try {
-    console.log("[assignArticlesForAnnotator] Fetching admin_config/settings");
     const adminDoc = await getDoc(doc(db, "admin_config", "settings"));
-    if (adminDoc.exists()) {
-      adminConfig = adminDoc.data() as AdminConfig;
-    }
+    if (adminDoc.exists()) adminConfig = adminDoc.data() as AdminConfig;
   } catch (err) {
-    console.warn("[assignArticlesForAnnotator] Could not load admin settings, proceeding with defaults.", err);
+    console.warn("[assignArticlesForAnnotator] Could not load admin settings, using defaults.", err);
   }
 
   const articlesRef = collection(db, "articles");
   let eligibleArticles: Article[] = [];
   const allHealedById = new Map<string, Article>();
-  const emailNorm = email.toLowerCase().trim();
 
-  // #region debug-point H3:articles-read-smoke-test
-  (async()=>{try{const smokeQ=query(articlesRef,limit(1));const smoke=await getDocs(smokeQ);fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:smoke-read",msg:"[DEBUG] ARTICLES read smoke test: simple unfiltered limit(1) list query",data:{ok:true,size:smoke.size,first_doc:smoke.size>0?smoke.docs[0].id:null},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})}catch(e){fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:smoke-read",msg:"[DEBUG] ARTICLES read smoke test FAILED",data:{ok:false,error_code:(e as any)?.code,error_message:(e as any)?.message?.slice(0,200)??String(e).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})}})();
-  // #endregion
-
+  // Load annotator context for self-heal
   let annotatorCtx: AnnotatorContext;
   try {
     annotatorCtx = await fetchAnnotatorContext();
-    console.log("[assignArticlesForAnnotator] Live annotators for self-heal:", annotatorCtx.liveEmails.size,
-      "Truth-assignees populated for", annotatorCtx.articlesByAssignee.size, "articles.");
-    // #region debug-point H1,H4:annotator-ctx-for-email
-    (()=>{const articlesWithEmail = [...annotatorCtx.articlesByAssignee.entries()].filter(([,emails])=>emails.has(emailNorm));const emailInLive=annotatorCtx.liveEmails.has(emailNorm);fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H1",location:"assignArticles.ts:ctx-scan",msg:"[DEBUG] annotatorCtx scan for email + articlesByAssignee already-assigned count",data:{email:email.slice(0,15)+"…",emailNorm,email_in_liveEmails:emailInLive,liveEmails_size:annotatorCtx.liveEmails.size,articles_with_this_assignee_count:articlesWithEmail.length,articlesByAssignee_total:annotatorCtx.articlesByAssignee.size,sample_article_ids:articlesWithEmail.slice(0,5).map(([id])=>id)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
-    // #endregion
+    console.log("[assignArticlesForAnnotator] Live annotators:", annotatorCtx.liveEmails.size,
+      "| Truth-assignees for", annotatorCtx.articlesByAssignee.size, "articles.");
   } catch (err) {
     console.warn("[assignArticlesForAnnotator] Could not load live annotators; skipping self-heal.", err);
     annotatorCtx = { liveEmails: new Set(), articlesByAssignee: new Map() };
@@ -142,31 +181,28 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
     return healArticles(raws, annotatorCtx, adminConfig);
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // STRATEGY A (PRIMARY) — uses composite index:
-  //   articles: status ASC, sequence_number ASC
-  // Query: where(status in [pending, partial]) + orderBy(sequence_number ASC)
-  // NEVER uses article_id for ordering.
-  // Defensive: limit(100) so we have candidates even after filtering.
-  // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // STRATEGY A (PRIMARY) — composite index: status + sequence_number
+  // Filters server-side so we only read pending/partial articles.
+  // ─────────────────────────────────────────────────────────────────────────
   try {
-    console.log("[assignArticlesForAnnotator] Running Strategy A (composite index: status + sequence_number)");
-    const strategyAQ = query(
+    console.log("[assignArticlesForAnnotator] Strategy A: status filter + sequence_number order");
+    const strategyASnap = await getDocs(query(
       articlesRef,
       where("status", "in", ["pending", "partial"]),
       orderBy("sequence_number", "asc"),
       limit(100)
-    );
-    const strategyASnap = await getDocs(strategyAQ);
+    ));
     console.log("[assignArticlesForAnnotator] Strategy A returned", strategyASnap.size, "docs");
 
     const healedBatch = await healDocSnaps(strategyASnap.docs);
     for (const a of healedBatch) allHealedById.set(a.article_id, a);
+
     const inconsistencies: string[] = [];
     const candidates: Article[] = [];
     for (const article of healedBatch) {
-      const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
-      const check = isEligible(article, email, requiredAnnotations);
+      const required = getRequiredAnnotations(article, adminConfig);
+      const check = isEligible(article, email, required);
       if (!check.ok) {
         if (check.reason?.startsWith("consistency-err")) {
           inconsistencies.push(`${article.article_id}(seq=${(article as any).sequence_number}): ${check.reason}`);
@@ -177,50 +213,45 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
     }
 
     if (inconsistencies.length > 0) {
-      console.warn("[assignArticlesForAnnotator] Strategy A skipped", inconsistencies.length, "inconsistent articles:", inconsistencies.slice(0, 5));
+      console.warn("[assignArticlesForAnnotator] Strategy A skipped", inconsistencies.length,
+        "inconsistent:", inconsistencies.slice(0, 3));
     }
-
-    // #region debug-point H3,H5:strategyA-iseligible-breakdown
-    (()=>{const counts: Record<string,number>={};for(const article of healedBatch){const requiredAnnotations = getRequiredAnnotations(article, adminConfig);const check = isEligible(article, email, requiredAnnotations);if(!check.ok){const k=check.reason||"unknown";counts[k]=(counts[k]||0)+1}}fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyA",msg:"[DEBUG] Strategy A isEligible reason breakdown",data:{strategyA_docs:strategyASnap.size,healed:healedBatch.length,candidates_len:candidates.length,eligible_len_before_slice:eligibleArticles.length||candidates.length,reason_counts:counts,targetCount},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
-    // #endregion
 
     candidates.sort(priorityCmp);
     eligibleArticles = candidates.slice(0, targetCount);
-    console.log("[assignArticlesForAnnotator] Strategy A eligible after filter:", eligibleArticles.length, "/", candidates.length, "candidates (target:", targetCount, ")");
+    console.log("[assignArticlesForAnnotator] Strategy A eligible:", eligibleArticles.length, "/", candidates.length);
   } catch (err) {
-    // #region debug-point H3,H5:strategyA-exception
-    fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyA-catch",msg:"[DEBUG] Strategy A threw EXCEPTION",data:{error_name:(err as any)?.name,error_code:(err as any)?.code,error_message:(err as any)?.message?.slice(0,200)??String(err).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{});
-    // #endregion
     console.warn("[assignArticlesForAnnotator] Strategy A failed (index missing?):", err);
   }
 
-  // ─────────────────────────────────────────────────────────────────
-  // STRATEGY B (FALLBACK) — no composite index required
-  // orderBy(sequence_number, asc) + limit(500). Filter client-side.
-  // NEVER falls back to article_id/doc-name ordering.
-  // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // STRATEGY B (FALLBACK) — no composite index required.
+  // Also filters by status — keeps reads to 100 max.
+  // ─────────────────────────────────────────────────────────────────────────
   if (eligibleArticles.length < targetCount) {
     try {
-      console.log("[assignArticlesForAnnotator] Running Strategy B (fallback: sequence_number order, client-side filter, target:", targetCount, ")");
-      const fallbackQ = query(articlesRef, orderBy("sequence_number", "asc"), limit(500));
-      const fallbackSnap = await getDocs(fallbackQ);
+      console.log("[assignArticlesForAnnotator] Strategy B fallback (target:", targetCount, ")");
+      const fallbackSnap = await getDocs(query(
+        articlesRef,
+        where("status", "in", ["pending", "partial"]),  // ← status filter — no 500-doc full scan
+        orderBy("sequence_number", "asc"),
+        limit(100)                                       // ← was 500, now 100
+      ));
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
 
       const healedFallback = await healDocSnaps(fallbackSnap.docs);
-      // #region debug-point H3,H5:strategyB-iseligible-breakdown
-      (()=>{const counts: Record<string,number>={};const statusCounts: Record<string,number>={};for(const article of healedFallback){const s=(article as any).status??"__MISSING__";statusCounts[s]=(statusCounts[s]||0)+1;const requiredAnnotations = getRequiredAnnotations(article, adminConfig);const check = isEligible(article, email, requiredAnnotations);if(!check.ok){const k=check.reason||"unknown";counts[k]=(counts[k]||0)+1}}fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyB",msg:"[DEBUG] Strategy B isEligible reason breakdown + status distribution",data:{fallback_size:fallbackSnap.size,healed_len:healedFallback.length,status_counts:statusCounts,reason_counts:counts,already_eligible_from_A:eligibleArticles.length,targetCount},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{})})();
-      // #endregion
       for (const a of healedFallback) allHealedById.set(a.article_id, a);
+
       const alreadySeen = new Set(eligibleArticles.map(a => a.article_id));
       const inconsistencies: string[] = [];
       for (const article of healedFallback) {
         if (eligibleArticles.length >= targetCount) break;
         if (alreadySeen.has(article.article_id)) continue;
-        const requiredAnnotations = getRequiredAnnotations(article, adminConfig);
-        const check = isEligible(article, email, requiredAnnotations);
+        const required = getRequiredAnnotations(article, adminConfig);
+        const check = isEligible(article, email, required);
         if (!check.ok) {
           if (check.reason?.startsWith("consistency-err")) {
-            inconsistencies.push(`${article.article_id}(seq=${(article as any).sequence_number}): ${check.reason}`);
+            inconsistencies.push(`${article.article_id}: ${check.reason}`);
           }
           continue;
         }
@@ -229,26 +260,24 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
       }
 
       if (inconsistencies.length > 0) {
-        console.warn("[assignArticlesForAnnotator] Strategy B skipped", inconsistencies.length, "inconsistent articles");
+        console.warn("[assignArticlesForAnnotator] Strategy B skipped", inconsistencies.length, "inconsistent");
       }
-      console.log("[assignArticlesForAnnotator] Strategy B total eligible now:", eligibleArticles.length);
+      console.log("[assignArticlesForAnnotator] Strategy B total eligible:", eligibleArticles.length);
     } catch (err2) {
-      // #region debug-point H3,H5:strategyB-exception
-      fetch("http://127.0.0.1:7777/event",{method:"POST",body:JSON.stringify({sessionId:"assign-no-articles-after-target",runId:"pre",hypothesisId:"H3",location:"assignArticles.ts:strategyB-catch",msg:"[DEBUG] Strategy B threw EXCEPTION",data:{error_name:(err2 as any)?.name,error_message:(err2 as any)?.message?.slice(0,200)??String(err2).slice(0,200)},ts:Date.now()}),headers:{"Content-Type":"application/json"}}).catch(()=>{});
-      // #endregion
       console.warn("[assignArticlesForAnnotator] Strategy B also failed:", err2);
     }
   }
 
-  console.log("[assignArticlesForAnnotator] Total eligible articles found:", eligibleArticles.length);
+  console.log("[assignArticlesForAnnotator] Total eligible:", eligibleArticles.length);
 
+  // ── Merge already-assigned articles from healed + annotator truth ─────────
   const alreadyMineFromHealed = [...allHealedById.values()]
     .filter((a) =>
       (a.assigned_to || []).some((e) => typeof e === "string" && e.toLowerCase().trim() === emailNorm)
     );
 
   const alreadyMineFromTruthIds = annotatorCtx.articlesByAssignee.size > 0
-    ? [ ...annotatorCtx.articlesByAssignee.entries() ]
+    ? [...annotatorCtx.articlesByAssignee.entries()]
         .filter(([, emails]) => emails.has(emailNorm))
         .map(([articleId]) => articleId)
     : [];
@@ -270,7 +299,7 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
           }
         }
       } catch (e) {
-        console.warn("[assignArticlesForAnnotator] Could not fetch already-articles:", e);
+        console.warn("[assignArticlesForAnnotator] Could not fetch already-assigned articles:", e);
       }
     }
     for (const id of alreadyMineFromTruthIds) {
@@ -283,7 +312,7 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
   for (const a of alreadyMineFromHealed) alreadyMineMap.set(a.article_id, a);
   for (const a of alreadyMineFromTruth) alreadyMineMap.set(a.article_id, a);
 
-  const alreadyMineArticles = [ ...alreadyMineMap.values() ]
+  const alreadyMineArticles = [...alreadyMineMap.values()]
     .sort((a, b) => ((a as any).sequence_number ?? 0) - ((b as any).sequence_number ?? 0));
 
   const alreadyMineIds = alreadyMineArticles.map((a) => a.article_id);
@@ -304,69 +333,33 @@ export async function assignArticlesForAnnotator(email: string, targetCount: num
     return [];
   }
 
-  console.log(
-    "[assignArticlesForAnnotator] Selected (sequential by sequence_number):",
-    selectedIds.map((id, i) => `${id}#seq=${(selectedArticles[i] as any).sequence_number}`).join(", ")
-  );
-  if (alreadyMineIds.length > 0) {
-    console.log("[assignArticlesForAnnotator] Already assigned to user (kept):", alreadyMineIds.length);
-  }
+  console.log("[assignArticlesForAnnotator] Selected:", selectedIds.length,
+    "| New to write:", idsNeedingWrite.length, "| Already mine:", alreadyMineIds.length);
 
-  const finalAssignment = [...selectedIds];
-
+  // ── Atomic per-article claim (prevents race condition) ─────────────────────
+  // Each article is claimed in its own runTransaction. If two users race on
+  // the same article, the second transaction re-reads after the first commits
+  // and only writes if the slot is still below the cap.
   if (idsNeedingWrite.length > 0) {
-    try {
-      console.log("[assignArticlesForAnnotator] Writing", idsNeedingWrite.length, "new assignment slot(s)");
-      const batch = writeBatch(db);
-      let batchCount = 0;
-      const MAX_BATCH_SIZE = 500;
+    console.log("[assignArticlesForAnnotator] Claiming", idsNeedingWrite.length, "slots atomically...");
+    const successfulIds: string[] = [...alreadyMineIds];
 
-      for (const articleId of idsNeedingWrite) {
-        if (batchCount >= MAX_BATCH_SIZE - 10) {
-          await batch.commit();
-          batchCount = 0;
-        }
-        const articleRef = doc(db, "articles", articleId);
-        batch.set(articleRef, {
-          assigned_count: increment(1),
-          assigned_to: arrayUnion(email)
-        }, { merge: true });
-        batchCount += 1;
-      }
-
-      if (batchCount > 0) {
-        await batch.commit();
-        console.log("[assignArticlesForAnnotator] ✅ Batch write SUCCESSFUL!");
-      }
-    } catch (e) {
-      console.error("[assignArticlesForAnnotator] ❌ Batch write FAILED:", e);
-      let successCount = 0;
-      const successfulIds: string[] = [...alreadyMineIds];
-      for (const articleId of idsNeedingWrite) {
-        try {
-          const articleRef = doc(db, "articles", articleId);
-          await runTransaction(db, async (tx) => {
-            const snap = await tx.get(articleRef);
-            if (!snap.exists()) return;
-            const current = snap.data() as Article;
-            const currentAssignedTo = Array.isArray(current.assigned_to) ? current.assigned_to : [];
-            const currentAssignedCount = typeof (current as any).assigned_count === "number" ? (current as any).assigned_count : 0;
-            tx.set(articleRef, {
-              assigned_count: currentAssignedCount + 1,
-              assigned_to: Array.from(new Set([...currentAssignedTo, email]))
-            }, { merge: true });
-          });
+    await Promise.all(
+      idsNeedingWrite.map(async (articleId) => {
+        const claimed = await claimAssignmentSlot(articleId, email, adminConfig);
+        if (claimed) {
           successfulIds.push(articleId);
-          successCount++;
-        } catch (perr) {
-          console.warn("[assignArticlesForAnnotator] Single-article write failed for", articleId, ":", perr);
+        } else {
+          console.log(`[assignArticlesForAnnotator] Slot for ${articleId} was taken by concurrent user — skipped.`);
         }
-      }
-      console.log("[assignArticlesForAnnotator] Fallback wrote", successCount, "new slot(s)");
-      return successfulIds.slice(0, targetCount);
-    }
+      })
+    );
+
+    console.log("[assignArticlesForAnnotator] ✅ Claimed", successfulIds.length - alreadyMineIds.length,
+      "new slots (", idsNeedingWrite.length - (successfulIds.length - alreadyMineIds.length), "lost to race).");
+    return successfulIds.slice(0, targetCount);
   }
 
-  console.log("[assignArticlesForAnnotator] ✅ DONE. Returning finalAssignment:", finalAssignment);
-  return finalAssignment;
+  console.log("[assignArticlesForAnnotator] ✅ DONE. Returning", selectedIds.length, "articles.");
+  return selectedIds;
 }

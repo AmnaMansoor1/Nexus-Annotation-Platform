@@ -31,6 +31,12 @@ export default function ExportCSV() {
       const snap = await getDocs(q);
       const articles = snap.docs.map(d => d.data() as Article);
 
+      // ── Main article loop — also builds kappa counts in one pass ──────────
+      // responses are fetched ONCE here and reused for both the CSV row and
+      // the dataset-wide kappa — no second Firestore scan needed.
+      const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
+      const completedCountsArray: BiasCounts[] = []; // built here, used for kappa below
+
       const exportData = await Promise.all(articles.map(async (article) => {
         const responsesSnap = await getDocs(
           collection(db, "annotations", article.article_id, "responses")
@@ -49,8 +55,6 @@ export default function ExportCSV() {
           console.log(`[ExportCSV] Article ${article.article_id}: excluded ${allResponses.length - responses.length} response(s) from deleted annotators.`);
         }
 
-        const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
-
         const row: any = {};
         row.sequence_number = typeof (article as any).sequence_number === "number"
           ? (article as any).sequence_number : "";
@@ -68,48 +72,51 @@ export default function ExportCSV() {
 
         // ── Scoring block ──────────────────────────────────────────────────
         // For complete articles we ALWAYS derive scores from live filtered
-        // responses when stored Firestore values are null/stale (happens when
-        // bias_score was never written, or was cleared by a repair pass that
-        // forgot to recompute).
+        // responses when stored Firestore values are null/stale.
+        const liveCounts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
+        for (const res of responses as any[]) {
+          const lbl = String(res.label || "");
+          if (lbl === "neutral")                    liveCounts.neutral++;
+          else if (lbl === "slightly_manipulative") liveCounts.slightly++;
+          else if (lbl === "highly_manipulative")   liveCounts.highly++;
+        }
+        const liveN = liveCounts.neutral + liveCounts.slightly + liveCounts.highly;
+
         if (
           article.status === "complete" &&
           typeof article.annotation_count === "number" &&
           article.annotation_count >= REQUIRED
         ) {
-          const liveCounts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
-          for (const res of responses as any[]) {
-            const lbl = String(res.label || "");
-            if (lbl === "neutral")               liveCounts.neutral++;
-            else if (lbl === "slightly_manipulative") liveCounts.slightly++;
-            else if (lbl === "highly_manipulative")   liveCounts.highly++;
-          }
-          const liveN = liveCounts.neutral + liveCounts.slightly + liveCounts.highly;
-
           if (liveN >= REQUIRED) {
-            // bias_score: stored value preferred; recompute when null
             row.bias_score = (article.bias_score != null)
               ? article.bias_score
               : calculateBiasScore(liveCounts);
-
-            // percent_agreement: stored value preferred; recompute when null
             row.percent_agreement = (article.percent_agreement != null)
               ? article.percent_agreement
               : calculatePercentAgreement(liveCounts);
-
-            // label (binary 0/1): stored value preferred; derive from bias_score when null
             if (article.label === 0 || article.label === 1) {
               row.label = article.label;
             } else {
               row.label = (row.bias_score as number) >= 2.5 ? 1 : 0;
             }
+
+            // ── Accumulate kappa counts (capped to REQUIRED for equal rater counts)
+            const cappedCounts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
+            let cappedN = 0;
+            for (const res of responses as any[]) {
+              if (cappedN >= REQUIRED) break;
+              const lbl = String(res.label || "");
+              if (lbl === "neutral")                    { cappedCounts.neutral++;  cappedN++; }
+              else if (lbl === "slightly_manipulative") { cappedCounts.slightly++; cappedN++; }
+              else if (lbl === "highly_manipulative")   { cappedCounts.highly++;  cappedN++; }
+            }
+            if (cappedN >= REQUIRED) completedCountsArray.push(cappedCounts);
           } else {
-            // Fewer live responses than REQUIRED after filtering deleted annotators
             row.bias_score        = "";
             row.percent_agreement = "";
             row.label             = "";
           }
         } else {
-          // Article not complete yet
           row.bias_score        = "";
           row.percent_agreement = "";
           row.label             = (article.label === 0 || article.label === 1) ? article.label : "";
@@ -122,7 +129,6 @@ export default function ExportCSV() {
           row[`ann_${i}_label`]            = "";
           row[`manipulation_cue_ann_${i}`] = "";
         }
-
         responses.forEach((res: any, i) => {
           if (i < ANNOTATOR_COLUMNS) {
             const slot = i + 1;
@@ -137,42 +143,9 @@ export default function ExportCSV() {
       }));
 
       // ── Dataset-wide Fleiss' Kappa summary row ─────────────────────────────
-      // We reuse the already-fetched responses from exportData instead of
-      // re-querying Firestore. Each article's label counts are re-tallied from
-      // the ann_* columns that were written into its row.
-      const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
-      const completedCountsArray: BiasCounts[] = [];
-      for (const article of articles) {
-        if (article.status !== "complete") continue;
-        if (typeof article.annotation_count !== "number" || article.annotation_count < REQUIRED) continue;
-        try {
-          const rSnap = await getDocs(
-            collection(db, "annotations", article.article_id, "responses")
-          );
-          const liveFiltered = rSnap.docs
-            .map(d => d.data() as any)
-            .filter((res: any) => {
-              const e = typeof res.annotator_email === "string"
-                ? res.annotator_email.toLowerCase().trim() : "";
-              return !!e && liveAnnotatorEmails.has(e);
-            });
-          const counts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
-          // Use only the first REQUIRED responses to guarantee equal rater
-          // counts across all articles (required by Fleiss' Kappa formula)
-          const capped = liveFiltered.slice(0, REQUIRED);
-          for (const res of capped) {
-            const lbl = String(res?.label || "");
-            if (lbl === "neutral")                    counts.neutral++;
-            else if (lbl === "slightly_manipulative") counts.slightly++;
-            else if (lbl === "highly_manipulative")   counts.highly++;
-          }
-          const n = counts.neutral + counts.slightly + counts.highly;
-          // Include article if it has at least REQUIRED live responses
-          if (n >= REQUIRED) completedCountsArray.push(counts);
-        } catch (e) {
-          console.warn(`[ExportCSV] Skipping kappa for ${article.article_id}:`, e);
-        }
-      }
+      // completedCountsArray was built during the main loop above — no extra
+      // Firestore reads needed here.
+      console.log(`[ExportCSV] Computing overall kappa from ${completedCountsArray.length} complete articles.`);
 
       const overallKappa = calculateOverallFleissKappa(completedCountsArray);
       if (completedCountsArray.length > 0) {
