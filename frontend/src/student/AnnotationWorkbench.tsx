@@ -928,7 +928,7 @@ export default function AnnotationWorkbench() {
   }
 
   if (!currentArticle) {
-      return (
+    return (
       <div className="min-h-screen flex items-center justify-center bg-bg-student p-6">
         <div className="max-w-md w-full text-center space-y-6 bg-white p-12 rounded-3xl shadow-sm border border-slate-100">
           <div className="bg-amber-50 w-16 h-16 rounded-full flex items-center justify-center mx-auto">
