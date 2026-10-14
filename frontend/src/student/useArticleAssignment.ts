@@ -318,6 +318,7 @@ export function useArticleAssignment(email: string | null, refreshTrigger = 0) {
             console.log(`[useArticleAssignment] CACHE HIT (<target branch) but assigned < target=${target} — WILL IGNORE CACHE and run assignment query to fetch remaining articles.`);
           }
         }
+
       } else {
         console.warn("[useArticleAssignment] Annotator doc MISSING. Creating now for:", email);
         const newUser: Annotator = {

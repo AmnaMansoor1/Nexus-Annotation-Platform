@@ -1,4 +1,4 @@
-﻿/**
+/**
  * rebuild-platform-summary.mjs
  *
  * Rebuilds the stats/platform_summary Firestore document from live data
@@ -21,7 +21,7 @@ import { fileURLToPath } from 'url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const DRY_RUN = process.argv.includes('--dry-run');
-const REQUIRED = 5;
+const REQUIRED = 3; // matches DEFAULT_REQUIRED_ANNOTATIONS in annotationConfig.ts
 
 const saPath = path.join(root, 'service-account.json');
 if (!fs.existsSync(saPath)) {
