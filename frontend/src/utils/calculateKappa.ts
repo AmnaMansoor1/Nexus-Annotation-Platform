@@ -97,19 +97,28 @@ export function calculateOverallFleissKappa(allCounts: BiasCounts[]): number {
   const annotatorCounts = categoryMatrix.map((categories) =>
     categories.reduce((sum, count) => sum + count, 0)
   );
-  const firstAnnotatorCount = annotatorCounts[0];
 
-  if (firstAnnotatorCount < 2 || annotatorCounts.some((count) => count !== firstAnnotatorCount)) {
-    return 0;
-  }
+  // Guard: every article needs at least 2 raters
+  if (annotatorCounts.some((count) => count < 2)) return 0;
 
-  const articleAgreements = categoryMatrix.map(calculateObservedAgreement);
+  // If rater counts differ (shouldn't happen after the cap in ExportCSV, but
+  // handle gracefully), normalize every article to the minimum rater count by
+  // proportionally scaling down the category counts.
+  const minN = Math.min(...annotatorCounts);
+  const normalizedMatrix = categoryMatrix.map((categories, idx) => {
+    const n = annotatorCounts[idx];
+    if (n === minN) return categories;
+    // Scale each category count proportionally to minN
+    return categories.map((c) => Math.round((c / n) * minN));
+  });
+
+  const articleAgreements = normalizedMatrix.map(calculateObservedAgreement);
   const observedAgreement =
     articleAgreements.reduce((sum, value) => sum + value, 0) / articleAgreements.length;
 
-  const totalAssignments = firstAnnotatorCount * categoryMatrix.length;
+  const totalAssignments = minN * normalizedMatrix.length;
   const categoryProportions = [0, 1, 2].map((index) =>
-    categoryMatrix.reduce((sum, categories) => sum + categories[index], 0) / totalAssignments
+    normalizedMatrix.reduce((sum, categories) => sum + categories[index], 0) / totalAssignments
   );
   const expectedAgreement = categoryProportions.reduce(
     (sum, proportion) => sum + proportion * proportion,
@@ -121,3 +130,4 @@ export function calculateOverallFleissKappa(allCounts: BiasCounts[]): number {
   const kappa = (observedAgreement - expectedAgreement) / (1 - expectedAgreement);
   return parseFloat(kappa.toFixed(3));
 }
+

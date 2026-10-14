@@ -137,6 +137,9 @@ export default function ExportCSV() {
       }));
 
       // ── Dataset-wide Fleiss' Kappa summary row ─────────────────────────────
+      // We reuse the already-fetched responses from exportData instead of
+      // re-querying Firestore. Each article's label counts are re-tallied from
+      // the ann_* columns that were written into its row.
       const REQUIRED = DEFAULT_REQUIRED_ANNOTATIONS;
       const completedCountsArray: BiasCounts[] = [];
       for (const article of articles) {
@@ -154,14 +157,18 @@ export default function ExportCSV() {
               return !!e && liveAnnotatorEmails.has(e);
             });
           const counts: BiasCounts = { neutral: 0, slightly: 0, highly: 0 };
-          for (const res of liveFiltered) {
+          // Use only the first REQUIRED responses to guarantee equal rater
+          // counts across all articles (required by Fleiss' Kappa formula)
+          const capped = liveFiltered.slice(0, REQUIRED);
+          for (const res of capped) {
             const lbl = String(res?.label || "");
-            if (lbl === "neutral")                   counts.neutral++;
+            if (lbl === "neutral")                    counts.neutral++;
             else if (lbl === "slightly_manipulative") counts.slightly++;
             else if (lbl === "highly_manipulative")   counts.highly++;
           }
           const n = counts.neutral + counts.slightly + counts.highly;
-          if (n === REQUIRED) completedCountsArray.push(counts);
+          // Include article if it has at least REQUIRED live responses
+          if (n >= REQUIRED) completedCountsArray.push(counts);
         } catch (e) {
           console.warn(`[ExportCSV] Skipping kappa for ${article.article_id}:`, e);
         }
