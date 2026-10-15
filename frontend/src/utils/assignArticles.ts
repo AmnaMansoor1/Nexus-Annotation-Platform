@@ -225,17 +225,19 @@ export async function assignArticlesForAnnotator(email: string, targetCount = 20
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // STRATEGY B (FALLBACK) — no composite index required.
-  // Also filters by status — keeps reads to 100 max.
+  // STRATEGY B (TRUE FALLBACK) — no composite index required.
+  // Omits orderBy so Firestore can serve this with only single-field indexes.
+  // Results are sorted client-side by priorityCmp after healing.
   // ─────────────────────────────────────────────────────────────────────────
   if (eligibleArticles.length < targetCount) {
     try {
-      console.log("[assignArticlesForAnnotator] Strategy B fallback (target:", targetCount, ")");
+      console.log("[assignArticlesForAnnotator] Strategy B fallback (no orderBy — index-free)");
       const fallbackSnap = await getDocs(query(
         articlesRef,
-        where("status", "in", ["pending", "partial"]),  // ← status filter — no 500-doc full scan
-        orderBy("sequence_number", "asc"),
-        limit(100)                                       // ← was 500, now 100
+        where("status", "in", ["pending", "partial"]),
+        // ← NO orderBy here: avoids the composite (status + sequence_number)
+        //   index requirement so this works even while the index is building
+        limit(200)   // fetch more since we sort client-side
       ));
       console.log("[assignArticlesForAnnotator] Strategy B returned", fallbackSnap.size, "docs");
 
