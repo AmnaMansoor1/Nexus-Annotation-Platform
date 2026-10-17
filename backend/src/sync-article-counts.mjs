@@ -138,27 +138,25 @@ for (const docSnap of articlesSnap.docs) {
     : uniqueEmails(rawAssignedTo, (e) => liveEmails.has(e));
   const rawLiveAnnotated = uniqueEmails(rawAnnotatedBy, (e) => liveEmails.has(e));
   // Issue-1 (v2): response annotators count WITHOUT the liveEmails filter.
-  // ExportCSV reads the same response docs unfiltered → deleted annotators'
-  // responses STILL appear in CSV human_label columns and DO count for bias.
-  // If we filtered responseAnnotators by liveEmails, we'd still have the
-  // "annotated_by=[ ] vs 5 real responses" drift that broke the scoring gate.
   const responseNormalized = uniqueEmails([...responseAnnotators]);
   const newAnnotatedByUncapped = uniqueEmails([...rawLiveAnnotated, ...responseNormalized]);
 
-  // ── ISSUE-2 / ISSUE-3 INTEGRITY CAP: annotation_count and annotated_by
-  //    MUST be exactly REQUIRED (5) when at completion. The FYP spec locks
-  //    N=5 raters per article; any physical orphaned response docs from
-  //    deleted annotators are still counted in the UNION above but MUST
-  //    NOT inflate annotation_count beyond 5, otherwise kappa uses n>5
-  //    (producing -0.2 / -0.167 / -0.143 instead of the correct -0.25)
-  //    and tie-detection evaluates a wrong-size counts object (2-2-1 at
-  //    n=7 becomes 3-2-2 → false majority instead of null).
-  //    We take the FIRST REQUIRED emails in insertion order: the oldest
-  //    response docs (matches how the frontend completion tx would have
-  //    locked-in the 5th rater's submit order).
   const newAnnotatedBy = newAnnotatedByUncapped.slice(0, REQUIRED);
-  const newAC = newAssignedTo.length;
   const newAnnC = newAnnotatedBy.length;
+
+  // ── CAP FIX: assigned_to must never exceed annotation_count + NON_RESPONSIVE_BUFFER.
+  // When annotators are assigned but don't submit, assigned_count grows beyond cap,
+  // permanently blocking new assignments. Fix: keep actual submitters first,
+  // then fill remaining slots up to cap only.
+  const NON_RESPONSIVE_BUFFER = 2;
+  const assignedCap = Math.min(newAnnC + NON_RESPONSIVE_BUFFER, REQUIRED + NON_RESPONSIVE_BUFFER);
+  const submitterSet = new Set(newAnnotatedBy.map(e => String(e).toLowerCase().trim()));
+  // Submitters always kept; non-submitting assignees trimmed if over cap
+  const submitters = newAssignedTo.filter(e => submitterSet.has(String(e).toLowerCase().trim()));
+  const nonSubmitters = newAssignedTo.filter(e => !submitterSet.has(String(e).toLowerCase().trim()));
+  const cappedAssignedTo = [...submitters, ...nonSubmitters].slice(0, assignedCap);
+  const newAC = cappedAssignedTo.length;
+
 
   // For score recomputation we build an EXACT allow-list of emails: only
   // the emails that are in the capped newAnnotatedBy set. This GUARANTEES
@@ -175,12 +173,12 @@ for (const docSnap of articlesSnap.docs) {
   const needsBaseUpdate =
     oldAC !== newAC ||
     oldAnnC !== newAnnC ||
-    (article.assigned_to || []).length !== newAssignedTo.length ||
+    (article.assigned_to || []).length !== cappedAssignedTo.length ||
     (article.annotated_by || []).length !== newAnnotatedBy.length ||
     article.status !== newStatus;
 
   const updates = {
-    assigned_to: newAssignedTo,
+    assigned_to: cappedAssignedTo,
     assigned_count: newAC,
     annotated_by: newAnnotatedBy,
     annotation_count: newAnnC,
