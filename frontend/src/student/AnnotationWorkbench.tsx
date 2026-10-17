@@ -780,7 +780,7 @@ export default function AnnotationWorkbench() {
             });
             console.log(`[SCORING-RECOVERY] fresh responses: ${freshTotal} total, counts=`, freshCounts);
 
-            if (freshTotal >= REQUIRED) {
+            if (freshTotal >= DEFAULT_REQUIRED_ANNOTATIONS) {
               const biasScore = calculateBiasScore(freshCounts);
               const pAgreement = calculatePercentAgreement(freshCounts);
               const entries2 = (Object.entries(freshCounts) as Array<[string, number]>);
@@ -806,7 +806,7 @@ export default function AnnotationWorkbench() {
               finalBiasScoreForStats = biasScore;
               console.log(`[SCORING-RECOVERY] ✅ Scores written: bias=${biasScore} pAgreement=${pAgreement} finalLabel=${finalLabelVal2} label=${binaryLabelVal2}`);
             } else {
-              console.warn(`[SCORING-RECOVERY] Only ${freshTotal} responses found (need ${REQUIRED}). Scores not written — will be fixed by admin repair script.`);
+              console.warn(`[SCORING-RECOVERY] Only ${freshTotal} responses found (need ${DEFAULT_REQUIRED_ANNOTATIONS}). Scores not written — will be fixed by admin repair script.`);
             }
           } catch (recoveryErr) {
             console.error(`[SCORING-RECOVERY] Post-tx score recovery failed for ${articleId}:`, recoveryErr);
