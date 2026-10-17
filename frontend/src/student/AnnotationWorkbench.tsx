@@ -386,6 +386,10 @@ export default function AnnotationWorkbench() {
         let lastTxFinalLabel: BiasLabel | null = null;
         let lastTxBinaryLabel: 0 | 1 | null = null;
         let scoreBranchEntered = false;
+        // Set to true when scoring was skipped due to missing prior labels.
+        // Post-transaction recovery will re-fetch all responses and compute scores.
+        let needsPostTxScoring = false;
+        let postTxAnnotatedBy: string[] = [];
 
         await runTransaction(db, async (transaction) => {
           const articleSnap = await txGetSafe(transaction, articleRef);
@@ -629,27 +633,18 @@ export default function AnnotationWorkbench() {
 
             const totalCounted = allCounts.neutral + allCounts.slightly + allCounts.highly;
             if (totalCounted !== REQUIRED) {
-              // ── FIX: Do NOT throw here. Throwing aborts the entire transaction,
-              // which means the response doc gets written (outside the transaction)
-              // but the article metadata (annotated_by, annotation_count, status)
-              // is NEVER updated → article stays status=pending with 0 annotation_count
-              // even though real response docs exist. This is the root cause of the
-              // "3 annotators but still pending" bug.
-              //
-              // Instead: log the error, skip computing scores for now, but still
-              // allow the transaction to commit the metadata update below.
-              // The admin sync-article-counts.mjs script will recompute scores later.
-              console.error(
-                `[SCORING-INTEGRITY] article=${articleId} totalCounted=${totalCounted} !== REQUIRED=${REQUIRED}. ` +
-                `priorResponses.length=${priorResponses.length}. Skipping score computation but CONTINUING ` +
-                `transaction so article metadata (annotated_by/status) is still written. ` +
-                `Run sync-article-counts.mjs to recompute scores.`
+              // ── Metadata-first strategy: Don't throw — let the transaction commit
+              // article metadata (annotated_by/annotation_count/status=complete).
+              // Then POST-TRANSACTION, re-fetch ALL responses fresh and compute scores
+              // in a separate updateDoc write. This guarantees both metadata AND scores
+              // are always correctly written even when prior reads fail.
+              console.warn(
+                `[SCORING-RECOVERY] article=${articleId} totalCounted=${totalCounted} !== REQUIRED=${REQUIRED}. ` +
+                `Will attempt post-transaction score recovery via fresh getDocs.`
               );
-              console.error(`[SCORING-INTEGRITY] priorAnnotatedAuthoritative=`, priorAnnotatedAuthoritative);
-              console.error(`[SCORING-INTEGRITY] priorEmailToLabel keys=`, Object.keys(priorEmailToLabel));
-              console.error(`[SCORING-INTEGRITY] priorResponses emails=`, priorResponses.map(r => String(r?.annotator_email)));
-              // Mark status as complete but leave scores null — sync script will fill them in
               scoreBranchEntered = false;
+              needsPostTxScoring = true;
+              postTxAnnotatedBy = newAnnotatedBy; // pass the final annotator list for recovery
             } else {
 
             console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts, { totalCounted, REQUIRED });
@@ -763,6 +758,58 @@ export default function AnnotationWorkbench() {
             await syncBiasScoreAndStatsAtomically(finalBiasScoreForStats, prevStatusForStats, nextStatusForStats);
           } catch (e) {
             console.warn("Stats sync post-transaction failed:", e);
+          }
+        }
+
+        // ── POST-TRANSACTION SCORING RECOVERY ────────────────────────────────────
+        // When scoring was skipped inside the transaction (prior response reads
+        // failed), re-fetch ALL responses fresh via getDocs and compute scores
+        // in a separate updateDoc. Metadata is already committed — this only
+        // adds the score fields.
+        if (needsPostTxScoring) {
+          try {
+            console.log(`[SCORING-RECOVERY] article=${articleId} fetching all responses fresh for post-tx scoring...`);
+            const freshSnaps = await getDocs(collection(db, "annotations", articleId, "responses"));
+            const freshCounts = { neutral: 0, slightly: 0, highly: 0 };
+            let freshTotal = 0;
+            freshSnaps.forEach((d) => {
+              const lab = d.data()?.label as string;
+              if (lab === "neutral") { freshCounts.neutral++; freshTotal++; }
+              else if (lab === "slightly_manipulative") { freshCounts.slightly++; freshTotal++; }
+              else if (lab === "highly_manipulative") { freshCounts.highly++; freshTotal++; }
+            });
+            console.log(`[SCORING-RECOVERY] fresh responses: ${freshTotal} total, counts=`, freshCounts);
+
+            if (freshTotal >= REQUIRED) {
+              const biasScore = calculateBiasScore(freshCounts);
+              const pAgreement = calculatePercentAgreement(freshCounts);
+              const entries2 = (Object.entries(freshCounts) as Array<[string, number]>);
+              entries2.sort((a, b) => b[1] - a[1]);
+              const [topKey2, topCount2] = entries2[0];
+              const [, secondCount2] = entries2[1];
+              const labelMap: Record<string, BiasLabel> = {
+                neutral: "neutral",
+                slightly: "slightly_manipulative",
+                highly: "highly_manipulative",
+              };
+              const finalLabelVal2: BiasLabel | null =
+                (topCount2 > 0 && topCount2 !== secondCount2) ? (labelMap[topKey2] ?? null) : null;
+              const binaryLabelVal2: 0 | 1 = biasScore >= 2.5 ? 1 : 0;
+
+              const articleRef2 = doc(db, "articles", articleId);
+              await updateDoc(articleRef2, {
+                bias_score: biasScore,
+                percent_agreement: pAgreement,
+                final_label: finalLabelVal2,
+                label: binaryLabelVal2,
+              });
+              finalBiasScoreForStats = biasScore;
+              console.log(`[SCORING-RECOVERY] ✅ Scores written: bias=${biasScore} pAgreement=${pAgreement} finalLabel=${finalLabelVal2} label=${binaryLabelVal2}`);
+            } else {
+              console.warn(`[SCORING-RECOVERY] Only ${freshTotal} responses found (need ${REQUIRED}). Scores not written — will be fixed by admin repair script.`);
+            }
+          } catch (recoveryErr) {
+            console.error(`[SCORING-RECOVERY] Post-tx score recovery failed for ${articleId}:`, recoveryErr);
           }
         }
 
