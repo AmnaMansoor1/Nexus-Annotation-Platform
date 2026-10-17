@@ -629,15 +629,28 @@ export default function AnnotationWorkbench() {
 
             const totalCounted = allCounts.neutral + allCounts.slightly + allCounts.highly;
             if (totalCounted !== REQUIRED) {
-              const msg = `[SCORING-INTEGRITY-FAIL] article=${articleId} totalCounted=${totalCounted} REQUIRED=${REQUIRED} priorResponses.length=${priorResponses.length}. ` +
-                `Refusing to compute scores with wrong rater count — would produce invalid percent_agreement and wrong tie detection. ` +
-                `This means one or more prior response docs could not be resolved. Aborting transaction (no writes).`;
-              console.error(msg);
-              console.error(`[SCORING-INTEGRITY-FAIL] priorAnnotatedAuthoritative=`, priorAnnotatedAuthoritative);
-              console.error(`[SCORING-INTEGRITY-FAIL] priorEmailToLabel keys=`, Object.keys(priorEmailToLabel));
-              console.error(`[SCORING-INTEGRITY-FAIL] priorResponses emails=`, priorResponses.map(r => String(r?.annotator_email)));
-              throw new Error(msg);
-            }
+              // ── FIX: Do NOT throw here. Throwing aborts the entire transaction,
+              // which means the response doc gets written (outside the transaction)
+              // but the article metadata (annotated_by, annotation_count, status)
+              // is NEVER updated → article stays status=pending with 0 annotation_count
+              // even though real response docs exist. This is the root cause of the
+              // "3 annotators but still pending" bug.
+              //
+              // Instead: log the error, skip computing scores for now, but still
+              // allow the transaction to commit the metadata update below.
+              // The admin sync-article-counts.mjs script will recompute scores later.
+              console.error(
+                `[SCORING-INTEGRITY] article=${articleId} totalCounted=${totalCounted} !== REQUIRED=${REQUIRED}. ` +
+                `priorResponses.length=${priorResponses.length}. Skipping score computation but CONTINUING ` +
+                `transaction so article metadata (annotated_by/status) is still written. ` +
+                `Run sync-article-counts.mjs to recompute scores.`
+              );
+              console.error(`[SCORING-INTEGRITY] priorAnnotatedAuthoritative=`, priorAnnotatedAuthoritative);
+              console.error(`[SCORING-INTEGRITY] priorEmailToLabel keys=`, Object.keys(priorEmailToLabel));
+              console.error(`[SCORING-INTEGRITY] priorResponses emails=`, priorResponses.map(r => String(r?.annotator_email)));
+              // Mark status as complete but leave scores null — sync script will fill them in
+              scoreBranchEntered = false;
+            } else {
 
             console.debug(`[DIAG-Issue1] allCounts (after adding submitter label)=`, allCounts, { totalCounted, REQUIRED });
 
@@ -707,6 +720,7 @@ export default function AnnotationWorkbench() {
               status: articleUpdates.status,
             });
             console.groupEnd();
+            } // end else (totalCounted === REQUIRED)
           }
 
           transaction.set(articleRef, articleUpdates, { merge: true });
