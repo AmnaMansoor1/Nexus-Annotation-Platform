@@ -148,13 +148,15 @@ for (const docSnap of articlesSnap.docs) {
   // When annotators are assigned but don't submit, assigned_count grows beyond cap,
   // permanently blocking new assignments. Fix: keep actual submitters first,
   // then fill remaining slots up to cap only.
+  // isEligible uses: hardCap = annotation_count + NON_RESPONSIVE_BUFFER (=4 when ann=2)
+  // and blocks when assigned_count >= hardCap. So we must set assigned_count < hardCap.
+  // We store only actual submitters in assigned_to — the buffer slots stay open for
+  // new annotators to fill via claimAssignmentSlot at annotation time.
   const NON_RESPONSIVE_BUFFER = 2;
-  const assignedCap = Math.min(newAnnC + NON_RESPONSIVE_BUFFER, REQUIRED + NON_RESPONSIVE_BUFFER);
   const submitterSet = new Set(newAnnotatedBy.map(e => String(e).toLowerCase().trim()));
-  // Submitters always kept; non-submitting assignees trimmed if over cap
-  const submitters = newAssignedTo.filter(e => submitterSet.has(String(e).toLowerCase().trim()));
-  const nonSubmitters = newAssignedTo.filter(e => !submitterSet.has(String(e).toLowerCase().trim()));
-  const cappedAssignedTo = [...submitters, ...nonSubmitters].slice(0, assignedCap);
+  // Keep only actual submitters in assigned_to; non-submitting assignees are removed.
+  // This frees buffer slots so new annotators can be assigned.
+  const cappedAssignedTo = newAssignedTo.filter(e => submitterSet.has(String(e).toLowerCase().trim()));
   const newAC = cappedAssignedTo.length;
 
 
